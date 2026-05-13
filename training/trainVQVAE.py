@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+# 获取项目根目录
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(ROOT))
+sys.path.append(str(ROOT / "models"))
+
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -16,9 +23,9 @@ transform = transforms.Compose([
     transforms.Normalize((0.5,), (0.5,))  # 归一化到 [-1, 1]
 ])
 
-train_dataset = datasets.MNIST(root='./data', train=True, 
+train_dataset = datasets.MNIST(root=ROOT / 'data', train=True, 
                                 download=True, transform=transform)
-test_dataset  = datasets.MNIST(root='./data', train=False, 
+test_dataset  = datasets.MNIST(root=ROOT / 'data', train=False, 
                                 download=True, transform=transform)
 
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
@@ -62,4 +69,4 @@ for epoch in range(20):
     used = all_indices.unique().numel()
     print(f"Codebook utilization: {used} / {codebook_K}")
     
-torch.save(model.state_dict(), 'outputs/vqvae2.pth')
+torch.save(model.state_dict(), ROOT / 'outputs/vqvae2.pth')

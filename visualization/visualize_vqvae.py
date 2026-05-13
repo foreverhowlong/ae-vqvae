@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+# 获取项目根目录
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(ROOT))
+sys.path.append(str(ROOT / "models"))
+
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -8,7 +15,7 @@ from vqvae import VQVAE
 # 模型参数（与训练时一致）
 latent_dim = 2
 codebook_K = 256
-model_path = "outputs/vqvae2.pth"
+model_path = ROOT / "outputs/vqvae2.pth"
 
 
 def get_device():
@@ -32,7 +39,7 @@ def get_test_data(batch_size=256):
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,)),
     ])
-    test_dataset = datasets.MNIST(root='./data', train=False,
+    test_dataset = datasets.MNIST(root=ROOT / 'data', train=False,
                                   download=True, transform=transform)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     return test_loader
@@ -196,4 +203,4 @@ if __name__ == "__main__":
     plot_latent_space_with_codebook()
 
     # 功能 2：5 个样本的原图与重建图对比
-    show_reconstruction()
+    show_reconstruction()()

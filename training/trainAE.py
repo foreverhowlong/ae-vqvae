@@ -1,7 +1,14 @@
+import sys
+from pathlib import Path
+# 获取项目根目录（当前脚本的父目录的父目录）
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(ROOT))
+sys.path.append(str(ROOT / "models"))
+
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from vae import VAE
+from ae import AE
 
 
 
@@ -14,19 +21,17 @@ transform = transforms.Compose([
     transforms.Normalize((0.5,), (0.5,))  # 归一化到 [-1, 1]
 ])
 
-train_dataset = datasets.MNIST(root='./data', train=True, 
+train_dataset = datasets.MNIST(root=ROOT / 'data', train=True, 
                                 download=True, transform=transform)
-test_dataset  = datasets.MNIST(root='./data', train=False, 
+test_dataset  = datasets.MNIST(root=ROOT / 'data', train=False, 
                                 download=True, transform=transform)
 
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 test_loader  = DataLoader(test_dataset,  batch_size=64, shuffle=False)
 
-model = VAE().to(device)
-
-
+model = AE().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
+criterion = torch.nn.MSELoss()  # 自编码器用 MSE 重建损失
 
 for epoch in range(20):
     total_loss = 0
@@ -35,14 +40,11 @@ for epoch in range(20):
         optimizer.zero_grad()
         
         
-        x = images.to(device)
-        x_recon, mu, logvar = model(x)
-
+        images = images.to(device)
+        reconstructed = model(images)
         
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        recon_loss = torch.nn.functional.mse_loss(x_recon, x, reduction='sum')
-        
-        loss = kl_loss + recon_loss
+        # 1. 算 loss（MSE，输入是 reconstructed 和 images）
+        loss = criterion(reconstructed,images)
         
         # 3. 反向传播
         loss.backward()
@@ -52,4 +54,4 @@ for epoch in range(20):
         
     print(f'Epoch {epoch+1}, Loss: {total_loss/len(train_loader):.4f}')
     
-torch.save(model.state_dict(), 'outputs/vae2.pth')
+torch.save(model.state_dict(), ROOT / 'outputs/ae2.pth')

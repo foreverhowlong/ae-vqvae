@@ -4,6 +4,13 @@
 有一个可拖拽的圆点（knob），拖动时实时解码生成对应的图片。
 """
 
+import sys
+from pathlib import Path
+# 获取项目根目录
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(ROOT))
+sys.path.append(str(ROOT / "models"))
+
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -11,7 +18,7 @@ import matplotlib.pyplot as plt
 from ae import AE
 
 # ── 配置 ──────────────────────────────────────────
-model_path = "outputs/ae2.pth"
+model_path = ROOT / "outputs/ae2.pth"
 
 
 def main():
@@ -31,7 +38,7 @@ def main():
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,)),
     ])
-    test_dataset = datasets.MNIST(root='./data', train=False,
+    test_dataset = datasets.MNIST(root=ROOT / 'data', train=False,
                                   download=True, transform=transform)
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
 
