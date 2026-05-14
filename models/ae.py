@@ -2,10 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-latent_dim = 2
-
 class Encoder(nn.Module):
-    def __init__(self):
+    def __init__(self, latent_dim):
         super(Encoder, self).__init__()
         # 定义卷积层
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)  # 输入1通道，输出32通道
@@ -26,7 +24,7 @@ class Encoder(nn.Module):
     
     
 class Decoder(nn.Module):
-    def __init__(self):
+    def __init__(self, latent_dim):
         super().__init__()
         self.invconv1 = nn.ConvTranspose2d(32, 1, kernel_size=2, stride=2)  # 输入32通道，输出1通道,长宽翻倍
         self.invconv2 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)  # 输入64通道，输出128通道,长宽翻倍
@@ -44,10 +42,10 @@ class Decoder(nn.Module):
         return x
     
 class AE(nn.Module):
-    def __init__(self):
+    def __init__(self, latent_dim=2):
         super().__init__()
-        self.encoder = Encoder()
-        self.decoder = Decoder()
+        self.encoder = Encoder(latent_dim)
+        self.decoder = Decoder(latent_dim)
         
     def forward(self, x):
         x = self.encoder(x)

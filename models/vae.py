@@ -4,10 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-latent_dim = 2
-
 class Encoder(nn.Module):
-    def __init__(self):
+    def __init__(self, latent_dim):
         super(Encoder, self).__init__()
         # 定义卷积层
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)  # 输入1通道，输出32通道
@@ -29,8 +27,8 @@ class Encoder(nn.Module):
         return mu,logvar
     
 class Reparam(nn.Module):
-    def init(self):
-        super().init()
+    def __init__(self):
+        super().__init__()
         
     def forward(self,mu,logvar):
         std = torch.exp(0.5 * logvar)
@@ -39,7 +37,7 @@ class Reparam(nn.Module):
         
         
 class Decoder(nn.Module):
-    def __init__(self):
+    def __init__(self, latent_dim):
         super().__init__()
         self.invconv1 = nn.ConvTranspose2d(32, 1, kernel_size=2, stride=2)  # 输入32通道，输出1通道,长宽翻倍
         self.invconv2 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)  # 输入64通道，输出128通道,长宽翻倍
@@ -57,11 +55,11 @@ class Decoder(nn.Module):
         return x
     
 class VAE(nn.Module):
-    def __init__(self):
+    def __init__(self, latent_dim=2):
         super().__init__()
-        self.encoder = Encoder()
+        self.encoder = Encoder(latent_dim)
         self.reparam = Reparam()
-        self.decoder = Decoder()
+        self.decoder = Decoder(latent_dim)
         
     def forward(self, x):
         mu,logvar = self.encoder(x)

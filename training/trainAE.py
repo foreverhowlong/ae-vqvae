@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from ae import AE
 
-
+latent_dim = 2
 
 device = torch.device('mps' if torch.mps.is_available() else 'cpu')
 
@@ -29,7 +29,7 @@ test_dataset  = datasets.MNIST(root=ROOT / 'data', train=False,
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 test_loader  = DataLoader(test_dataset,  batch_size=64, shuffle=False)
 
-model = AE().to(device)
+model = AE(latent_dim=latent_dim).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 criterion = torch.nn.MSELoss()  # 自编码器用 MSE 重建损失
 

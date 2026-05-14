@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from vae import VAE
 
-
+latent_dim = 2
 
 device = torch.device('mps' if torch.mps.is_available() else 'cpu')
 
@@ -29,7 +29,7 @@ test_dataset  = datasets.MNIST(root=ROOT / 'data', train=False,
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 test_loader  = DataLoader(test_dataset,  batch_size=64, shuffle=False)
 
-model = VAE().to(device)
+model = VAE(latent_dim=latent_dim).to(device)
 
 
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
