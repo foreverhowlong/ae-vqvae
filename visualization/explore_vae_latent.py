@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from vae import VAE
 
 # ── 配置 ──────────────────────────────────────────
-model_path = ROOT / "outputs/vae2.pth"
+model_path = ROOT / "outputs/vae32.pth"
 
 
 def main():

@@ -8,10 +8,10 @@ sys.path.append(str(ROOT / "models"))
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from vqvae import VQVAE
+from models.vqvae import VQVAE
 import torch.nn.functional as F
 
-latent_dim = 2
+latent_dim = 8
 codebook_K = 256
 
 device = torch.device('mps' if torch.mps.is_available() else 'cpu')
@@ -69,4 +69,4 @@ for epoch in range(20):
     used = all_indices.unique().numel()
     print(f"Codebook utilization: {used} / {codebook_K}")
     
-torch.save(model.state_dict(), ROOT / 'outputs/vqvae2.pth')
+torch.save(model.state_dict(), ROOT / f'outputs/vqvae{latent_dim}.pth')

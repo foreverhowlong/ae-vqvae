@@ -8,7 +8,7 @@ sys.path.append(str(ROOT / "models"))
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from vae import VAE
+from models.vae import VAE
 
 latent_dim = 2
 
@@ -59,4 +59,4 @@ for epoch in range(20):
         
     print(f'Epoch {epoch+1}, Loss: {total_loss/len(train_loader):.4f}')
     
-torch.save(model.state_dict(), ROOT / 'outputs/vae2.pth')
+torch.save(model.state_dict(), ROOT / f'outputs/vae{latent_dim}.pth')

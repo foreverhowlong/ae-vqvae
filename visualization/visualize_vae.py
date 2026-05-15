@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
-from vae import VAE
+from models.vae import VAE
 
 # 要可视化的模型文件路径
 model_path = ROOT / "outputs/vae2.pth"
