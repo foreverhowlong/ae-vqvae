@@ -1,7 +1,6 @@
 # TODO
-1. 把latent_dim开到比如32或64，两个模型都重新训练，然后做同样的reconstruction对比可视化。
-2. 写技术博客
-3. vqvae loss playaround 
+1. 把latent_dim开到比如32或64，两个模型都重新训练，然后做同样的reconstruction对比可视化
+2. vqvae loss playaround 
 z_e散点加codebook位置的叠加图。
 跑四组实验，每组训练完画同一种图：
 
