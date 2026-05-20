@@ -11,12 +11,14 @@ from torchvision import datasets, transforms
 from models.vqvae import VQVAE
 import torch.nn.functional as F
 
-latent_dim = 8
-codebook_K = 256
+Latent_dim = 4
+Codebook_K = 256
+Epoches = 50
 
 device = torch.device('mps' if torch.mps.is_available() else 'cpu')
 
 print(f"device:{device}")
+print(f"latent dim:{Latent_dim}, codebook K:{Codebook_K},epoches:{Epoches}")
 
 transform = transforms.Compose([
     transforms.ToTensor(),          # PIL图像 → [0,1] 的tensor
@@ -31,12 +33,12 @@ test_dataset  = datasets.MNIST(root=ROOT / 'data', train=False,
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 test_loader  = DataLoader(test_dataset,  batch_size=64, shuffle=False)
 
-model = VQVAE(latent_dim,codebook_K).to(device)
+model = VQVAE(Latent_dim, Codebook_K).to(device)
 
 
 optimizer = torch.optim.Adam(model.parameters())
 
-for epoch in range(20):
+for epoch in range(Epoches):
     all_indices = []   
     total_loss = 0
     for images, _ in train_loader:
@@ -67,6 +69,6 @@ for epoch in range(20):
     print(f'Epoch {epoch+1}, Loss: {total_loss/len(train_loader):.4f}')
     all_indices = torch.cat(all_indices, dim=0)  # 把所有batch拼起来
     used = all_indices.unique().numel()
-    print(f"Codebook utilization: {used} / {codebook_K}")
+    print(f"Codebook utilization: {used} / {Codebook_K}")
     
-torch.save(model.state_dict(), ROOT / f'outputs/vqvae{latent_dim}.pth')
+torch.save(model.state_dict(), ROOT / f'outputs/vqvae{Latent_dim}.pth')
