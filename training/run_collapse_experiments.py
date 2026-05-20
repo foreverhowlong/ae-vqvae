@@ -797,14 +797,22 @@ def main():
         transforms.Normalize((0.5,), (0.5,))  # Normalize to [-1, 1]
     ])
     
-    # Load 10k sub-sampled MNIST training dataset
-    train_dataset = get_subsampled_mnist(ROOT / 'data', seed=args.seed, train=True, transform=transform)
+    # Load MNIST training dataset (full dataset for real runs, subset for dry runs)
+    if args.dry_run:
+        # In dry run, use a small subset of 1,000 images to keep the verification extremely fast
+        full_dataset = datasets.MNIST(root=ROOT / 'data', train=True, download=True, transform=transform)
+        rng = np.random.default_rng(args.seed)
+        indices = rng.choice(len(full_dataset), size=1000, replace=False)
+        train_dataset = Subset(full_dataset, indices)
+    else:
+        train_dataset = datasets.MNIST(root=ROOT / 'data', train=True, download=True, transform=transform)
+        
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     
     # Load MNIST test dataset for visualization
     test_dataset = datasets.MNIST(root=ROOT / 'data', train=False, download=True, transform=transform)
     
-    print(f"[Dataset Setup]: Loaded sub-sampled training set size: {len(train_dataset)}")
+    print(f"[Dataset Setup]: Loaded {'sub-sampled (dry run)' if args.dry_run else 'full'} training set size: {len(train_dataset)}")
     print(f"[Dataset Setup]: Loaded full test set size: {len(test_dataset)}")
     
     # Determine local and Drive base directories
@@ -812,7 +820,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # 2. Run Experiment 1
-    # run_experiment_1(args, device, train_loader, test_dataset, output_dir, args.drive_dir)
+    run_experiment_1(args, device, train_loader, test_dataset, output_dir, args.drive_dir)
     
     # 3. Run Experiment 2
     run_experiment_2(args, device, train_loader, output_dir, args.drive_dir)

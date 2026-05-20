@@ -11,7 +11,7 @@ from torchvision import datasets, transforms
 from models.vqvae import VQVAE
 import torch.nn.functional as F
 
-Latent_dim = 4
+Latent_dim = 8
 Codebook_K = 256
 Epoches = 50
 
