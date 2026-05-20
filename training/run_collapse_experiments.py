@@ -782,7 +782,7 @@ def main():
     parser.add_argument("--drive-dir", type=str, default=None, 
                         help="Optional Google Drive output folder (e.g. /content/drive/MyDrive/vqvae_collapse)")
     parser.add_argument("--epochs1", type=int, default=45, help="Number of epochs for Experiment 1 (default 45)")
-    parser.add_argument("--epochs2", type=int, default=10, help="Number of epochs for Experiment 2 (default 10)")
+    parser.add_argument("--epochs2", type=int, default=45, help="Number of epochs for Experiment 2 (default 45)")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training (default 128)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for Experiment 1 (default 42)")
     parser.add_argument("--dry-run", action="store_true", help="Perform a quick dry run with minimal epochs/grids")
@@ -812,7 +812,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # 2. Run Experiment 1
-    run_experiment_1(args, device, train_loader, test_dataset, output_dir, args.drive_dir)
+    # run_experiment_1(args, device, train_loader, test_dataset, output_dir, args.drive_dir)
     
     # 3. Run Experiment 2
     run_experiment_2(args, device, train_loader, output_dir, args.drive_dir)
