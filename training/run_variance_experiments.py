@@ -166,6 +166,12 @@ def train_single_model_variance(scale_factor, D, args, device_name, exp_dir):
     # Set device
     device = torch.device(device_name)
     
+    # Enable hardware-level TensorFloat-32 (TF32) and cuDNN benchmark for Ampere GPUs (RTX 3080 Ti)
+    if device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    
     # Dry run params
     epochs = 1 if args.dry_run else args.epochs
     K = 256
@@ -315,6 +321,12 @@ def main():
     device = get_device()
     device_name = str(device)
     print(f"\n[Hardware Accelerator]: Detected device = {device_name}")
+    
+    # Enable hardware-level TensorFloat-32 (TF32) and cuDNN benchmark for Ampere GPUs (RTX 3080 Ti)
+    if device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
     
     transform = transforms.Compose([
         transforms.ToTensor(),
