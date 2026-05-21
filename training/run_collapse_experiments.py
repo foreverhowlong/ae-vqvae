@@ -37,6 +37,46 @@ sys.path.append(str(ROOT / "models"))
 from models.vqvae import VQVAE
 
 
+class GPUDataLoader:
+    """
+    A fast DataLoader that preloads the entire dataset onto the GPU/MPS device.
+    Eliminates CPU-to-GPU copy and dataloader worker overhead during training epochs.
+    """
+    def __init__(self, dataset, batch_size=128, shuffle=True, device=None):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.device = device if device is not None else torch.device("cpu")
+        
+        # Preload the entire dataset to target device
+        print(f"[GPU Preloader]: Preloading dataset of size {len(dataset)} onto {self.device}...")
+        start_time = time.time()
+        
+        # Load everything using a temporary standard DataLoader
+        temp_loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False, num_workers=0)
+        all_images, all_labels = next(iter(temp_loader))
+        
+        self.images = all_images.to(self.device)
+        self.labels = all_labels.to(self.device)
+        
+        self.num_samples = len(dataset)
+        self.num_batches = (self.num_samples + batch_size - 1) // batch_size
+        print(f"[GPU Preloader]: Preloaded successfully in {time.time() - start_time:.2f} seconds.")
+
+    def __iter__(self):
+        if self.shuffle:
+            indices = torch.randperm(self.num_samples, device=self.device)
+        else:
+            indices = torch.arange(self.num_samples, device=self.device)
+            
+        for i in range(0, self.num_samples, self.batch_size):
+            batch_indices = indices[i : i + self.batch_size]
+            yield self.images[batch_indices], self.labels[batch_indices]
+
+    def __len__(self):
+        return self.num_batches
+
+
 # =====================================================================
 # 1. Dataset Preparation & Helper Functions
 # =====================================================================
@@ -807,7 +847,7 @@ def main():
     else:
         train_dataset = datasets.MNIST(root=ROOT / 'data', train=True, download=True, transform=transform)
         
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    train_loader = GPUDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, device=device)
     
     # Load MNIST test dataset for visualization
     test_dataset = datasets.MNIST(root=ROOT / 'data', train=False, download=True, transform=transform)
