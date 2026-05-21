@@ -14,6 +14,8 @@ import json
 import time
 import shutil
 import argparse
+import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import numpy as np
 
@@ -180,25 +182,289 @@ def load_log(local_path, drive_path=None):
 
 
 # =====================================================================
-# 2. Experiment 1 Runner
+# 2. Parallel Result Syncing & Compilation Utilities
 # =====================================================================
 
-def run_experiment_1(args, device, train_loader, test_dataset, output_dir, drive_dir):
+def sync_results_from_drive(local_results_dir, drive_results_dir):
+    """
+    Syncs all individual result files from Google Drive back to the local results directory.
+    This guarantees that the local resume mechanism works instantly for parallel workers.
+    """
+    if not drive_results_dir or not Path(drive_results_dir).exists():
+        return
+        
+    local_results_dir.mkdir(parents=True, exist_ok=True)
+    for drive_file in Path(drive_results_dir).glob("*.json"):
+        local_file = local_results_dir / drive_file.name
+        if not local_file.exists():
+            try:
+                shutil.copy2(drive_file, local_file)
+                print(f"  [Resuming] Synced {drive_file.name} from Google Drive.")
+            except Exception as e:
+                print(f"  [WARNING] Failed to sync {drive_file.name}: {e}")
+
+
+def compile_log_from_results(results_dir, log_path):
+    """
+    Compiles all individual result JSON files from results_dir into a single unified log dict
+    and saves it to log_path.
+    """
+    log_data = {"completed_runs": [], "runs": {}}
+    if not results_dir.exists():
+        return log_data
+        
+    for file_path in results_dir.glob("*.json"):
+        run_id = file_path.stem
+        try:
+            with open(file_path, "r") as f:
+                run_data = json.load(f)
+            log_data["runs"][run_id] = run_data
+            log_data["completed_runs"].append(run_id)
+        except Exception as e:
+            print(f"  [Compile WARNING] Failed to read {file_path.name}: {e}")
+            
+    with open(log_path, "w") as f:
+        json.dump(log_data, f, indent=2)
+        
+    return log_data
+
+
+# =====================================================================
+# 3. Parallel Worker Functions (Picklable Module-Level Targets)
+# =====================================================================
+
+def train_single_model_exp1(K, D, args, device_name, exp1_dir, drive_dir):
+    """
+    Worker function to train a single VQ-VAE model for Experiment 1 in parallel.
+    """
+    run_id = f"K{K}_D{D}"
+    results_dir = exp1_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
+    local_result_path = results_dir / f"{run_id}.json"
+    drive_result_path = Path(drive_dir) / "exp1" / "results" / f"{run_id}.json" if drive_dir else None
+    
+    # Check if result file already exists (locally or on Drive)
+    if local_result_path.exists():
+        print(f"--> Skip Completed Run: K={K}, D={D}")
+        return
+    if drive_result_path and drive_result_path.exists():
+        # Sync from Drive to local
+        try:
+            local_result_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(drive_result_path, local_result_path)
+            print(f"--> Skip Completed Run (synced from Drive): K={K}, D={D}")
+            return
+        except Exception as e:
+            print(f"  [WARNING] Failed to sync {run_id}.json from Google Drive: {e}")
+
+    # Set device
+    device = torch.device(device_name)
+    
+    # Dry run params
+    epochs = 1 if args.dry_run else args.epochs1
+    
+    print(f"\n--> [Worker] Starting VQ-VAE Training: K={K}, D={D} for {epochs} epochs on {device}...")
+    
+    # Load dataset
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
+    
+    if args.dry_run:
+        full_dataset = datasets.MNIST(root=ROOT / 'data', train=True, download=False, transform=transform)
+        rng = np.random.default_rng(args.seed)
+        indices = rng.choice(len(full_dataset), size=1000, replace=False)
+        train_dataset = Subset(full_dataset, indices)
+    else:
+        train_dataset = datasets.MNIST(root=ROOT / 'data', train=True, download=False, transform=transform)
+        
+    train_loader = GPUDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, device=device)
+    
+    # Reseed torch and numpy for weight initialization reproducibility
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    
+    model = VQVAE(latent_dim=D, codebook_K=K).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    
+    epoch_logs = []
+    
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        
+        for images, _ in train_loader:
+            optimizer.zero_grad()
+            z_e, z_q_raw, z_q_st, x_recon, indices = model(images)
+            
+            recon_loss = F.mse_loss(x_recon, images)
+            codebook_loss = F.mse_loss(z_q_raw, z_e.detach())
+            commitment_loss = F.mse_loss(z_e, z_q_raw.detach())
+            
+            loss = codebook_loss + 0.2 * commitment_loss + recon_loss
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            
+        eval_recon, eval_util, eval_perp = evaluate_metrics(model, train_loader, device, K)
+        epoch_logs.append({
+            "epoch": epoch,
+            "train_loss": total_loss / len(train_loader),
+            "recon_loss": eval_recon,
+            "utilization": eval_util,
+            "perplexity": eval_perp
+        })
+        
+        print(f"    [K={K}, D={D}] Epoch {epoch:2d}/{epochs} | Loss: {total_loss/len(train_loader):.4f} | Recon MSE: {eval_recon:.4f} | Util: {eval_util*100:5.1f}% | Perp: {eval_perp:.2f}")
+        
+    # Save model checkpoint
+    model_dir = exp1_dir / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    local_model_path = model_dir / f"vqvae_{run_id}.pth"
+    drive_model_path = Path(drive_dir) / "exp1" / "models" / f"vqvae_{run_id}.pth" if drive_dir else None
+    
+    torch.save(model.state_dict(), local_model_path)
+    sync_file_to_drive(local_model_path, drive_model_path)
+    
+    # Save metrics dict to result JSON
+    result_data = {
+        "K": K,
+        "D": D,
+        "epoch_metrics": epoch_logs,
+        "final_metrics": epoch_logs[-1]
+    }
+    with open(local_result_path, "w") as f:
+        json.dump(result_data, f, indent=2)
+    sync_file_to_drive(local_result_path, drive_result_path)
+    print(f"    ✓ [K={K}, D={D}] Completed and metrics saved.")
+
+
+def train_single_model_exp2(seed, D, args, device_name, exp2_dir, drive_dir):
+    """
+    Worker function to train a single VQ-VAE model for Experiment 2 in parallel.
+    """
+    run_id = f"seed{seed}_D{D}"
+    results_dir = exp2_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
+    local_result_path = results_dir / f"{run_id}.json"
+    drive_result_path = Path(drive_dir) / "exp2" / "results" / f"{run_id}.json" if drive_dir else None
+    
+    # Check if result file already exists (locally or on Drive)
+    if local_result_path.exists():
+        print(f"--> Skip Completed Run: Seed={seed}, D={D}")
+        return
+    if drive_result_path and drive_result_path.exists():
+        # Sync from Drive to local
+        try:
+            local_result_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(drive_result_path, local_result_path)
+            print(f"--> Skip Completed Run (synced from Drive): Seed={seed}, D={D}")
+            return
+        except Exception as e:
+            print(f"  [WARNING] Failed to sync {run_id}.json from Google Drive: {e}")
+
+    # Set device
+    device = torch.device(device_name)
+    
+    # Parameters
+    K = 256
+    epochs = 1 if args.dry_run else args.epochs2
+    
+    print(f"\n--> [Worker] Starting VQ-VAE Training: Seed={seed}, D={D} for {epochs} epochs on {device}...")
+    
+    # Load dataset
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
+    
+    if args.dry_run:
+        full_dataset = datasets.MNIST(root=ROOT / 'data', train=True, download=False, transform=transform)
+        rng = np.random.default_rng(args.seed)
+        indices = rng.choice(len(full_dataset), size=1000, replace=False)
+        train_dataset = Subset(full_dataset, indices)
+    else:
+        train_dataset = datasets.MNIST(root=ROOT / 'data', train=True, download=False, transform=transform)
+        
+    train_loader = GPUDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, device=device)
+    
+    # Reseed torch and numpy for weight initialization reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    model = VQVAE(latent_dim=D, codebook_K=K).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    
+    epoch_logs = []
+    
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        
+        for images, _ in train_loader:
+            optimizer.zero_grad()
+            z_e, z_q_raw, z_q_st, x_recon, indices = model(images)
+            
+            recon_loss = F.mse_loss(x_recon, images)
+            codebook_loss = F.mse_loss(z_q_raw, z_e.detach())
+            commitment_loss = F.mse_loss(z_e, z_q_raw.detach())
+            
+            loss = codebook_loss + 0.2 * commitment_loss + recon_loss
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            
+        eval_recon, eval_util, eval_perp = evaluate_metrics(model, train_loader, device, K)
+        epoch_logs.append({
+            "epoch": epoch,
+            "train_loss": total_loss / len(train_loader),
+            "recon_loss": eval_recon,
+            "utilization": eval_util,
+            "perplexity": eval_perp
+        })
+        
+        print(f"    [Seed={seed}, D={D}] Epoch {epoch:2d}/{epochs} | Loss: {total_loss/len(train_loader):.4f} | Recon MSE: {eval_recon:.4f} | Util: {eval_util*100:5.1f}% | Perp: {eval_perp:.2f}")
+        
+    # Save model checkpoint
+    model_dir = exp2_dir / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    local_model_path = model_dir / f"vqvae_{run_id}.pth"
+    drive_model_path = Path(drive_dir) / "exp2" / "models" / f"vqvae_{run_id}.pth" if drive_dir else None
+    
+    torch.save(model.state_dict(), local_model_path)
+    sync_file_to_drive(local_model_path, drive_model_path)
+    
+    # Save metrics dict to result JSON
+    result_data = {
+        "seed": seed,
+        "D": D,
+        "epoch_metrics": epoch_logs,
+        "final_metrics": epoch_logs[-1]
+    }
+    with open(local_result_path, "w") as f:
+        json.dump(result_data, f, indent=2)
+    sync_file_to_drive(local_result_path, drive_result_path)
+    print(f"    ✓ [Seed={seed}, D={D}] Completed and metrics saved.")
+
+
+# =====================================================================
+# 4. Experiment Master Runners
+# =====================================================================
+
+def run_experiment_1(args, device_name, test_dataset, output_dir, drive_dir):
     print("\n" + "="*80)
-    print("  RUNNING EXPERIMENT 1 (Grid of K x D Phase Transition)")
+    print("  RUNNING EXPERIMENT 1 (Grid of K x D Phase Transition - PARALLEL)")
     print("="*80)
     
     exp1_dir = output_dir / "exp1"
-    model_dir = exp1_dir / "models"
-    plot_dir = exp1_dir / "plots"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    plot_dir.mkdir(parents=True, exist_ok=True)
+    local_results_dir = exp1_dir / "results"
+    drive_results_dir = Path(drive_dir) / "exp1" / "results" if drive_dir else None
     
-    local_log_path = exp1_dir / "log.json"
-    drive_log_path = Path(drive_dir) / "exp1" / "log.json" if drive_dir else None
-    
-    # Load existing progress
-    log_data = load_log(local_log_path, drive_log_path)
+    # 1. Sync any existing results from Drive to Local to support resume
+    sync_results_from_drive(local_results_dir, drive_results_dir)
     
     # Experiment Grid
     K_list = [64, 256, 1024]
@@ -207,202 +473,107 @@ def run_experiment_1(args, device, train_loader, test_dataset, output_dir, drive
     if args.dry_run:
         K_list = [64]
         D_list = [4, 8]
-        epochs = 1
-        print("  [DRY RUN] Running with minimal epochs and grid sizes.")
-    else:
-        epochs = args.epochs1
-
+        print("  [DRY RUN] Running with minimal grid sizes.")
+        
+    # Generate combinations
+    tasks = []
     for K in K_list:
         for D in D_list:
-            run_id = f"K{K}_D{D}"
+            tasks.append((K, D))
             
-            # Check if this run has already been completed and stored
-            if run_id in log_data["completed_runs"]:
-                print(f"--> Skip Completed Run: K={K}, D={D}")
-                continue
+    print(f"  Total planned runs: {len(tasks)}. Parallel workers: {args.workers}")
+    
+    # 2. Run training tasks in parallel
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(
+                train_single_model_exp1, K, D, args, device_name, exp1_dir, drive_dir
+            ): (K, D) for K, D in tasks
+        }
+        
+        for future in as_completed(futures):
+            K, D = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                print(f"  [ERROR] Worker failed for K={K}, D={D}: {e}")
                 
-            print(f"\n--> Training VQ-VAE: K={K}, D={D} for {epochs} epochs...")
-            
-            # Setup fixed seed for weight initialization in this run
-            torch.manual_seed(args.seed)
-            np.random.seed(args.seed)
-            
-            model = VQVAE(latent_dim=D, codebook_K=K).to(device)
-            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-            
-            epoch_logs = []
-            
-            for epoch in range(1, epochs + 1):
-                model.train()
-                total_loss = 0.0
-                
-                for images, _ in train_loader:
-                    images = images.to(device)
-                    optimizer.zero_grad()
-                    
-                    z_e, z_q_raw, z_q_st, x_recon, indices = model(images)
-                    
-                    recon_loss = F.mse_loss(x_recon, images)
-                    codebook_loss = F.mse_loss(z_q_raw, z_e.detach())
-                    commitment_loss = F.mse_loss(z_e, z_q_raw.detach())
-                    
-                    loss = codebook_loss + 0.2 * commitment_loss + recon_loss
-                    loss.backward()
-                    optimizer.step()
-                    
-                    total_loss += loss.item()
-                
-                # Evaluate precise metrics at epoch end
-                eval_recon, eval_util, eval_perp = evaluate_metrics(model, train_loader, device, K)
-                
-                epoch_logs.append({
-                    "epoch": epoch,
-                    "train_loss": total_loss / len(train_loader),
-                    "recon_loss": eval_recon,
-                    "utilization": eval_util,
-                    "perplexity": eval_perp
-                })
-                
-                print(f"    Epoch {epoch:2d}/{epochs} | Loss: {total_loss/len(train_loader):.4f} | Recon MSE: {eval_recon:.4f} | Util: {eval_util*100:5.1f}% | Perp: {eval_perp:.2f}")
-
-            # Save model checkpoint
-            local_model_path = model_dir / f"vqvae_{run_id}.pth"
-            drive_model_path = Path(drive_dir) / "exp1" / "models" / f"vqvae_{run_id}.pth" if drive_dir else None
-            
-            torch.save(model.state_dict(), local_model_path)
-            sync_file_to_drive(local_model_path, drive_model_path)
-            
-            # Save run metrics
-            log_data["runs"][run_id] = {
-                "K": K,
-                "D": D,
-                "epoch_metrics": epoch_logs,
-                "final_metrics": epoch_logs[-1]
-            }
-            log_data["completed_runs"].append(run_id)
-            
-            # Save updated log
-            with open(local_log_path, "w") as f:
-                json.dump(log_data, f, indent=2)
-            sync_file_to_drive(local_log_path, drive_log_path)
-            
+    # 3. Compile all individual result JSONs into log.json
+    local_log_path = exp1_dir / "log.json"
+    drive_log_path = Path(drive_dir) / "exp1" / "log.json" if drive_dir else None
+    
+    log_data = compile_log_from_results(local_results_dir, local_log_path)
+    sync_file_to_drive(local_log_path, drive_log_path)
+    
     print("\nExperiment 1 Training Completed!")
     
-    # Generate Visualizations
+    # 4. Generate Visualizations (runs in parent process)
+    plot_dir = exp1_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = exp1_dir / "models"
+    
+    # We load device here to load saved models for test set reconstruction plotting
+    device = torch.device(device_name)
     generate_exp1_plots(log_data, model_dir, plot_dir, test_dataset, device, drive_dir)
 
 
-# =====================================================================
-# 3. Experiment 2 Runner
-# =====================================================================
-
-def run_experiment_2(args, device, train_loader, output_dir, drive_dir):
+def run_experiment_2(args, device_name, output_dir, drive_dir):
     print("\n" + "="*80)
-    print("  RUNNING EXPERIMENT 2 (Stochasticity Across Random Seeds)")
+    print("  RUNNING EXPERIMENT 2 (Stochasticity Across Random Seeds - PARALLEL)")
     print("="*80)
     
     exp2_dir = output_dir / "exp2"
-    model_dir = exp2_dir / "models"
-    plot_dir = exp2_dir / "plots"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    plot_dir.mkdir(parents=True, exist_ok=True)
+    local_results_dir = exp2_dir / "results"
+    drive_results_dir = Path(drive_dir) / "exp2" / "results" if drive_dir else None
     
-    local_log_path = exp2_dir / "log.json"
-    drive_log_path = Path(drive_dir) / "exp2" / "log.json" if drive_dir else None
-    
-    # Load existing progress
-    log_data = load_log(local_log_path, drive_log_path)
+    # 1. Sync any existing results from Drive to Local to support resume
+    sync_results_from_drive(local_results_dir, drive_results_dir)
     
     # Parameters
-    K = 256  # Standard fixed codebook size
     D_list = [8, 9, 10]
     seeds = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]  # 10 random seeds
     
     if args.dry_run:
         D_list = [8]
         seeds = [42, 43]
-        epochs = 1
-        print("  [DRY RUN] Running with minimal epochs, dimensions, and seeds.")
-    else:
-        epochs = args.epochs2
-
+        print("  [DRY RUN] Running with minimal seeds and dimensions.")
+        
+    # Generate combinations
+    tasks = []
     for D in D_list:
         for seed in seeds:
-            run_id = f"seed{seed}_D{D}"
+            tasks.append((seed, D))
             
-            # Check if completed
-            if run_id in log_data["completed_runs"]:
-                print(f"--> Skip Completed Run: Seed={seed}, D={D}")
-                continue
+    print(f"  Total planned runs: {len(tasks)}. Parallel workers: {args.workers}")
+    
+    # 2. Run training tasks in parallel
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(
+                train_single_model_exp2, seed, D, args, device_name, exp2_dir, drive_dir
+            ): (seed, D) for seed, D in tasks
+        }
+        
+        for future in as_completed(futures):
+            seed, D = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                print(f"  [ERROR] Worker failed for Seed={seed}, D={D}: {e}")
                 
-            print(f"\n--> Training VQ-VAE: Seed={seed}, D={D} for {epochs} epochs...")
-            
-            # Reseed torch and numpy for reproducibility of weight initializations
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-            
-            model = VQVAE(latent_dim=D, codebook_K=K).to(device)
-            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-            
-            epoch_logs = []
-            
-            for epoch in range(1, epochs + 1):
-                model.train()
-                total_loss = 0.0
-                
-                for images, _ in train_loader:
-                    images = images.to(device)
-                    optimizer.zero_grad()
-                    
-                    z_e, z_q_raw, z_q_st, x_recon, indices = model(images)
-                    
-                    recon_loss = F.mse_loss(x_recon, images)
-                    codebook_loss = F.mse_loss(z_q_raw, z_e.detach())
-                    commitment_loss = F.mse_loss(z_e, z_q_raw.detach())
-                    
-                    loss = codebook_loss + 0.2 * commitment_loss + recon_loss
-                    loss.backward()
-                    optimizer.step()
-                    
-                    total_loss += loss.item()
-                
-                # Evaluate epoch metrics
-                eval_recon, eval_util, eval_perp = evaluate_metrics(model, train_loader, device, K)
-                
-                epoch_logs.append({
-                    "epoch": epoch,
-                    "train_loss": total_loss / len(train_loader),
-                    "recon_loss": eval_recon,
-                    "utilization": eval_util,
-                    "perplexity": eval_perp
-                })
-                
-                print(f"    Epoch {epoch:2d}/{epochs} | Loss: {total_loss/len(train_loader):.4f} | Recon MSE: {eval_recon:.4f} | Util: {eval_util*100:5.1f}% | Perp: {eval_perp:.2f}")
-
-            # Save model checkpoint
-            local_model_path = model_dir / f"vqvae_{run_id}.pth"
-            drive_model_path = Path(drive_dir) / "exp2" / "models" / f"vqvae_{run_id}.pth" if drive_dir else None
-            
-            torch.save(model.state_dict(), local_model_path)
-            sync_file_to_drive(local_model_path, drive_model_path)
-            
-            # Save run metrics
-            log_data["runs"][run_id] = {
-                "seed": seed,
-                "D": D,
-                "epoch_metrics": epoch_logs,
-                "final_metrics": epoch_logs[-1]
-            }
-            log_data["completed_runs"].append(run_id)
-            
-            # Save updated log
-            with open(local_log_path, "w") as f:
-                json.dump(log_data, f, indent=2)
-            sync_file_to_drive(local_log_path, drive_log_path)
-            
+    # 3. Compile all individual result JSONs into log.json
+    local_log_path = exp2_dir / "log.json"
+    drive_log_path = Path(drive_dir) / "exp2" / "log.json" if drive_dir else None
+    
+    log_data = compile_log_from_results(local_results_dir, local_log_path)
+    sync_file_to_drive(local_log_path, drive_log_path)
+    
     print("\nExperiment 2 Training Completed!")
     
-    # Generate Visualizations
+    # 4. Generate Visualizations (runs in parent process)
+    plot_dir = exp2_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    
     generate_exp2_plots(log_data, plot_dir, drive_dir)
 
 
@@ -825,45 +996,36 @@ def main():
     parser.add_argument("--epochs2", type=int, default=45, help="Number of epochs for Experiment 2 (default 45)")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training (default 128)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for Experiment 1 (default 42)")
+    parser.add_argument("--workers", type=int, default=2, help="Number of parallel experiment workers (default 2)")
     parser.add_argument("--dry-run", action="store_true", help="Perform a quick dry run with minimal epochs/grids")
     args = parser.parse_args()
     
-    # 1. Device and Dataset Setup
+    # 1. Device and Dataset Pre-download
     device = get_device()
-    print(f"\n[Hardware Accelerator]: Detected device = {device}")
+    device_name = str(device)
+    print(f"\n[Hardware Accelerator]: Detected device = {device_name}")
     
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,))  # Normalize to [-1, 1]
     ])
     
-    # Load MNIST training dataset (full dataset for real runs, subset for dry runs)
-    if args.dry_run:
-        # In dry run, use a small subset of 1,000 images to keep the verification extremely fast
-        full_dataset = datasets.MNIST(root=ROOT / 'data', train=True, download=True, transform=transform)
-        rng = np.random.default_rng(args.seed)
-        indices = rng.choice(len(full_dataset), size=1000, replace=False)
-        train_dataset = Subset(full_dataset, indices)
-    else:
-        train_dataset = datasets.MNIST(root=ROOT / 'data', train=True, download=True, transform=transform)
-        
-    train_loader = GPUDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, device=device)
-    
-    # Load MNIST test dataset for visualization
+    # Pre-download dataset in parent process to avoid worker download race conditions
+    print("[Dataset Setup]: Ensuring MNIST dataset is fully downloaded locally...")
+    datasets.MNIST(root=ROOT / 'data', train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST(root=ROOT / 'data', train=False, download=True, transform=transform)
     
-    print(f"[Dataset Setup]: Loaded {'sub-sampled (dry run)' if args.dry_run else 'full'} training set size: {len(train_dataset)}")
     print(f"[Dataset Setup]: Loaded full test set size: {len(test_dataset)}")
     
-    # Determine local and Drive base directories
+    # Determine local outputs directory
     output_dir = ROOT / "outputs" / "collapse_experiment"
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 2. Run Experiment 1
-    run_experiment_1(args, device, train_loader, test_dataset, output_dir, args.drive_dir)
+    # 2. Run Experiment 1 (Grid of K x D)
+    run_experiment_1(args, device_name, test_dataset, output_dir, args.drive_dir)
     
-    # 3. Run Experiment 2
-    run_experiment_2(args, device, train_loader, output_dir, args.drive_dir)
+    # 3. Run Experiment 2 (Seed Stochasticity)
+    run_experiment_2(args, device_name, output_dir, args.drive_dir)
     
     print("\n" + "="*80)
     print("  ALL EXPERIMENTS COMPLETED SUCCESSFULLY!")
@@ -874,4 +1036,10 @@ def main():
 
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    try:
+        # Crucial for GPU/MPS safety inside parallel spawned processes
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
     main()
