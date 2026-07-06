@@ -1,15 +1,9 @@
-import sys
-from pathlib import Path
-# 获取项目根目录
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(ROOT))
-sys.path.append(str(ROOT / "models"))
-
 import torch
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+
+from common import ROOT, get_device
+from common.data import get_test_loader
 from models.vae import VAE
 from models.vqvae import VQVAE
 
@@ -22,23 +16,8 @@ latent_dim = 32
 codebook_K = 256
 
 
-def get_device():
-    return torch.device(
-        "mps" if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available()
-        else "cpu"
-    )
-
-
 def get_test_data(batch_size=64):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,)),
-    ])
-    test_dataset = datasets.MNIST(root=ROOT / 'data', train=False,
-                                  download=True, transform=transform)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    return test_loader
+    return get_test_loader(batch_size=batch_size)
 
 
 def show_reconstruction_comparison(num_pairs=8):

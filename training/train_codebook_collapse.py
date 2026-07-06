@@ -6,28 +6,20 @@
   观察随着维数增加，codebook 利用率、有效秩等指标的变化。
 
 输出：
-  output/collapse/ 目录下存放：
+  outputs/collapse/ 目录下存放：
     - 每个 latent_dim 的模型权重
     - 训练日志（loss、utilization 等）
     - 5 张可视化图
 """
 
-import sys
-from pathlib import Path
-
-# ── 项目根目录 ──────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(ROOT))
-sys.path.append(str(ROOT / "models"))
-
 import json
-import time
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-from vqvae import VQVAE
+
+from common import ROOT, enable_tf32, get_device
+from common.data import get_test_loader, get_train_loader
+from common.experiment import vq_losses
+from models.vqvae import VQVAE
 
 # ── matplotlib 配置 ─────────────────────────────────────────
 import matplotlib
@@ -46,18 +38,14 @@ LR = 1e-3
 BETA = 0.2                # commitment loss 权重
 
 # 输出目录
-OUTPUT_DIR = ROOT / "output" / "collapse"
+OUTPUT_DIR = ROOT / "outputs" / "collapse"
 MODEL_DIR = OUTPUT_DIR / "models"
 PLOT_DIR = OUTPUT_DIR / "plots"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
-# 设备
-device = torch.device(
-    "mps" if torch.backends.mps.is_available()
-    else "cuda" if torch.cuda.is_available()
-    else "cpu"
-)
+device = get_device()
+enable_tf32(device)
 print(f"Device: {device}")
 print(f"Output dir: {OUTPUT_DIR}\n")
 
@@ -66,20 +54,8 @@ print(f"Output dir: {OUTPUT_DIR}\n")
 #  1. 数据加载
 # ══════════════════════════════════════════════════════════════
 
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,)),  # → [-1, 1]
-])
-
-train_dataset = datasets.MNIST(
-    root=ROOT / "data", train=True, download=True, transform=transform
-)
-test_dataset = datasets.MNIST(
-    root=ROOT / "data", train=False, download=True, transform=transform
-)
-
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+train_loader = get_train_loader(batch_size=BATCH_SIZE)
+test_loader = get_test_loader(batch_size=BATCH_SIZE)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -122,11 +98,9 @@ def train_one_model(latent_dim: int) -> dict:
 
             z_e, z_q_raw, z_q_st, x_recon, indices = model(images)
 
-            recon_loss = F.mse_loss(x_recon, images)
-            codebook_loss = F.mse_loss(z_q_raw, z_e.detach())
-            commitment_loss = F.mse_loss(z_e, z_q_raw.detach())
-
-            loss = codebook_loss + BETA * commitment_loss + recon_loss
+            loss, recon_loss, codebook_loss, commitment_loss = vq_losses(
+                z_e, z_q_raw, x_recon, images, beta=BETA
+            )
 
             loss.backward()
             optimizer.step()

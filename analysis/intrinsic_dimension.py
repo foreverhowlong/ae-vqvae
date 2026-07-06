@@ -1,11 +1,5 @@
 """使用 MLE 和 TwoNN 估计 MNIST 的本征维度，互相验证。"""
 
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(ROOT))
-
 # ── Monkey-patch: 修复 skdim MLE 在 Python 3.14 上的兼容性问题 ──
 # skdim 0.3.4 的 MLE.__init__ 中使用了 inspect.getargvalues().pop("self")，
 # 但 Python 3.14 的 FrameLocalsProxy 不支持 .pop()。
@@ -29,13 +23,11 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from skdim.id import MLE, TwoNN
 
+from common import ROOT, get_device
+
 
 def main():
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available()
-        else "cpu"
-    )
+    device = get_device()
 
     # ── 加载 MNIST 测试集 ──────────────────────────
     # 只做 ToTensor()，保留 [0,1] 原始像素值

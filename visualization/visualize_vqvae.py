@@ -1,29 +1,16 @@
-import sys
-from pathlib import Path
-# 获取项目根目录
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(ROOT))
-sys.path.append(str(ROOT / "models"))
-
 import torch
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-from vqvae import VQVAE
+
+from common import ROOT, get_device
+from common.data import get_test_loader
+from models.vqvae import VQVAE
+from visualization.common import denormalize, first_test_batch
 
 # 模型参数（与训练时一致）
 latent_dim = 2
 codebook_K = 256
 model_path = ROOT / "outputs/vqvae2.pth"
-
-
-def get_device():
-    return torch.device(
-        "mps" if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available()
-        else "cpu"
-    )
 
 
 def load_model(pth_path=model_path):
@@ -35,14 +22,7 @@ def load_model(pth_path=model_path):
 
 
 def get_test_data(batch_size=256):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,)),
-    ])
-    test_dataset = datasets.MNIST(root=ROOT / 'data', train=False,
-                                  download=True, transform=transform)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    return test_loader
+    return get_test_loader(batch_size=batch_size)
 
 
 # ---------------------------------------------------------------------------
@@ -164,19 +144,14 @@ def show_reconstruction(pth_path=model_path, num_pairs=5):
         num_pairs: 显示的原图-重建图对数（默认 5）
     """
     model, device = load_model(pth_path)
-    test_loader = get_test_data(batch_size=64)
-
-    # 取一个 batch
-    images, labels = next(iter(test_loader))
-    images = images[:num_pairs].to(device)
-    labels = labels[:num_pairs]
+    images, labels = first_test_batch(batch_size=64, num_items=num_pairs)
+    images = images.to(device)
 
     with torch.no_grad():
         _, _, _, x_recon, _ = model(images)
 
-    # 反归一化：[-1, 1] → [0, 1]
-    images = ((images + 1) / 2).cpu().clamp(0, 1)
-    x_recon = ((x_recon + 1) / 2).cpu().clamp(0, 1)
+    images = denormalize(images)
+    x_recon = denormalize(x_recon)
 
     fig, axes = plt.subplots(num_pairs, 2, figsize=(4, num_pairs * 2))
 
@@ -203,4 +178,4 @@ if __name__ == "__main__":
     plot_latent_space_with_codebook()
 
     # 功能 2：5 个样本的原图与重建图对比
-    show_reconstruction()()
+    show_reconstruction()

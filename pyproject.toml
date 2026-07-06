@@ -21,7 +21,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["models*", "training*", "visualization*"]
+include = ["common*", "models*", "training*", "visualization*", "analysis*"]
 
 [tool.pyright]
 extraPaths = ["."]

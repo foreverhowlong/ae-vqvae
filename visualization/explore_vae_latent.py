@@ -4,29 +4,19 @@
 有一个可拖拽的圆点（knob），拖动时实时解码生成对应的图片。
 """
 
-import sys
-from pathlib import Path
-# 获取项目根目录
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(ROOT))
-sys.path.append(str(ROOT / "models"))
-
 import torch
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
-from vae import VAE
+
+from common import ROOT, get_device
+from common.data import get_test_loader
+from models.vae import VAE
 
 # ── 配置 ──────────────────────────────────────────
-model_path = ROOT / "outputs/vae32.pth"
+model_path = ROOT / "outputs/vae2.pth"
 
 
 def main():
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available()
-        else "cpu"
-    )
+    device = get_device()
 
     # ── 加载模型 ──────────────────────────────────
     model = VAE().to(device)
@@ -34,13 +24,7 @@ def main():
     model.eval()
 
     # ── 准备测试集潜空间数据 ──────────────────────
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,)),
-    ])
-    test_dataset = datasets.MNIST(root=ROOT / 'data', train=False,
-                                  download=True, transform=transform)
-    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+    test_loader = get_test_loader(batch_size=256)
 
     all_latents = []
     all_labels = []
@@ -162,4 +146,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()()
+    main()

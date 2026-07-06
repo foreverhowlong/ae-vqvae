@@ -7,144 +7,21 @@ depends on the codebook initialization variance.
 Author: Antigravity AI Assistant
 """
 
-import os
-import sys
 import json
-import time
 import argparse
-from pathlib import Path
-import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
 
 # Set matplotlib backend to non-interactive
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Add project root to path for imports
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(ROOT))
-sys.path.append(str(ROOT / "models"))
-
+from common import ROOT, get_device, enable_tf32
+from common.data import GPUDataLoader, get_mnist, get_subsampled_mnist
+from common.experiment import compile_log_from_results, train_vqvae
 from models.vqvae import VQVAE
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
-
-class GPUDataLoader:
-    """
-    A fast DataLoader that preloads the entire dataset onto the GPU/MPS device.
-    Eliminates CPU-to-GPU copy and dataloader worker overhead during training epochs.
-    """
-    def __init__(self, dataset, batch_size=64, shuffle=True, device=None):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.device = device if device is not None else torch.device("cpu")
-        
-        print(f"[GPU Preloader]: Preloading dataset of size {len(dataset)} onto {self.device}...")
-        start_time = time.time()
-        
-        # Load everything using a temporary standard DataLoader
-        temp_loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False, num_workers=0)
-        all_images, all_labels = next(iter(temp_loader))
-        
-        self.images = all_images.to(self.device)
-        self.labels = all_labels.to(self.device)
-        
-        self.num_samples = len(dataset)
-        self.num_batches = (self.num_samples + batch_size - 1) // batch_size
-        print(f"[GPU Preloader]: Preloaded successfully in {time.time() - start_time:.2f} seconds.")
-
-    def __iter__(self):
-        if self.shuffle:
-            indices = torch.randperm(self.num_samples, device=self.device)
-        else:
-            indices = torch.arange(self.num_samples, device=self.device)
-            
-        for i in range(0, self.num_samples, self.batch_size):
-            batch_indices = indices[i : i + self.batch_size]
-            yield self.images[batch_indices], self.labels[batch_indices]
-
-    def __len__(self):
-        return self.num_batches
-
-
-def get_device():
-    """
-    Detects the best available hardware accelerator.
-    """
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        return torch.device("mps")
-    else:
-        return torch.device("cpu")
-
-
-@torch.no_grad()
-def evaluate_metrics(model, data_loader, device, K):
-    """
-    Performs a deterministic evaluation pass over the entire dataset
-    to calculate precise Reconstruction MSE, Codebook Utilization, and Perplexity.
-    """
-    model.eval()
-    all_indices = []
-    total_recon_loss = 0.0
-    
-    for images, _ in data_loader:
-        images = images.to(device)
-        z_e, z_q_raw, z_q_st, x_recon, indices = model(images)
-        
-        all_indices.append(indices.cpu())
-        total_recon_loss += F.mse_loss(x_recon, images, reduction='sum').item()
-        
-    all_indices = torch.cat(all_indices, dim=0)
-    total_samples = len(data_loader.dataset)
-    
-    # Normalize by total pixels (1 channel * 28 * 28 pixels)
-    avg_recon_loss = total_recon_loss / (total_samples * 1 * 28 * 28)
-    
-    # Perplexity calculation: P = exp(-sum p_i log p_i)
-    counts = torch.bincount(all_indices, minlength=K).float()
-    probs = counts / (counts.sum() + 1e-12)
-    entropy = -torch.sum(probs * torch.log(probs + 1e-12))
-    perplexity = torch.exp(entropy).item()
-    
-    # Utilization calculation
-    unique_used = (counts > 0).sum().item()
-    utilization = unique_used / K
-    
-    return avg_recon_loss, utilization, perplexity
-
-
-def compile_log_from_results(results_dir, log_path):
-    """
-    Compiles all individual result JSON files from results_dir into a single unified log dict
-    and saves it to log_path.
-    """
-    log_data = {"completed_runs": [], "runs": {}}
-    if not results_dir.exists():
-        return log_data
-        
-    for file_path in results_dir.glob("*.json"):
-        run_id = file_path.stem
-        try:
-            with open(file_path, "r") as f:
-                run_data = json.load(f)
-            log_data["runs"][run_id] = run_data
-            log_data["completed_runs"].append(run_id)
-        except Exception as e:
-            print(f"  [Compile WARNING] Failed to read {file_path.name}: {e}")
-            
-    with open(log_path, "w") as f:
-        json.dump(log_data, f, indent=2)
-        
-    return log_data
 
 
 def train_single_model_variance(scale_factor, D, args, device_name, exp_dir):
@@ -165,78 +42,37 @@ def train_single_model_variance(scale_factor, D, args, device_name, exp_dir):
 
     # Set device
     device = torch.device(device_name)
-    
-    # Enable hardware-level TensorFloat-32 (TF32) and cuDNN benchmark for Ampere GPUs (RTX 3080 Ti)
-    if device.type == 'cuda':
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-    
+    enable_tf32(device)
+
     # Dry run params
     epochs = 1 if args.dry_run else args.epochs
     K = 256
-    
+
     print(f"\n--> [Worker] Starting VQ-VAE Training: Scale={scale_factor}, D={D} for {epochs} epochs on {device}...")
-    
+
     # Load dataset
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
-    ])
-    
     if args.dry_run:
-        full_dataset = datasets.MNIST(root=ROOT / 'data', train=True, download=False, transform=transform)
-        rng = np.random.default_rng(args.seed)
-        indices = rng.choice(len(full_dataset), size=1000, replace=False)
-        train_dataset = Subset(full_dataset, indices)
+        train_dataset = get_subsampled_mnist(size=1000, seed=args.seed)
     else:
-        train_dataset = datasets.MNIST(root=ROOT / 'data', train=True, download=False, transform=transform)
-        
+        train_dataset = get_mnist(train=True, download=False)
+
     train_loader = GPUDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, device=device)
-    
+
     # Reseed torch and numpy for weight initialization reproducibility
     torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    
+
     model = VQVAE(latent_dim=D, codebook_K=K).to(device)
-    
+
     # Scale codebook weight standard deviation
     if scale_factor != 1.0:
         with torch.no_grad():
             model.codebook.codebook.weight.mul_(scale_factor)
-            
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    
-    epoch_logs = []
-    
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = 0.0
-        
-        for images, _ in train_loader:
-            optimizer.zero_grad()
-            z_e, z_q_raw, z_q_st, x_recon, indices = model(images)
-            
-            recon_loss = F.mse_loss(x_recon, images)
-            codebook_loss = F.mse_loss(z_q_raw, z_e.detach())
-            commitment_loss = F.mse_loss(z_e, z_q_raw.detach())
-            
-            loss = codebook_loss + 0.2 * commitment_loss + recon_loss
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            
-        eval_recon, eval_util, eval_perp = evaluate_metrics(model, train_loader, device, K)
-        epoch_logs.append({
-            "epoch": epoch,
-            "train_loss": total_loss / len(train_loader),
-            "recon_loss": eval_recon,
-            "utilization": eval_util,
-            "perplexity": eval_perp
-        })
-        
-        print(f"    [Scale={scale_factor}, D={D}] Epoch {epoch:2d}/{epochs} | Loss: {total_loss/len(train_loader):.4f} | Recon MSE: {eval_recon:.4f} | Util: {eval_util*100:5.1f}% | Perp: {eval_perp:.2f}")
-        
+
+    epoch_logs = train_vqvae(
+        model, train_loader, device, K, epochs,
+        log_label=f"Scale={scale_factor}, D={D}",
+    )
+
     # Save model checkpoint
     model_dir = exp_dir / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -321,22 +157,12 @@ def main():
     device = get_device()
     device_name = str(device)
     print(f"\n[Hardware Accelerator]: Detected device = {device_name}")
-    
-    # Enable hardware-level TensorFloat-32 (TF32) and cuDNN benchmark for Ampere GPUs (RTX 3080 Ti)
-    if device.type == 'cuda':
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-    
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
-    ])
-    
+    enable_tf32(device)
+
     # Pre-download dataset to avoid multi-worker race conditions
     print("[Dataset Setup]: Ensuring MNIST dataset is fully downloaded locally...")
-    datasets.MNIST(root=ROOT / 'data', train=True, download=True, transform=transform)
-    
+    get_mnist(train=True, download=True)
+
     exp_dir = ROOT / "outputs" / "collapse_experiment" / "exp_variance"
     exp_dir.mkdir(parents=True, exist_ok=True)
     
