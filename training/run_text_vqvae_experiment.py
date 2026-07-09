@@ -85,7 +85,100 @@ def parse_args():
     parser.add_argument("--codebook-size", type=int, default=1024)
     parser.add_argument("--commitment-beta", type=float, default=0.25)
 
+    parser.add_argument(
+        "--collapse-preset",
+        choices=["none", "anti"],
+        default="none",
+        help="Use `anti` to enable common anti-collapse engineering measures.",
+    )
+    parser.add_argument("--use-ema-codebook", dest="use_ema_codebook", action="store_true", default=None)
+    parser.add_argument("--no-ema-codebook", dest="use_ema_codebook", action="store_false")
+    parser.add_argument("--ema-decay", type=float, default=None)
+    parser.add_argument("--ema-eps", type=float, default=None)
+    parser.add_argument("--entropy-weight", type=float, default=None)
+    parser.add_argument("--entropy-temperature", type=float, default=None)
+    parser.add_argument("--diversity-weight", type=float, default=None)
+    parser.add_argument("--code-dropout", type=float, default=None)
+    parser.add_argument("--stochastic-code-sampling", dest="stochastic_code_sampling", action="store_true", default=None)
+    parser.add_argument("--no-stochastic-code-sampling", dest="stochastic_code_sampling", action="store_false")
+    parser.add_argument("--sampling-temperature", type=float, default=None)
+    parser.add_argument("--sampling-topk", type=int, default=None)
+    parser.add_argument("--dead-code-reset-every", type=int, default=None)
+    parser.add_argument("--dead-code-reset-usage-threshold", type=float, default=None)
+    parser.add_argument("--normalize-latents", dest="normalize_latents", action="store_true", default=None)
+    parser.add_argument("--no-normalize-latents", dest="normalize_latents", action="store_false")
+    parser.add_argument("--commitment-beta-start", type=float, default=None)
+    parser.add_argument("--commitment-beta-warmup-steps", type=int, default=None)
+
     return parser.parse_args()
+
+
+def build_collapse_config(args):
+    if args.collapse_preset == "anti":
+        config = CollapseControlConfig(
+            enabled=True,
+            use_ema_codebook=True,
+            ema_decay=0.99,
+            ema_eps=1e-5,
+            entropy_weight=0.05,
+            entropy_temperature=1.0,
+            diversity_weight=0.001,
+            code_dropout=0.01,
+            stochastic_code_sampling=True,
+            sampling_temperature=0.5,
+            sampling_topk=8,
+            dead_code_reset_every=500,
+            dead_code_reset_usage_threshold=1.0,
+            normalize_latents=True,
+            commitment_beta_start=0.05,
+            commitment_beta_warmup_steps=2000,
+        )
+    else:
+        config = CollapseControlConfig()
+
+    overrides = {
+        "use_ema_codebook": args.use_ema_codebook,
+        "ema_decay": args.ema_decay,
+        "ema_eps": args.ema_eps,
+        "entropy_weight": args.entropy_weight,
+        "entropy_temperature": args.entropy_temperature,
+        "diversity_weight": args.diversity_weight,
+        "code_dropout": args.code_dropout,
+        "stochastic_code_sampling": args.stochastic_code_sampling,
+        "sampling_temperature": args.sampling_temperature,
+        "sampling_topk": args.sampling_topk,
+        "dead_code_reset_every": args.dead_code_reset_every,
+        "dead_code_reset_usage_threshold": args.dead_code_reset_usage_threshold,
+        "normalize_latents": args.normalize_latents,
+        "commitment_beta_start": args.commitment_beta_start,
+        "commitment_beta_warmup_steps": args.commitment_beta_warmup_steps,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            setattr(config, key, value)
+
+    config.enabled = any(
+        [
+            config.use_ema_codebook,
+            config.entropy_weight > 0,
+            config.diversity_weight > 0,
+            config.code_dropout > 0,
+            config.stochastic_code_sampling,
+            config.dead_code_reset_every > 0,
+            config.normalize_latents,
+            config.commitment_beta_start is not None,
+        ]
+    )
+    return config
+
+
+def scheduled_commitment_beta(model_config, collapse_config, step):
+    target = model_config.commitment_beta
+    if collapse_config.commitment_beta_start is None or collapse_config.commitment_beta_warmup_steps <= 0:
+        return target
+
+    progress = min(step / collapse_config.commitment_beta_warmup_steps, 1.0)
+    return collapse_config.commitment_beta_start + progress * (target - collapse_config.commitment_beta_start)
 
 
 def make_run_dir(run_name: str | None):
@@ -148,40 +241,61 @@ def compute_accuracy(logits, targets, pad_token_id):
     return correct, total
 
 
-def optimizer_step(model, optimizer, batch, model_config, grad_clip):
+def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_clip, beta, step):
     outputs = model(batch["input_ids"], batch["attention_mask"])
-    loss, recon_loss, codebook_loss, commitment_loss = text_vqvae_losses(
+    losses = text_vqvae_losses(
         outputs,
         batch["input_ids"],
         pad_token_id=model_config.pad_token_id,
-        beta=model_config.commitment_beta,
+        beta=beta,
+        collapse_config=collapse_config,
+        codebook_weight=model.quantizer.codebook.weight,
     )
     optimizer.zero_grad(set_to_none=True)
-    loss.backward()
+    losses["total"].backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
+
+    reset_count = 0
+    if (
+        collapse_config.dead_code_reset_every > 0
+        and step % collapse_config.dead_code_reset_every == 0
+        and hasattr(model.quantizer, "reset_dead_codes")
+    ):
+        reset_count = model.quantizer.reset_dead_codes(
+            outputs["z_e"],
+            usage_threshold=collapse_config.dead_code_reset_usage_threshold,
+        )
 
     correct, total = compute_accuracy(outputs["logits"], batch["input_ids"], model_config.pad_token_id)
     stats = codebook_stats(outputs["indices"], model_config.codebook_size)
     return {
-        "loss": loss.item(),
-        "recon_nll": recon_loss.item(),
-        "codebook_loss": codebook_loss.item(),
-        "commitment_loss": commitment_loss.item(),
+        "loss": losses["total"].item(),
+        "recon_nll": losses["recon"].item(),
+        "codebook_loss": losses["codebook"].item(),
+        "commitment_loss": losses["commitment"].item(),
+        "entropy_loss": losses["entropy"].item(),
+        "assignment_entropy": losses["normalized_assignment_entropy"].item(),
+        "diversity_loss": losses["diversity"].item(),
+        "commitment_beta": beta,
         "token_accuracy": correct / max(total, 1),
         "grad_norm": float(grad_norm),
         "codebook_utilization": stats["utilization"],
         "codebook_perplexity": stats["codebook_perplexity"],
+        "dead_code_resets": reset_count,
     }
 
 
 @torch.no_grad()
-def evaluate(model, data_loader, device, model_config):
+def evaluate(model, data_loader, device, model_config, collapse_config, beta):
     model.eval()
     total_loss = 0.0
     total_recon = 0.0
     total_codebook = 0.0
     total_commit = 0.0
+    total_entropy = 0.0
+    total_assignment_entropy = 0.0
+    total_diversity = 0.0
     total_correct = 0
     total_tokens = 0
     all_indices = []
@@ -190,18 +304,23 @@ def evaluate(model, data_loader, device, model_config):
     for batch in data_loader:
         batch = batch_to_device(batch, device)
         outputs = model(batch["input_ids"], batch["attention_mask"])
-        loss, recon_loss, codebook_loss, commitment_loss = text_vqvae_losses(
+        losses = text_vqvae_losses(
             outputs,
             batch["input_ids"],
             pad_token_id=model_config.pad_token_id,
-            beta=model_config.commitment_beta,
+            beta=beta,
+            collapse_config=collapse_config,
+            codebook_weight=model.quantizer.codebook.weight,
         )
         correct, tokens = compute_accuracy(outputs["logits"], batch["input_ids"], model_config.pad_token_id)
 
-        total_loss += loss.item()
-        total_recon += recon_loss.item()
-        total_codebook += codebook_loss.item()
-        total_commit += commitment_loss.item()
+        total_loss += losses["total"].item()
+        total_recon += losses["recon"].item()
+        total_codebook += losses["codebook"].item()
+        total_commit += losses["commitment"].item()
+        total_entropy += losses["entropy"].item()
+        total_assignment_entropy += losses["normalized_assignment_entropy"].item()
+        total_diversity += losses["diversity"].item()
         total_correct += correct
         total_tokens += tokens
         all_indices.append(outputs["indices"].detach().cpu())
@@ -216,6 +335,10 @@ def evaluate(model, data_loader, device, model_config):
         "token_ppl": math.exp(min(avg_recon, 20.0)),
         "codebook_loss": total_codebook / max(batches, 1),
         "commitment_loss": total_commit / max(batches, 1),
+        "entropy_loss": total_entropy / max(batches, 1),
+        "assignment_entropy": total_assignment_entropy / max(batches, 1),
+        "diversity_loss": total_diversity / max(batches, 1),
+        "commitment_beta": beta,
         "token_accuracy": total_correct / max(total_tokens, 1),
         "codebook_utilization": stats["utilization"],
         "codebook_perplexity": stats["codebook_perplexity"],
@@ -376,7 +499,7 @@ def main():
         commitment_beta=args.commitment_beta,
         pad_token_id=BYTE_PAD,
     )
-    collapse_config = CollapseControlConfig()
+    collapse_config = build_collapse_config(args)
 
     config_payload = {
         "train": asdict(train_config),
@@ -411,7 +534,7 @@ def main():
         device=device, num_workers=train_config.num_workers,
     )
 
-    model = TextVQVAE(model_config).to(device)
+    model = TextVQVAE(model_config, collapse_config=collapse_config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_config.lr,
@@ -450,8 +573,16 @@ def main():
             for batch in train_loader:
                 global_step += 1
                 batch = batch_to_device(batch, device)
+                beta = scheduled_commitment_beta(model_config, collapse_config, global_step)
                 train_metrics = optimizer_step(
-                    model, optimizer, batch, model_config, train_config.grad_clip
+                    model,
+                    optimizer,
+                    batch,
+                    model_config,
+                    collapse_config,
+                    train_config.grad_clip,
+                    beta,
+                    global_step,
                 )
                 train_row = {
                     "split": "train",
@@ -463,7 +594,7 @@ def main():
                 append_jsonl(train_row, metrics_path)
 
                 if global_step == 1 or global_step % train_config.eval_every == 0:
-                    last_eval = evaluate(model, val_loader, device, model_config)
+                    last_eval = evaluate(model, val_loader, device, model_config, collapse_config, beta)
                     eval_row = {
                         "split": "eval",
                         "epoch": epoch,
@@ -497,7 +628,8 @@ def main():
                     )
 
         if last_eval is None:
-            last_eval = evaluate(model, val_loader, device, model_config)
+            beta = scheduled_commitment_beta(model_config, collapse_config, global_step)
+            last_eval = evaluate(model, val_loader, device, model_config, collapse_config, beta)
 
         save_checkpoint(model, optimizer, global_step, train_config.epochs, run_dir, "last.pt")
         write_reconstruction_samples(

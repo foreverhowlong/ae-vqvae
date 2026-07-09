@@ -25,11 +25,19 @@ python -m training.trainVQVAE
 python -m training.run_collapse_experiments --dry-run
 
 # run TinyStories language compression experiment
-# Requires the optional HuggingFace `datasets` package unless --data-file is used.
 python -m training.run_text_vqvae_experiment --run-name tinystories_vqvae_baseline
+
+# run TinyStories language compression with common anti-collapse measures enabled
+python -m training.run_text_vqvae_experiment --run-name tinystories_vqvae_anti --collapse-preset anti
 
 # quick local smoke run from a .txt/.jsonl file
 python -m training.run_text_vqvae_experiment --data-file path/to/text.txt --max-train-samples 2000 --epochs 1
+
+# sync outputs from the Tailscale host configured as `mech` in ~/.ssh/config
+scripts/sync_outputs_from_mech.sh
+
+# sync all outputs, but only pull best.pt among *.pt model files
+scripts/sync_outputs_from_mech.sh --best-only
 
 # visualize
 python -m visualization.visualize_ae
