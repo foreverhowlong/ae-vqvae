@@ -1,4 +1,4 @@
-"""Train a byte-level BPE tokenizer on TinyStories."""
+"""Train a byte-level BPE tokenizer on a text dataset."""
 
 from __future__ import annotations
 
@@ -12,8 +12,9 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 from common import ROOT
 from common.text_data import (
     DEFAULT_HF_DATASET_CACHE,
+    DEFAULT_TEXT_DATASET,
+    iter_hf_texts,
     iter_texts_from_file,
-    iter_tinystories_texts,
 )
 
 
@@ -25,9 +26,16 @@ VALIDATION_TEXT = "Once upon a time, a tiny dragon said: 你好!\nThe end."
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a byte-level BPE tokenizer on TinyStories."
+        description="Train a byte-level BPE tokenizer on a text dataset."
     )
-    parser.add_argument("--split", default="train", help="TinyStories dataset split.")
+    parser.add_argument(
+        "--dataset",
+        default=DEFAULT_TEXT_DATASET,
+        help=f"Hugging Face dataset name (default: {DEFAULT_TEXT_DATASET}).",
+    )
+    parser.add_argument("--dataset-config", default=None, help="Optional Hugging Face dataset config.")
+    parser.add_argument("--split", default="train", help="Dataset split (default: train).")
+    parser.add_argument("--text-field", default="text", help="Dataset/JSONL text field (default: text).")
     parser.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE)
     parser.add_argument("--min-frequency", type=int, default=2)
     parser.add_argument(
@@ -37,7 +45,7 @@ def parse_args():
         help="Optional sample limit for smoke tests or subset training.",
     )
     parser.add_argument(
-        "--dataset-cache-dir",
+        "--cache-dir",
         default=str(DEFAULT_HF_DATASET_CACHE),
         help=f"Hugging Face dataset cache (default: {DEFAULT_HF_DATASET_CACHE}).",
     )
@@ -45,12 +53,12 @@ def parse_args():
         "--streaming",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Stream TinyStories without building the reusable local Arrow cache (default: false).",
+        help="Stream the Hugging Face dataset without building a reusable local Arrow cache.",
     )
     parser.add_argument(
         "--data-file",
         default=None,
-        help="Optional local .txt or .jsonl file instead of TinyStories.",
+        help="Optional local .txt or .jsonl file instead of a Hugging Face dataset.",
     )
     parser.add_argument(
         "--output-dir",
@@ -81,11 +89,16 @@ def validate_args(args):
 
 def build_text_iterator(args) -> Iterable[str]:
     if args.data_file:
-        return iter_texts_from_file(Path(args.data_file), max_samples=args.max_samples)
-    return iter_tinystories_texts(
+        return iter_texts_from_file(
+            Path(args.data_file), text_field=args.text_field, max_samples=args.max_samples
+        )
+    return iter_hf_texts(
+        dataset_name=args.dataset,
         split=args.split,
         max_samples=args.max_samples,
-        cache_dir=args.dataset_cache_dir,
+        text_field=args.text_field,
+        dataset_config=args.dataset_config,
+        cache_dir=args.cache_dir,
         streaming=args.streaming,
     )
 
@@ -173,12 +186,15 @@ def main():
     save_tokenizer(tokenizer, output_dir)
 
     config = {
-        "dataset": {
-            "name": "local" if args.data_file else "roneneldan/TinyStories",
+        "data": {
+            "source": "file" if args.data_file else "huggingface",
+            "dataset": None if args.data_file else args.dataset,
+            "dataset_config": None if args.data_file else args.dataset_config,
             "data_file": args.data_file,
-            "split": args.split,
+            "split": None if args.data_file else args.split,
+            "text_field": args.text_field,
             "streaming": args.streaming if not args.data_file else None,
-            "cache_dir": args.dataset_cache_dir,
+            "cache_dir": None if args.data_file else args.cache_dir,
             "max_samples": args.max_samples,
             "training_samples": counter["samples"],
         },

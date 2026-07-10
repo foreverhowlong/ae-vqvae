@@ -1,4 +1,4 @@
-"""Train a non-autoregressive VQ-VAE on TinyStories byte sequences."""
+"""Train a non-autoregressive VQ-VAE on tokenized text sequences."""
 
 from __future__ import annotations
 
@@ -19,9 +19,10 @@ from torch.utils.data import DataLoader, random_split
 
 from common import ROOT, enable_tf32, get_device
 from common.text_data import (
-    BYTE_PAD,
-    BYTE_VOCAB_SIZE,
+    DEFAULT_BPE_TOKENIZER_PATH,
     DEFAULT_HF_DATASET_CACHE,
+    DEFAULT_TEXT_DATASET,
+    BPETokenizer,
     ByteTokenizer,
     build_text_dataset,
 )
@@ -46,19 +47,29 @@ class TrainConfig:
     grad_clip: float
     eval_every: int
     save_every: int
-    max_train_samples: int | None
-    max_eval_samples: int
-    val_fraction: float
     num_workers: int
-    data_file: str | None
-    tinystories_split: str
-    dataset_cache_dir: str | None
-    streaming: bool
+    tokenizer: str
+    tokenizer_path: str | None
     ablation: str | None
 
 
+@dataclass
+class DataConfig:
+    source: str
+    dataset: str | None
+    dataset_config: str | None
+    split: str | None
+    text_field: str
+    data_file: str | None
+    cache_dir: str | None
+    streaming: bool | None
+    max_train_samples: int | None
+    max_eval_samples: int
+    val_fraction: float
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="TinyStories byte-level VQ-VAE experiment")
+    parser = argparse.ArgumentParser(description="Text VQ-VAE experiment")
 
     parser.add_argument("--run-name", default=None, help="Output run name. Defaults to timestamp.")
     parser.add_argument("--ablation", default=None, help="Free-form ablation label stored in config/logs.")
@@ -72,10 +83,17 @@ def parse_args():
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--num-workers", type=int, default=0)
 
-    parser.add_argument("--data-file", default=None, help="Optional local .txt or .jsonl file.")
-    parser.add_argument("--tinystories-split", default="train")
     parser.add_argument(
-        "--dataset-cache-dir",
+        "--dataset",
+        default=DEFAULT_TEXT_DATASET,
+        help=f"Hugging Face dataset name (default: {DEFAULT_TEXT_DATASET}).",
+    )
+    parser.add_argument("--dataset-config", default=None, help="Optional Hugging Face dataset config.")
+    parser.add_argument("--split", default="train", help="Dataset split (default: train).")
+    parser.add_argument("--text-field", default="text", help="Dataset/JSONL text field (default: text).")
+    parser.add_argument("--data-file", default=None, help="Optional local .txt or .jsonl file.")
+    parser.add_argument(
+        "--cache-dir",
         default=str(DEFAULT_HF_DATASET_CACHE),
         help=f"Hugging Face dataset cache (default: {DEFAULT_HF_DATASET_CACHE}).",
     )
@@ -83,6 +101,17 @@ def parse_args():
     parser.add_argument("--max-train-samples", type=int, default=50000)
     parser.add_argument("--max-eval-samples", type=int, default=2048)
     parser.add_argument("--val-fraction", type=float, default=0.02)
+    parser.add_argument(
+        "--tokenizer",
+        choices=["bpe", "byte"],
+        default="bpe",
+        help="Tokenizer to use (default: bpe).",
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        default=str(DEFAULT_BPE_TOKENIZER_PATH),
+        help=f"Saved tokenizer.json used with --tokenizer bpe (default: {DEFAULT_BPE_TOKENIZER_PATH}).",
+    )
 
     parser.add_argument("--max-seq-len", type=int, default=256)
     parser.add_argument("--latent-slots", type=int, default=32)
@@ -121,6 +150,15 @@ def parse_args():
     parser.add_argument("--commitment-beta-warmup-steps", type=int, default=None)
 
     return parser.parse_args()
+
+
+def load_tokenizer(name: str, path: str | None):
+    if name == "byte":
+        return ByteTokenizer(), None
+    if not path:
+        raise ValueError("--tokenizer-path is required when --tokenizer bpe is selected.")
+    tokenizer = BPETokenizer(path)
+    return tokenizer, str(tokenizer.path)
 
 
 def build_collapse_config(args):
@@ -359,9 +397,10 @@ def evaluate(model, data_loader, device, model_config, collapse_config, beta):
 
 
 @torch.no_grad()
-def write_reconstruction_samples(model, data_loader, device, model_config, path: Path, max_items=16):
+def write_reconstruction_samples(
+    model, data_loader, device, model_config, tokenizer, path: Path, max_items=16
+):
     model.eval()
-    tokenizer = ByteTokenizer()
     written = 0
     with path.open("w", encoding="utf-8") as handle:
         for batch in data_loader:
@@ -467,6 +506,7 @@ def plot_codebook_usage(counts, plot_dir: Path):
 
 def main():
     args = parse_args()
+    tokenizer, tokenizer_path = load_tokenizer(args.tokenizer, args.tokenizer_path)
     run_dir, run_name = make_run_dir(args.run_name)
 
     device = get_device()
@@ -485,18 +525,26 @@ def main():
         grad_clip=args.grad_clip,
         eval_every=args.eval_every,
         save_every=args.save_every,
+        num_workers=args.num_workers,
+        tokenizer=args.tokenizer,
+        tokenizer_path=tokenizer_path,
+        ablation=args.ablation,
+    )
+    data_config = DataConfig(
+        source="file" if args.data_file else "huggingface",
+        dataset=None if args.data_file else args.dataset,
+        dataset_config=None if args.data_file else args.dataset_config,
+        split=None if args.data_file else args.split,
+        text_field=args.text_field,
+        data_file=args.data_file,
+        cache_dir=None if args.data_file else args.cache_dir,
+        streaming=None if args.data_file else args.streaming,
         max_train_samples=args.max_train_samples,
         max_eval_samples=args.max_eval_samples,
         val_fraction=args.val_fraction,
-        num_workers=args.num_workers,
-        data_file=args.data_file,
-        tinystories_split=args.tinystories_split,
-        dataset_cache_dir=args.dataset_cache_dir,
-        streaming=args.streaming,
-        ablation=args.ablation,
     )
     model_config = TextVQVAEConfig(
-        vocab_size=BYTE_VOCAB_SIZE,
+        vocab_size=tokenizer.vocab_size,
         max_seq_len=args.max_seq_len,
         latent_slots=args.latent_slots,
         d_model=args.d_model,
@@ -507,12 +555,14 @@ def main():
         dropout=args.dropout,
         codebook_size=args.codebook_size,
         commitment_beta=args.commitment_beta,
-        pad_token_id=BYTE_PAD,
+        pad_token_id=tokenizer.pad_token_id,
     )
     collapse_config = build_collapse_config(args)
 
+    data_payload = asdict(data_config)
     config_payload = {
         "train": asdict(train_config),
+        "data": data_payload,
         "model": model_config.to_dict(),
         "collapse_control": collapse_config.to_dict(),
         "device": str(device),
@@ -522,17 +572,21 @@ def main():
 
     dataset = build_text_dataset(
         max_seq_len=model_config.max_seq_len,
-        max_samples=train_config.max_train_samples,
-        data_file=train_config.data_file,
-        split=train_config.tinystories_split,
-        cache_dir=train_config.dataset_cache_dir,
-        streaming=train_config.streaming,
+        max_samples=data_config.max_train_samples,
+        data_file=data_config.data_file,
+        dataset_name=data_config.dataset,
+        dataset_config=data_config.dataset_config,
+        split=data_config.split or "train",
+        text_field=data_config.text_field,
+        cache_dir=data_config.cache_dir,
+        streaming=bool(data_config.streaming),
+        tokenizer=tokenizer,
     )
     train_dataset, val_dataset = split_dataset(
         dataset,
-        val_fraction=train_config.val_fraction,
+        val_fraction=data_config.val_fraction,
         seed=train_config.seed,
-        max_eval_samples=train_config.max_eval_samples,
+        max_eval_samples=data_config.max_eval_samples,
     )
 
     train_loader = make_loader(
@@ -558,15 +612,21 @@ def main():
         "latent_slots": model_config.latent_slots,
         "nominal_token_to_latent_ratio": model_config.max_seq_len / model_config.latent_slots,
     }
-    config_payload["dataset"] = {
-        "train_examples": len(train_dataset),
-        "eval_examples": len(val_dataset),
-    }
+    data_payload.update(
+        {
+            "train_examples": len(train_dataset),
+            "eval_examples": len(val_dataset),
+        }
+    )
     atomic_json_dump(config_payload, run_dir / "config.json")
 
     print(f"[Run] {run_name}")
     print(f"[Device] {device}")
     print(f"[Params] {parameter_count:,}")
+    print(
+        f"[Tokenizer] {train_config.tokenizer} vocab={tokenizer.vocab_size} "
+        f"pad={tokenizer.pad_token_id}"
+    )
     print(f"[Data] train={len(train_dataset)} eval={len(val_dataset)}")
     print(f"[Output] {run_dir}")
 
@@ -618,6 +678,7 @@ def main():
                         val_loader,
                         device,
                         model_config,
+                        tokenizer,
                         run_dir / "samples" / f"recon_step{global_step}.jsonl",
                     )
 
@@ -647,6 +708,7 @@ def main():
             val_loader,
             device,
             model_config,
+            tokenizer,
             run_dir / "samples" / "recon_final.jsonl",
         )
         plot_training_curves(metrics_path, run_dir / "plots")
