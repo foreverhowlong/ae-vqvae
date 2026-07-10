@@ -39,6 +39,12 @@ scripts/sync_outputs_from_mech.sh
 # sync all outputs, but only pull best.pt among *.pt model files
 scripts/sync_outputs_from_mech.sh --best-only
 
+# sync outputs without model/checkpoint weight files
+scripts/sync_outputs_from_mech.sh --no-models
+
+# sync only the newest output run directory
+scripts/sync_outputs_from_mech.sh --latest-only
+
 # visualize
 python -m visualization.visualize_ae
 python -m visualization.visualize_vae
