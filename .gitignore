@@ -12,6 +12,10 @@ __pycache__/
 dist/
 build/
 
+# Local secrets and environment overrides
+.env
+.env.*
+
 # IDE
 .vscode/
 .idea/

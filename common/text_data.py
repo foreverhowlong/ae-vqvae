@@ -3,16 +3,35 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
 import torch
+from dotenv import dotenv_values
 from torch.utils.data import Dataset
+
+from . import ROOT
 
 
 BYTE_EOS = 256
 BYTE_PAD = 257
 BYTE_VOCAB_SIZE = 258
+DEFAULT_HF_DATASET_CACHE = ROOT / "data" / "huggingface"
+HF_TOKEN_ENV_VAR = "HF_TOKEN"
+DEFAULT_DOTENV_PATH = ROOT / ".env"
+
+
+def get_hf_token(dotenv_path: Path = DEFAULT_DOTENV_PATH) -> str | None:
+    """Read HF_TOKEN from the environment, falling back to the ignored root .env."""
+    environment_token = os.environ.get(HF_TOKEN_ENV_VAR)
+    if environment_token:
+        return environment_token
+
+    if not dotenv_path.is_file():
+        return None
+    dotenv_token = dotenv_values(dotenv_path).get(HF_TOKEN_ENV_VAR)
+    return str(dotenv_token) if dotenv_token else None
 
 
 class ByteTokenizer:
@@ -61,9 +80,18 @@ class ByteTextDataset(Dataset):
 
 
 def read_texts_from_file(path: Path, text_field: str = "text", max_samples: int | None = None):
-    texts = []
+    return list(iter_texts_from_file(path, text_field=text_field, max_samples=max_samples))
+
+
+def iter_texts_from_file(
+    path: Path,
+    text_field: str = "text",
+    max_samples: int | None = None,
+):
+    """Yield texts from a local .txt or .jsonl file without materializing them."""
     suffix = path.suffix.lower()
     with path.open("r", encoding="utf-8") as handle:
+        yielded = 0
         for line in handle:
             line = line.strip()
             if not line:
@@ -73,10 +101,10 @@ def read_texts_from_file(path: Path, text_field: str = "text", max_samples: int 
                 text = str(item[text_field])
             else:
                 text = line
-            texts.append(text)
-            if max_samples is not None and len(texts) >= max_samples:
+            yield text
+            yielded += 1
+            if max_samples is not None and yielded >= max_samples:
                 break
-    return texts
 
 
 def load_tinystories_texts(
@@ -85,6 +113,23 @@ def load_tinystories_texts(
     cache_dir: str | None = None,
     streaming: bool = False,
 ):
+    return list(
+        iter_tinystories_texts(
+            split=split,
+            max_samples=max_samples,
+            cache_dir=cache_dir,
+            streaming=streaming,
+        )
+    )
+
+
+def iter_tinystories_texts(
+    split: str = "train",
+    max_samples: int | None = None,
+    cache_dir: str | None = None,
+    streaming: bool = False,
+):
+    """Yield TinyStories texts lazily from Hugging Face Datasets."""
     try:
         from datasets import load_dataset
     except ImportError as exc:
@@ -93,19 +138,21 @@ def load_tinystories_texts(
             "Install it or pass --data-file with a local .txt/.jsonl file."
         ) from exc
 
+    resolved_cache_dir = Path(cache_dir).expanduser() if cache_dir else DEFAULT_HF_DATASET_CACHE
+    resolved_cache_dir.mkdir(parents=True, exist_ok=True)
+
     dataset = load_dataset(
         "roneneldan/TinyStories",
         split=split,
-        cache_dir=cache_dir,
+        cache_dir=str(resolved_cache_dir),
         streaming=streaming,
+        token=get_hf_token(),
     )
 
-    texts = []
-    for row in dataset:
-        texts.append(str(row["text"]))
-        if max_samples is not None and len(texts) >= max_samples:
+    for index, row in enumerate(dataset):
+        yield str(row["text"])
+        if max_samples is not None and index + 1 >= max_samples:
             break
-    return texts
 
 
 def build_text_dataset(

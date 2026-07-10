@@ -18,7 +18,13 @@ import torch
 from torch.utils.data import DataLoader, random_split
 
 from common import ROOT, enable_tf32, get_device
-from common.text_data import BYTE_PAD, BYTE_VOCAB_SIZE, ByteTokenizer, build_text_dataset
+from common.text_data import (
+    BYTE_PAD,
+    BYTE_VOCAB_SIZE,
+    DEFAULT_HF_DATASET_CACHE,
+    ByteTokenizer,
+    build_text_dataset,
+)
 from models.text_vqvae import (
     CollapseControlConfig,
     TextVQVAE,
@@ -68,7 +74,11 @@ def parse_args():
 
     parser.add_argument("--data-file", default=None, help="Optional local .txt or .jsonl file.")
     parser.add_argument("--tinystories-split", default="train")
-    parser.add_argument("--dataset-cache-dir", default=None)
+    parser.add_argument(
+        "--dataset-cache-dir",
+        default=str(DEFAULT_HF_DATASET_CACHE),
+        help=f"Hugging Face dataset cache (default: {DEFAULT_HF_DATASET_CACHE}).",
+    )
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--max-train-samples", type=int, default=50000)
     parser.add_argument("--max-eval-samples", type=int, default=2048)

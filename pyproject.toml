@@ -8,8 +8,10 @@ dependencies = [
     "datasets>=2.19.0",
     "matplotlib>=3.10.9",
     "pandas>=3.0.3",
+    "python-dotenv>=1.0.0",
     "scikit-dimension>=0.3.4",
     "scikit-learn>=1.8.0",
+    "tokenizers>=0.20.0",
     "torch>=2.3.0",
     "torchvision>=0.18.0",
 ]
