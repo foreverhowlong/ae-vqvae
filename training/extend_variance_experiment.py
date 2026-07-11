@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from common import ROOT, get_device, enable_tf32
 from common.data import GPUDataLoader, get_mnist, get_subsampled_mnist
 from common.experiment import compile_log_from_results, train_vqvae
+from common.tracking import wandb_run
 from models.vqvae import VQVAE
 
 
@@ -81,11 +82,12 @@ def train_single_model_extend(scale_factor, D, target_epochs, args, device_name,
 
     train_loader = GPUDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, device=device)
 
-    epoch_logs = train_vqvae(
-        model, train_loader, device, K, target_epochs,
-        start_epoch=start_epoch, log_label=f"Scale={scale_factor}, D={D}",
-        epoch_logs=epoch_logs,
-    )
+    with wandb_run(run_id, group="variance-extension", tags=["mnist", "vqvae", "variance"], config={"scale_factor": scale_factor, "latent_dim": D, "codebook_size": K, "start_epoch": start_epoch, "target_epochs": target_epochs, "batch_size": args.batch_size, "seed": args.seed}):
+        epoch_logs = train_vqvae(
+            model, train_loader, device, K, target_epochs,
+            start_epoch=start_epoch, log_label=f"Scale={scale_factor}, D={D}",
+            epoch_logs=epoch_logs,
+        )
 
     # Save updated model checkpoint
     torch.save(model.state_dict(), local_model_path)

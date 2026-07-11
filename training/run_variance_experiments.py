@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from common import ROOT, get_device, enable_tf32
 from common.data import GPUDataLoader, get_mnist, get_subsampled_mnist
 from common.experiment import compile_log_from_results, train_vqvae
+from common.tracking import wandb_run
 from models.vqvae import VQVAE
 
 
@@ -68,10 +69,11 @@ def train_single_model_variance(scale_factor, D, args, device_name, exp_dir):
         with torch.no_grad():
             model.codebook.codebook.weight.mul_(scale_factor)
 
-    epoch_logs = train_vqvae(
-        model, train_loader, device, K, epochs,
-        log_label=f"Scale={scale_factor}, D={D}",
-    )
+    with wandb_run(run_id, group="variance", tags=["mnist", "vqvae", "variance"], config={"scale_factor": scale_factor, "latent_dim": D, "codebook_size": K, "epochs": epochs, "batch_size": args.batch_size, "seed": args.seed}):
+        epoch_logs = train_vqvae(
+            model, train_loader, device, K, epochs,
+            log_label=f"Scale={scale_factor}, D={D}",
+        )
 
     # Save model checkpoint
     model_dir = exp_dir / "models"

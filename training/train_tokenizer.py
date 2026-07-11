@@ -16,6 +16,7 @@ from common.text_data import (
     iter_hf_texts,
     iter_texts_from_file,
 )
+from common.tracking import wandb_run
 
 
 SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>"]
@@ -171,11 +172,14 @@ def main():
     validate_args(args)
 
     counter = {"samples": 0}
-    tokenizer = train_tokenizer(
-        count_texts(build_text_iterator(args), counter),
-        vocab_size=args.vocab_size,
-        min_frequency=args.min_frequency,
-    )
+    tracking_config = {"dataset": args.dataset, "dataset_config": args.dataset_config, "split": args.split, "vocab_size": args.vocab_size, "min_frequency": args.min_frequency, "max_samples": args.max_samples, "streaming": args.streaming}
+    with wandb_run("tokenizer-bpe", group="tokenizer", tags=["text", "tokenizer"], config=tracking_config) as tracker:
+        tokenizer = train_tokenizer(
+            count_texts(build_text_iterator(args), counter),
+            vocab_size=args.vocab_size,
+            min_frequency=args.min_frequency,
+        )
+        tracker.log({"data/training_samples": counter["samples"], "tokenizer/vocab_size": tokenizer.get_vocab_size()})
     if counter["samples"] == 0:
         raise ValueError("No texts were loaded for tokenizer training.")
 

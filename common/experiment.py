@@ -8,6 +8,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from common.tracking import log as wandb_log
+
 
 def vq_losses(z_e, z_q_raw, x_recon, x, beta=0.2):
     """标准 VQ-VAE 三项损失，返回 (total, recon, codebook, commitment)。"""
@@ -85,6 +87,7 @@ def train_vqvae(model, train_loader, device, K, target_epochs, *,
             "utilization": eval_util,
             "perplexity": eval_perp,
         })
+        wandb_log(epoch_logs[-1], step=epoch)
 
         print(f"    [{log_label}] Epoch {epoch:3d}/{target_epochs} | "
               f"Loss: {total_loss/len(train_loader):.4f} | Recon MSE: {eval_recon:.4f} | "

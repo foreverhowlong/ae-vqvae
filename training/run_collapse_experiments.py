@@ -30,6 +30,7 @@ from common.experiment import (
     sync_results_from_drive,
     train_vqvae,
 )
+from common.tracking import wandb_run
 from models.vqvae import VQVAE
 
 
@@ -83,10 +84,11 @@ def train_single_model_exp1(K, D, args, device_name, exp1_dir, drive_dir):
     np.random.seed(args.seed)
     
     model = VQVAE(latent_dim=D, codebook_K=K).to(device)
-    epoch_logs = train_vqvae(
-        model, train_loader, device, K, epochs,
-        log_label=f"K={K}, D={D}",
-    )
+    with wandb_run(run_id, group="collapse-k-d", tags=["mnist", "vqvae", "collapse"], config={"codebook_size": K, "latent_dim": D, "epochs": epochs, "batch_size": args.batch_size, "seed": args.seed}):
+        epoch_logs = train_vqvae(
+            model, train_loader, device, K, epochs,
+            log_label=f"K={K}, D={D}",
+        )
         
     # Save model checkpoint
     model_dir = exp1_dir / "models"
@@ -157,10 +159,11 @@ def train_single_model_exp2(seed, D, args, device_name, exp2_dir, drive_dir):
     np.random.seed(seed)
     
     model = VQVAE(latent_dim=D, codebook_K=K).to(device)
-    epoch_logs = train_vqvae(
-        model, train_loader, device, K, epochs,
-        log_label=f"Seed={seed}, D={D}",
-    )
+    with wandb_run(run_id, group="collapse-seeds", tags=["mnist", "vqvae", "collapse"], config={"seed": seed, "latent_dim": D, "codebook_size": K, "epochs": epochs, "batch_size": args.batch_size}):
+        epoch_logs = train_vqvae(
+            model, train_loader, device, K, epochs,
+            log_label=f"Seed={seed}, D={D}",
+        )
         
     # Save model checkpoint
     model_dir = exp2_dir / "models"

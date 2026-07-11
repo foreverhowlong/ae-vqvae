@@ -4,6 +4,7 @@ import torch
 
 from common import ROOT, get_device
 from common.data import get_train_loader
+from common.tracking import log as wandb_log, wandb_run
 from models.ae import AE
 
 latent_dim = 2
@@ -17,21 +18,24 @@ model = AE(latent_dim=latent_dim).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 criterion = torch.nn.MSELoss()  # 自编码器用 MSE 重建损失
 
-for epoch in range(20):
-    total_loss = 0
-    for images, _ in train_loader:
-        optimizer.zero_grad()
+with wandb_run("mnist-ae", config={"model": "AE", "latent_dim": latent_dim, "epochs": 20, "batch_size": 64, "lr": 1e-3}, tags=["mnist", "ae"]):
+    for epoch in range(20):
+        total_loss = 0
+        for images, _ in train_loader:
+            optimizer.zero_grad()
 
-        images = images.to(device)
-        reconstructed = model(images)
+            images = images.to(device)
+            reconstructed = model(images)
 
-        loss = criterion(reconstructed, images)
+            loss = criterion(reconstructed, images)
 
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
 
-    print(f'Epoch {epoch+1}, Loss: {total_loss/len(train_loader):.4f}')
+        epoch_loss = total_loss / len(train_loader)
+        wandb_log({"epoch": epoch + 1, "train/loss": epoch_loss}, step=epoch + 1)
+        print(f'Epoch {epoch+1}, Loss: {epoch_loss:.4f}')
 
 output_path = ROOT / f"outputs/ae{latent_dim}.pth"
 output_path.parent.mkdir(parents=True, exist_ok=True)

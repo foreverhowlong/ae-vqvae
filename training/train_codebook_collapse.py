@@ -19,6 +19,7 @@ import torch
 from common import ROOT, enable_tf32, get_device
 from common.data import get_test_loader, get_train_loader
 from common.experiment import vq_losses
+from common.tracking import log as wandb_log, wandb_run
 from models.vqvae import VQVAE
 
 # ── matplotlib 配置 ─────────────────────────────────────────
@@ -62,7 +63,7 @@ test_loader = get_test_loader(batch_size=BATCH_SIZE)
 #  2. 训练函数
 # ══════════════════════════════════════════════════════════════
 
-def train_one_model(latent_dim: int) -> dict:
+def _train_one_model(latent_dim: int) -> dict:
     """训练一个指定 latent_dim 的 VQ-VAE，返回训练日志。"""
     print(f"{'='*60}")
     print(f"  Training VQ-VAE with latent_dim = {latent_dim}")
@@ -123,6 +124,14 @@ def train_one_model(latent_dim: int) -> dict:
         log["commitment_loss"].append(total_commit / n_batches)
         log["total_loss"].append(total_loss / n_batches)
         log["codebook_util"].append(utilization)
+        wandb_log({
+            "epoch": epoch,
+            "train/recon_loss": total_recon / n_batches,
+            "train/codebook_loss": total_cb / n_batches,
+            "train/commitment_loss": total_commit / n_batches,
+            "train/total_loss": total_loss / n_batches,
+            "codebook/utilization": utilization,
+        }, step=epoch)
 
         print(
             f"  Epoch {epoch:2d}/{EPOCHS}  "
@@ -145,6 +154,14 @@ def train_one_model(latent_dim: int) -> dict:
     print(f"  Model saved → {model_path}\n")
 
     return log
+
+
+def train_one_model(latent_dim: int) -> dict:
+    config = {"latent_dim": latent_dim, "codebook_size": CODEBOOK_K, "epochs": EPOCHS,
+              "batch_size": BATCH_SIZE, "lr": LR, "beta": BETA}
+    with wandb_run(f"collapse-D{latent_dim}", group="collapse-dimensions",
+                   tags=["mnist", "vqvae", "collapse"], config=config):
+        return _train_one_model(latent_dim)
 
 
 # ══════════════════════════════════════════════════════════════
