@@ -1,6 +1,7 @@
 """Non-autoregressive VQ-VAE for byte-level text compression."""
 
 from dataclasses import asdict, dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -16,6 +17,9 @@ class TextVQVAEConfig:
     n_heads: int = 8
     encoder_layers: int = 4
     decoder_layers: int = 6
+    decoder_type: Literal["cross_attention", "memory_trunk"] = "cross_attention"
+    memory_decoder_latent_layers: int = 4
+    memory_decoder_output_layers: int = 2
     ffn_mult: int = 4
     dropout: float = 0.1
     codebook_size: int = 1024
@@ -160,6 +164,181 @@ class VectorQuantizer(nn.Module):
         return int(dead_indices.numel())
 
 
+class TextDecoder(nn.Module):
+    """Common interface for parallel text decoders."""
+
+    def forward(self, memory: torch.Tensor, seq_len: int) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class CrossAttentionTextDecoder(TextDecoder):
+    """Original position-query decoder, kept as the compatibility path."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__()
+        ffn_dim = config.d_model * config.ffn_mult
+        self.max_seq_len = config.max_seq_len
+        self.position_embedding = nn.Embedding(config.max_seq_len, config.d_model)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=config.d_model,
+            nhead=config.n_heads,
+            dim_feedforward=ffn_dim,
+            dropout=config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=config.decoder_layers)
+        self.norm = nn.LayerNorm(config.d_model)
+
+    def forward(self, memory: torch.Tensor, seq_len: int) -> torch.Tensor:
+        _validate_decode_length(seq_len, self.max_seq_len)
+        batch_size = memory.shape[0]
+        positions = torch.arange(seq_len, device=memory.device).unsqueeze(0).expand(batch_size, -1)
+        queries = self.position_embedding(positions)
+        return self.norm(self.transformer(tgt=queries, memory=memory))
+
+
+class RotarySelfAttention(nn.Module):
+    """Bidirectional self-attention with rotary Q/K position encoding."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float, rope_base: float = 10_000.0):
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads}).")
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError(
+                f"RoPE requires an even attention head dimension, got {self.head_dim}."
+            )
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.output = nn.Linear(d_model, d_model)
+        self.attention_dropout = dropout
+        self.output_dropout = nn.Dropout(dropout)
+        inv_freq = 1.0 / (
+            rope_base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+        )
+        self.register_buffer("rope_inv_freq", inv_freq, persistent=False)
+
+    def _apply_rope(self, tensor: torch.Tensor) -> torch.Tensor:
+        seq_len = tensor.shape[2]
+        positions = torch.arange(seq_len, device=tensor.device, dtype=torch.float32)
+        angles = torch.outer(positions, self.rope_inv_freq.float())
+        cos = angles.cos().to(dtype=tensor.dtype)[None, None, :, :]
+        sin = angles.sin().to(dtype=tensor.dtype)[None, None, :, :]
+
+        pairs = tensor.reshape(*tensor.shape[:-1], self.head_dim // 2, 2)
+        even, odd = pairs.unbind(dim=-1)
+        rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1)
+        return rotated.flatten(-2)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, d_model = hidden.shape
+        qkv = self.qkv(hidden).reshape(
+            batch_size, seq_len, 3, self.n_heads, self.head_dim
+        )
+        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
+        query = self._apply_rope(query)
+        key = self._apply_rope(key)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        attended = attended.transpose(1, 2).contiguous().reshape(batch_size, seq_len, d_model)
+        return self.output_dropout(self.output(attended))
+
+
+class RotaryResidualBlock(nn.Module):
+    """Pre-norm Transformer block used by both memory-trunk stages."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__()
+        ffn_dim = config.d_model * config.ffn_mult
+        self.attention_norm = nn.LayerNorm(config.d_model)
+        self.attention = RotarySelfAttention(config.d_model, config.n_heads, config.dropout)
+        self.ffn_norm = nn.LayerNorm(config.d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(config.d_model, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(ffn_dim, config.d_model),
+            nn.Dropout(config.dropout),
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        hidden = hidden + self.attention(self.attention_norm(hidden))
+        return hidden + self.ffn(self.ffn_norm(hidden))
+
+
+class SubPixelSequenceUpsampler(nn.Module):
+    """Increase sequence length by projecting channels and rearranging them into slots."""
+
+    def __init__(self, d_model: int, upscale_factor: int):
+        super().__init__()
+        if upscale_factor < 1:
+            raise ValueError(f"upscale_factor must be positive, got {upscale_factor}.")
+        self.d_model = d_model
+        self.upscale_factor = upscale_factor
+        self.projection = nn.Linear(d_model, d_model * upscale_factor)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        batch_size, latent_slots, _ = hidden.shape
+        expanded = self.projection(hidden)
+        return expanded.reshape(
+            batch_size, latent_slots * self.upscale_factor, self.d_model
+        )
+
+
+class MemoryTrunkTextDecoder(TextDecoder):
+    """Use quantized memory itself as the decoder residual stream."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__()
+        if config.latent_slots < 1:
+            raise ValueError(f"latent_slots must be positive, got {config.latent_slots}.")
+        if config.max_seq_len % config.latent_slots != 0:
+            raise ValueError(
+                "memory_trunk decoder requires max_seq_len to be an integer multiple of "
+                f"latent_slots, got {config.max_seq_len} and {config.latent_slots}."
+            )
+        self.latent_slots = config.latent_slots
+        self.max_seq_len = config.max_seq_len
+        self.latent_blocks = nn.ModuleList(
+            RotaryResidualBlock(config) for _ in range(config.memory_decoder_latent_layers)
+        )
+        self.upsampler = SubPixelSequenceUpsampler(
+            config.d_model, config.max_seq_len // config.latent_slots
+        )
+        self.output_blocks = nn.ModuleList(
+            RotaryResidualBlock(config) for _ in range(config.memory_decoder_output_layers)
+        )
+        self.norm = nn.LayerNorm(config.d_model)
+
+    def forward(self, memory: torch.Tensor, seq_len: int) -> torch.Tensor:
+        _validate_decode_length(seq_len, self.max_seq_len)
+        if memory.shape[1] != self.latent_slots:
+            raise ValueError(
+                f"Expected {self.latent_slots} latent slots, got {memory.shape[1]}."
+            )
+        hidden = memory
+        for block in self.latent_blocks:
+            hidden = block(hidden)
+        hidden = self.upsampler(hidden)
+        for block in self.output_blocks:
+            hidden = block(hidden)
+        return self.norm(hidden[:, :seq_len])
+
+
+def _validate_decode_length(seq_len: int, max_seq_len: int) -> None:
+    if not 0 < seq_len <= max_seq_len:
+        raise ValueError(f"seq_len must be in [1, {max_seq_len}], got {seq_len}.")
+
+
 class TextVQVAE(nn.Module):
     """Compresses a byte sequence into discrete latent slots and decodes in parallel."""
 
@@ -171,7 +350,6 @@ class TextVQVAE(nn.Module):
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.encoder_pos_embedding = nn.Embedding(config.max_seq_len, config.d_model)
-        self.decoder_pos_embedding = nn.Embedding(config.max_seq_len, config.d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
@@ -192,17 +370,18 @@ class TextVQVAE(nn.Module):
         self.latent_proj = nn.Linear(config.d_model, config.d_model)
         self.quantizer = VectorQuantizer(config.codebook_size, config.d_model, self.collapse_config)
 
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=config.d_model,
-            nhead=config.n_heads,
-            dim_feedforward=ffn_dim,
-            dropout=config.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=config.decoder_layers)
-        self.decoder_norm = nn.LayerNorm(config.d_model)
+        decoder_types: dict[str, type[TextDecoder]] = {
+            "cross_attention": CrossAttentionTextDecoder,
+            "memory_trunk": MemoryTrunkTextDecoder,
+        }
+        try:
+            decoder_class = decoder_types[config.decoder_type]
+        except KeyError as exc:
+            choices = ", ".join(sorted(decoder_types))
+            raise ValueError(
+                f"Unknown decoder_type {config.decoder_type!r}; expected one of: {choices}."
+            ) from exc
+        self.decoder_impl = decoder_class(config)
         self.output_head = nn.Linear(config.d_model, config.vocab_size)
 
     def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
@@ -223,12 +402,28 @@ class TextVQVAE(nn.Module):
         return self.latent_proj(latents)
 
     def decode(self, z_q_st: torch.Tensor, seq_len: int):
-        batch_size = z_q_st.shape[0]
-        positions = torch.arange(seq_len, device=z_q_st.device).unsqueeze(0).expand(batch_size, -1)
-        queries = self.decoder_pos_embedding(positions)
-        decoded = self.decoder(tgt=queries, memory=z_q_st)
-        decoded = self.decoder_norm(decoded)
-        return self.output_head(decoded)
+        return self.output_head(self.decoder_impl(z_q_st, seq_len))
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        """Load current checkpoints and migrate checkpoints from the original decoder layout."""
+        if isinstance(self.decoder_impl, CrossAttentionTextDecoder) and any(
+            key.startswith("decoder.") for key in state_dict
+        ):
+            metadata = getattr(state_dict, "_metadata", None)
+            state_dict = state_dict.copy()
+            if metadata is not None:
+                state_dict._metadata = metadata
+            legacy_prefixes = {
+                "decoder_pos_embedding.": "decoder_impl.position_embedding.",
+                "decoder.": "decoder_impl.transformer.",
+                "decoder_norm.": "decoder_impl.norm.",
+            }
+            for key in list(state_dict):
+                for old_prefix, new_prefix in legacy_prefixes.items():
+                    if key.startswith(old_prefix):
+                        state_dict[new_prefix + key.removeprefix(old_prefix)] = state_dict.pop(key)
+                        break
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
         z_e = self.encode(input_ids, attention_mask=attention_mask)

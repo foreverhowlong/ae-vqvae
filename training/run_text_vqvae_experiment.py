@@ -18,6 +18,7 @@ import torch
 from torch.utils.data import DataLoader, random_split
 
 from common import ROOT, enable_tf32, get_device
+from common.tracking import init_wandb
 from common.text_data import (
     DEFAULT_BPE_TOKENIZER_PATH,
     DEFAULT_HF_DATASET_CACHE,
@@ -119,6 +120,14 @@ def parse_args():
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--encoder-layers", type=int, default=4)
     parser.add_argument("--decoder-layers", type=int, default=6)
+    parser.add_argument(
+        "--decoder-type",
+        choices=["cross_attention", "memory_trunk"],
+        default="cross_attention",
+        help="Decoder backbone (default: cross_attention).",
+    )
+    parser.add_argument("--memory-decoder-latent-layers", type=int, default=4)
+    parser.add_argument("--memory-decoder-output-layers", type=int, default=2)
     parser.add_argument("--ffn-mult", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--codebook-size", type=int, default=1024)
@@ -551,6 +560,9 @@ def main():
         n_heads=args.n_heads,
         encoder_layers=args.encoder_layers,
         decoder_layers=args.decoder_layers,
+        decoder_type=args.decoder_type,
+        memory_decoder_latent_layers=args.memory_decoder_latent_layers,
+        memory_decoder_output_layers=args.memory_decoder_output_layers,
         ffn_mult=args.ffn_mult,
         dropout=args.dropout,
         codebook_size=args.codebook_size,
@@ -636,6 +648,7 @@ def main():
     global_step = 0
     last_eval = None
     start_time = time.time()
+    tracker = init_wandb(run_name, group="text-vqvae", tags=["text", "vqvae"], config=config_payload)
 
     try:
         for epoch in range(1, train_config.epochs + 1):
@@ -662,6 +675,7 @@ def main():
                     **train_metrics,
                 }
                 append_jsonl(train_row, metrics_path)
+                tracker.log({f"train/{key}": value for key, value in train_metrics.items()}, step=global_step)
 
                 if global_step == 1 or global_step % train_config.eval_every == 0:
                     last_eval = evaluate(model, val_loader, device, model_config, collapse_config, beta)
@@ -673,6 +687,7 @@ def main():
                         **{k: v for k, v in last_eval.items() if k != "code_counts"},
                     }
                     append_jsonl(eval_row, metrics_path)
+                    tracker.log({f"eval/{key}": value for key, value in last_eval.items() if key != "code_counts"}, step=global_step)
                     write_reconstruction_samples(
                         model,
                         val_loader,
@@ -727,6 +742,7 @@ def main():
         }
         atomic_json_dump(summary, run_dir / "summary.json")
         shutil.copy2(run_dir / "summary.json", run_dir / "latest_summary.json")
+        tracker.summary.update({"best_eval_loss": best_eval_loss, "best_step": best_step, "steps": global_step})
 
     except Exception as exc:
         atomic_json_dump(
@@ -740,6 +756,8 @@ def main():
             run_dir / "summary.json",
         )
         raise
+    finally:
+        tracker.finish()
 
 
 if __name__ == "__main__":

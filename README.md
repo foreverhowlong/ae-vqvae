@@ -16,6 +16,15 @@ PyTorch implementations of Autoencoder, Variational Autoencoder, and Vector Quan
 
 ## Usage
 
+All training entry points report configs and metrics to Weights & Biases. Put the API key
+in the ignored root `.env` file (the project/entity settings are optional):
+
+```dotenv
+WANDB_API_KEY=your_api_key
+WANDB_PROJECT=ae-vqvae
+# WANDB_ENTITY=your_team_or_username
+```
+
 ```bash
 # train
 python -m training.trainAE
@@ -57,6 +66,12 @@ python -m training.train_tokenizer --data-file path/to/text.txt --max-samples 10
 
 # run TinyStories language compression with common anti-collapse measures enabled
 python -m training.run_text_vqvae_experiment --run-name tinystories_vqvae_anti --collapse-preset anti
+
+# sequentially run the experiments in a JSON config; unspecified options keep their defaults
+python -m training.run_experiment_sequence --config configs/text_vqvae_experiments.example.json
+
+# inspect generated run names and commands without starting training
+python -m training.run_experiment_sequence --config configs/text_vqvae_experiments.example.json --dry-run
 
 # quick local smoke run from a .txt/.jsonl file
 python -m training.run_text_vqvae_experiment --data-file path/to/text.txt --max-train-samples 2000 --epochs 1

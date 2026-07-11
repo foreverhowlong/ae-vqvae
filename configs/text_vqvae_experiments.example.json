@@ -1,0 +1,13 @@
+{
+  "module": "training.run_text_vqvae_experiment",
+  "experiments": [
+    {
+      "seed": 42,
+      "collapse-preset": "none"
+    },
+    {
+      "seed": 42,
+      "collapse-preset": "anti"
+    }
+  ]
+}
