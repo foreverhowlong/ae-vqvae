@@ -130,7 +130,7 @@ def parse_args():
     parser.add_argument("--memory-decoder-output-layers", type=int, default=2)
     parser.add_argument("--ffn-mult", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--codebook-size", type=int, default=1024)
+    parser.add_argument("--codebook-size", type=int, default=3072)
     parser.add_argument("--commitment-beta", type=float, default=0.25)
 
     parser.add_argument(

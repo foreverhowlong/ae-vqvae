@@ -1,0 +1,12 @@
+{
+  "module": "training.run_text_vqvae_experiment",
+  "experiments": [
+    {
+      "decoder-type": "cross_attention"
+    },
+    {
+      "decoder-type": "memory_trunk"
+    }
+  ],
+  "_comments": "本次训练两个模型，测试不同decoder结构的作用。先训练一个codebooksize3072的以位置编码为残差流主干的decoder，再训练一个以memory为残差流主干的decoder，进行对比"
+}
