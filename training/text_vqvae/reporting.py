@@ -47,11 +47,12 @@ def write_reconstruction_samples(model, data_loader, device, model_config, token
         for batch in data_loader:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            outputs = model(input_ids, attention_mask)
-            pred_ids = outputs["logits"].argmax(dim=-1).cpu()
-            for original, reconstructed in zip(input_ids.cpu(), pred_ids):
+            outputs = model.infer(input_ids, attention_mask)
+            pred_ids = [logits.argmax(dim=-1).cpu() for logits in outputs["logits"]]
+            lengths = outputs["lengths"].cpu()
+            for original, reconstructed, length in zip(input_ids.cpu(), pred_ids, lengths):
                 row = {
-                    "original": tokenizer.decode(original.tolist()),
+                    "original": tokenizer.decode(original[: int(length.item())].tolist()),
                     "reconstruction": tokenizer.decode(reconstructed.tolist()),
                 }
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")

@@ -25,6 +25,7 @@ class TextVQVAEConfig:
     codebook_size: int = 3072
     commitment_beta: float = 0.25
     pad_token_id: int = 257
+    slot_pad_ratio_threshold: float = 0.5
 
     def to_dict(self):
         return asdict(self)
@@ -81,34 +82,42 @@ class VectorQuantizer(nn.Module):
         flat_valid_mask = valid_mask.reshape(-1)
         weights = self.codebook.weight
 
-        distance_flat = flat
-        distance_weights = weights
-        if self.collapse_config.normalize_latents:
-            distance_flat = F.normalize(distance_flat, dim=-1)
-            distance_weights = F.normalize(distance_weights, dim=-1)
-
-        distances = (
-            distance_flat.pow(2).sum(dim=1, keepdim=True)
-            - 2 * distance_flat @ distance_weights.t()
-            + distance_weights.pow(2).sum(dim=1).unsqueeze(0)
+        # Keep invalid slots out of nearest-neighbour assignment altogether.
+        # Full-shaped tensors are reconstructed below for API/checkpoint-tooling
+        # compatibility, but invalid rows never gather a codebook vector.
+        flat_indices = torch.full(
+            (flat.shape[0],), -1, dtype=torch.long, device=z_e.device
         )
-        indices = self._select_codes(distances)
-        z_q_raw = self.codebook(indices).view_as(z_e)
-        z_q_raw = torch.where(valid_mask.unsqueeze(-1), z_q_raw, z_e.detach())
+        flat_z_q_raw = flat.detach().clone()
+        distances = flat.new_zeros((flat.shape[0], self.codebook_size))
 
-        if (
-            self.training
-            and self.collapse_config.use_ema_codebook
-            and flat_valid_mask.any()
-        ):
-            self._ema_update(
-                flat[flat_valid_mask].detach(),
-                indices[flat_valid_mask].detach(),
+        if flat_valid_mask.any():
+            distance_flat = flat[flat_valid_mask]
+            distance_weights = weights
+            if self.collapse_config.normalize_latents:
+                distance_flat = F.normalize(distance_flat, dim=-1)
+                distance_weights = F.normalize(distance_weights, dim=-1)
+
+            valid_distances = (
+                distance_flat.pow(2).sum(dim=1, keepdim=True)
+                - 2 * distance_flat @ distance_weights.t()
+                + distance_weights.pow(2).sum(dim=1).unsqueeze(0)
             )
+            valid_indices = self._select_codes(valid_distances)
+            flat_indices[flat_valid_mask] = valid_indices
+            flat_z_q_raw[flat_valid_mask] = self.codebook(valid_indices)
+            distances[flat_valid_mask] = valid_distances
+
+            if self.training and self.collapse_config.use_ema_codebook:
+                self._ema_update(
+                    flat[flat_valid_mask].detach(),
+                    valid_indices.detach(),
+                )
+
+        z_q_raw = flat_z_q_raw.view_as(z_e)
 
         z_q_st = z_e + (z_q_raw - z_e).detach()
-        indices = indices.view(z_e.shape[0], z_e.shape[1])
-        indices = indices.masked_fill(~valid_mask, -1)
+        indices = flat_indices.view(z_e.shape[0], z_e.shape[1])
         return {
             "z_q_raw": z_q_raw,
             "z_q_st": z_q_st,
@@ -368,8 +377,9 @@ def pad_aware_adaptive_pool1d(
     hidden: torch.Tensor,
     attention_mask: torch.Tensor,
     output_size: int,
+    slot_pad_ratio_threshold: float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Average valid tokens in adaptive-pooling bins and zero fully padded bins."""
+    """Average valid tokens in absolute-position bins and mask PAD-heavy bins."""
     if hidden.ndim != 3:
         raise ValueError(f"hidden must have shape (batch, sequence, channels), got {hidden.shape}.")
     if attention_mask.shape != hidden.shape[:2]:
@@ -378,6 +388,11 @@ def pad_aware_adaptive_pool1d(
         )
     if output_size < 1:
         raise ValueError(f"output_size must be positive, got {output_size}.")
+    if not 0.0 <= slot_pad_ratio_threshold < 1.0:
+        raise ValueError(
+            "slot_pad_ratio_threshold must be in [0, 1), got "
+            f"{slot_pad_ratio_threshold}."
+        )
 
     valid_tokens = attention_mask.to(device=hidden.device, dtype=torch.bool)
     masked_hidden = torch.where(
@@ -391,7 +406,8 @@ def pad_aware_adaptive_pool1d(
     valid_fraction = F.adaptive_avg_pool1d(
         valid_tokens.to(hidden.dtype).unsqueeze(1), output_size
     ).squeeze(1)
-    latent_mask = valid_fraction > 0
+    pad_fraction = 1.0 - valid_fraction
+    latent_mask = pad_fraction <= slot_pad_ratio_threshold
     pooled = pooled_with_pad_denominator / valid_fraction.clamp_min(1e-12).unsqueeze(-1)
     pooled = torch.where(latent_mask.unsqueeze(-1), pooled, torch.zeros_like(pooled))
     return pooled, latent_mask
@@ -402,6 +418,11 @@ class TextVQVAE(nn.Module):
 
     def __init__(self, config: TextVQVAEConfig, collapse_config: CollapseControlConfig | None = None):
         super().__init__()
+        if not 0.0 <= config.slot_pad_ratio_threshold < 1.0:
+            raise ValueError(
+                "slot_pad_ratio_threshold must be in [0, 1), got "
+                f"{config.slot_pad_ratio_threshold}."
+            )
         self.config = config
         self.collapse_config = collapse_config or CollapseControlConfig()
         ffn_dim = config.d_model * config.ffn_mult
@@ -466,6 +487,7 @@ class TextVQVAE(nn.Module):
             hidden,
             attention_mask,
             self.config.latent_slots,
+            slot_pad_ratio_threshold=self.config.slot_pad_ratio_threshold,
         )
         latents = self.latent_proj(pooled)
         # A fully padded segment is represented by a fixed zero vector, including
@@ -500,9 +522,16 @@ class TextVQVAE(nn.Module):
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
+        if attention_mask is None:
+            resolved_attention_mask = input_ids != self.config.pad_token_id
+        else:
+            resolved_attention_mask = attention_mask.to(
+                device=input_ids.device, dtype=torch.bool
+            )
+        lengths = resolved_attention_mask.sum(dim=-1)
         z_e, latent_mask = self.encode(
             input_ids,
-            attention_mask=attention_mask,
+            attention_mask=resolved_attention_mask,
             return_mask=True,
         )
         quantized = self.quantizer(z_e, valid_mask=latent_mask)
@@ -518,7 +547,31 @@ class TextVQVAE(nn.Module):
             "indices": indices,
             "distances": quantized["distances"],
             "latent_mask": latent_mask,
+            "lengths": lengths,
         }
+
+    @torch.no_grad()
+    def infer(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
+        """Run reconstruction and expose only defined, per-example logits.
+
+        Training keeps a dense ``[B, L, V]`` tensor. Inference returns a tuple
+        of ``[length, V]`` tensors so callers cannot accidentally consume the
+        undefined PAD region.
+        """
+        was_training = self.training
+        self.eval()
+        try:
+            outputs = self.forward(input_ids, attention_mask=attention_mask)
+            dense_logits = outputs["logits"]
+            outputs["logits"] = tuple(
+                sample_logits[:length]
+                for sample_logits, length in zip(
+                    dense_logits, outputs["lengths"].tolist()
+                )
+            )
+            return outputs
+        finally:
+            self.train(was_training)
 
 
 def assignment_entropy_loss(outputs, temperature: float, codebook_size: int):
@@ -567,10 +620,20 @@ def text_vqvae_losses(
     beta: float,
     collapse_config: CollapseControlConfig | None = None,
     codebook_weight: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,
 ):
     collapse_config = collapse_config or CollapseControlConfig()
     logits = outputs["logits"]
-    valid_tokens = targets != pad_token_id
+    if attention_mask is None:
+        # Compatibility path for external/legacy callers. The main training
+        # path passes the independently constructed token-level mask.
+        valid_tokens = targets != pad_token_id
+    else:
+        if attention_mask.shape != targets.shape:
+            raise ValueError(
+                f"attention_mask must have shape {targets.shape}, got {attention_mask.shape}."
+            )
+        valid_tokens = attention_mask.to(device=targets.device, dtype=torch.bool)
     if valid_tokens.any():
         recon_loss = F.cross_entropy(logits[valid_tokens], targets[valid_tokens])
     else:

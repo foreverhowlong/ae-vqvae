@@ -68,9 +68,21 @@ def scheduled_commitment_beta(
     return collapse_config.commitment_beta_start + progress * (target - collapse_config.commitment_beta_start)
 
 
-def compute_accuracy(logits: torch.Tensor, targets: torch.Tensor, pad_token_id: int):
+def compute_accuracy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    pad_token_id: int,
+    attention_mask: torch.Tensor | None = None,
+):
     preds = logits.argmax(dim=-1)
-    valid = targets != pad_token_id
+    if attention_mask is None:
+        valid = targets != pad_token_id
+    else:
+        if attention_mask.shape != targets.shape:
+            raise ValueError(
+                f"attention_mask must have shape {targets.shape}, got {attention_mask.shape}."
+            )
+        valid = attention_mask.to(device=targets.device, dtype=torch.bool)
     correct = ((preds == targets) & valid).sum().item()
     total = valid.sum().item()
     return correct, total
@@ -96,6 +108,7 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
         batch["input_ids"],
         pad_token_id=model_config.pad_token_id,
         beta=beta,
+        attention_mask=batch["attention_mask"],
         collapse_config=collapse_config,
         codebook_weight=model.quantizer.codebook.weight,
     )
@@ -116,7 +129,12 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
             valid_mask=outputs["latent_mask"],
         )
 
-    correct, total = compute_accuracy(outputs["logits"], batch["input_ids"], model_config.pad_token_id)
+    correct, total = compute_accuracy(
+        outputs["logits"],
+        batch["input_ids"],
+        model_config.pad_token_id,
+        attention_mask=batch["attention_mask"],
+    )
     stats = codebook_stats(outputs["indices"], model_config.codebook_size, valid_mask=outputs["latent_mask"])
     return {
         "loss": losses["total"].item(),
@@ -159,10 +177,16 @@ def evaluate(model, data_loader, device, model_config, collapse_config, beta: fl
             batch["input_ids"],
             pad_token_id=model_config.pad_token_id,
             beta=beta,
+            attention_mask=batch["attention_mask"],
             collapse_config=collapse_config,
             codebook_weight=model.quantizer.codebook.weight,
         )
-        correct, tokens = compute_accuracy(outputs["logits"], batch["input_ids"], model_config.pad_token_id)
+        correct, tokens = compute_accuracy(
+            outputs["logits"],
+            batch["input_ids"],
+            model_config.pad_token_id,
+            attention_mask=batch["attention_mask"],
+        )
 
         total_loss += losses["total"].item()
         total_recon += losses["recon"].item()

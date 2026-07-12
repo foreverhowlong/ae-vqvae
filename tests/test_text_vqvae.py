@@ -18,6 +18,7 @@ from models.text_vqvae import (
     SubPixelSequenceUpsampler,
     TextVQVAE,
     TextVQVAEConfig,
+    VectorQuantizer,
     codebook_stats,
     pad_aware_adaptive_pool1d,
     text_vqvae_losses,
@@ -128,6 +129,22 @@ class TextVQVAEDecoderTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "seq_len"):
                     model.decode(torch.randn(2, 4, 16), seq_len=13)
 
+    def test_inference_returns_logits_truncated_by_side_channel_lengths(self):
+        model = TextVQVAE(small_config(decoder_type="memory_trunk"))
+        input_ids = torch.randint(0, 31, (2, 12))
+        attention_mask = torch.zeros(2, 12, dtype=torch.long)
+        attention_mask[0, :5] = 1
+        attention_mask[1, :9] = 1
+
+        dense_outputs = model(input_ids, attention_mask)
+        inference_outputs = model.infer(input_ids, attention_mask)
+
+        torch.testing.assert_close(dense_outputs["lengths"], torch.tensor([5, 9]))
+        self.assertEqual(
+            [tuple(logits.shape) for logits in inference_outputs["logits"]],
+            [(5, 32), (9, 32)],
+        )
+
     def test_original_cross_attention_checkpoint_keys_are_migrated(self):
         model = TextVQVAE(small_config())
         legacy_state = OrderedDict()
@@ -141,7 +158,7 @@ class TextVQVAEDecoderTest(unittest.TestCase):
 
 
 class TextVQVAEPaddingTest(unittest.TestCase):
-    def test_pad_aware_pool_excludes_pad_tokens_and_zeros_empty_segments(self):
+    def test_pad_aware_pool_excludes_pad_heavy_segments(self):
         hidden = torch.tensor(
             [
                 [[1.0], [2.0], [100.0], [4.0], [100.0], [100.0]],
@@ -163,12 +180,30 @@ class TextVQVAEPaddingTest(unittest.TestCase):
 
         torch.testing.assert_close(
             pooled,
-            torch.tensor([[[1.5], [4.0]], [[0.0], [0.0]]]),
+            torch.tensor([[[1.5], [0.0]], [[0.0], [0.0]]]),
         )
         torch.testing.assert_close(
             latent_mask,
-            torch.tensor([[True, True], [False, False]]),
+            torch.tensor([[True, False], [False, False]]),
         )
+
+    def test_pad_ratio_at_threshold_remains_a_content_slot(self):
+        hidden = torch.tensor([[[1.0], [100.0], [3.0], [5.0]]])
+        attention_mask = torch.tensor([[1, 0, 1, 1]])
+
+        pooled, latent_mask = pad_aware_adaptive_pool1d(
+            hidden,
+            attention_mask,
+            output_size=2,
+            slot_pad_ratio_threshold=0.5,
+        )
+
+        torch.testing.assert_close(pooled, torch.tensor([[[1.0], [4.0]]]))
+        self.assertTrue(latent_mask.all())
+
+    def test_slot_pad_ratio_threshold_is_validated(self):
+        with self.assertRaisesRegex(ValueError, "slot_pad_ratio_threshold"):
+            TextVQVAE(small_config(slot_pad_ratio_threshold=1.0))
 
     def test_pad_aware_pool_matches_adaptive_pool_when_all_tokens_are_valid(self):
         hidden = torch.randn(2, 11, 3)
@@ -233,6 +268,65 @@ class TextVQVAEPaddingTest(unittest.TestCase):
         self.assertEqual((correct, total), (1, 1))
         self.assertEqual(stats["used_codes"], 1)
         self.assertEqual(stats["counts"].tolist(), [0.0, 0.0, 1.0, 0.0])
+
+    def test_reconstruction_loss_and_accuracy_prefer_attention_mask(self):
+        targets = torch.tensor([[1, 3, 3]])
+        logits = torch.tensor(
+            [[[0.0, 4.0, 0.0, 0.0], [9.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 9.0]]]
+        )
+        outputs = {
+            "logits": logits,
+            "z_e": torch.zeros(1, 1, 2),
+            "z_q_raw": torch.zeros(1, 1, 2),
+            "latent_mask": torch.ones(1, 1, dtype=torch.bool),
+            "distances": torch.zeros(1, 1, 4),
+        }
+        attention_mask = torch.tensor([[1, 1, 0]])
+
+        losses = text_vqvae_losses(
+            outputs,
+            targets,
+            pad_token_id=3,
+            beta=0.25,
+            attention_mask=attention_mask,
+        )
+        expected = torch.nn.functional.cross_entropy(logits[:, :2].reshape(-1, 4), targets[:, :2].reshape(-1))
+        correct, total = compute_accuracy(
+            logits,
+            targets,
+            pad_token_id=3,
+            attention_mask=attention_mask,
+        )
+
+        torch.testing.assert_close(losses["recon"], expected)
+        self.assertEqual((correct, total), (1, 2))
+
+
+class VectorQuantizerMaskingTest(unittest.TestCase):
+    def test_only_valid_slots_are_sent_to_code_assignment(self):
+        quantizer = VectorQuantizer(codebook_size=4, d_model=2)
+        z_e = torch.randn(2, 3, 2)
+        valid_mask = torch.tensor([[True, False, True], [False, False, True]])
+
+        with patch.object(quantizer, "_select_codes", wraps=quantizer._select_codes) as select:
+            outputs = quantizer(z_e, valid_mask=valid_mask)
+
+        self.assertEqual(select.call_count, 1)
+        self.assertEqual(select.call_args.args[0].shape, (3, 4))
+        torch.testing.assert_close(outputs["indices"][~valid_mask], -torch.ones(3, dtype=torch.long))
+        torch.testing.assert_close(outputs["distances"][~valid_mask], torch.zeros(3, 4))
+
+    def test_all_invalid_slots_skip_code_assignment(self):
+        quantizer = VectorQuantizer(codebook_size=4, d_model=2)
+        z_e = torch.randn(1, 2, 2)
+        valid_mask = torch.zeros(1, 2, dtype=torch.bool)
+
+        with patch.object(quantizer, "_select_codes", wraps=quantizer._select_codes) as select:
+            outputs = quantizer(z_e, valid_mask=valid_mask)
+
+        select.assert_not_called()
+        torch.testing.assert_close(outputs["z_q_raw"], z_e)
+        torch.testing.assert_close(outputs["indices"], -torch.ones(1, 2, dtype=torch.long))
 
 
 class TextVQVAEVisualizationTest(unittest.TestCase):
@@ -378,6 +472,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(data.max_train_samples, 50000)
         self.assertEqual(data.val_fraction, 0.02)
         self.assertEqual(model.latent_slots, 128)
+        self.assertEqual(model.slot_pad_ratio_threshold, 0.5)
         self.assertEqual(model.codebook_size, 3072)
         self.assertEqual(model.d_model, 448)
         self.assertEqual(model.max_seq_len, 256)

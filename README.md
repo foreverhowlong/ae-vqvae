@@ -50,6 +50,9 @@ python -m training.run_text_vqvae_experiment --decoder-type memory_trunk
 # use kmeans codebook initialization instead of random
 python -m training.run_text_vqvae_experiment --codebook-init kmeans
 
+# change the slot-level PAD exclusion threshold (default: 0.5)
+python -m training.run_text_vqvae_experiment --slot-pad-ratio-threshold 0.5
+
 # enable all anti-collapse measures (EMA, dead-code reset, entropy loss, …)
 python -m training.run_text_vqvae_experiment --collapse-preset anti
 

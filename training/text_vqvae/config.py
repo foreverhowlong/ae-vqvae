@@ -143,6 +143,7 @@ def add_arguments(parser) -> None:
     g = parser.add_argument_group("model")
     g.add_argument("--max-seq-len", type=int, default=None)
     g.add_argument("--latent-slots", type=int, default=None)
+    g.add_argument("--slot-pad-ratio-threshold", type=float, default=None)
     g.add_argument("--d-model", type=int, default=None)
     g.add_argument("--n-heads", type=int, default=None)
     g.add_argument("--encoder-layers", type=int, default=None)
@@ -338,6 +339,7 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
     _override(model_cfg, {
         "max_seq_len": getattr(args, "max_seq_len", None),
         "latent_slots": getattr(args, "latent_slots", None),
+        "slot_pad_ratio_threshold": getattr(args, "slot_pad_ratio_threshold", None),
         "d_model": getattr(args, "d_model", None),
         "n_heads": getattr(args, "n_heads", None),
         "encoder_layers": getattr(args, "encoder_layers", None),

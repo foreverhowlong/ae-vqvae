@@ -1,0 +1,14 @@
+{
+  "module": "training.run_text_vqvae_experiment",
+  "experiments": [
+    {
+      "decoder-type": "memory_trunk",
+      "codebook-init": "random"
+    },
+    {
+      "decoder-type": "memory_trunk",
+      "codebook-init": "kmeans"
+    }
+  ],
+  "_comments": "固定 memory_trunk decoder，对比 random 与 K-means codebook 初始化。"
+}

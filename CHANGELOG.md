@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-07-12 — Text-VQVAE mask and inference contract
+
+* Added the persisted `slot_pad_ratio_threshold` model setting (default 0.5)
+  and excluded PAD-heavy slots before code assignment.
+* Made reconstruction loss and token accuracy consume the token-level
+  `attention_mask`, while preserving the PAD-id fallback for older callers.
+* Added the explicit `lengths` side channel and `TextVQVAE.infer()`, which
+  returns per-example logits truncated to the defined content region.
+* Kept `cross_attention` and random codebook initialization as defaults;
+  `memory_trunk` and K-means remain opt-in research configurations.
+
 ## 2026-07-12 — Refactor review fixes
 
 * Restored no-argument training by resolving `TrainConfig` defaults before
