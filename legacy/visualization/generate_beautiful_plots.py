@@ -4,8 +4,8 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
 from common import ROOT, get_device
-from common.data import get_test_loader
-from models.vqvae import VQVAE
+from legacy.common.data import get_test_loader
+from legacy.models.vqvae import VQVAE
 
 # 定义输出路径
 OUTPUT_DIR = ROOT / "outputs" / "beautiful_plots"

@@ -8,8 +8,8 @@ import torch
 import matplotlib.pyplot as plt
 
 from common import ROOT, get_device
-from common.data import get_test_loader
-from models.ae import AE
+from legacy.common.data import get_test_loader
+from legacy.models.ae import AE
 
 # ── 配置 ──────────────────────────────────────────
 model_path = ROOT / "outputs/ae2.pth"

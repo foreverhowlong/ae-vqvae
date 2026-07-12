@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
-from . import ROOT
+from common import ROOT
 
 # 统一归一化到 [-1, 1]（与所有模型的 tanh 输出对应）
 MNIST_TRANSFORM = transforms.Compose([

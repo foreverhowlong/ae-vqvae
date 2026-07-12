@@ -23,15 +23,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from common import ROOT, get_device, enable_tf32
-from common.data import GPUDataLoader, get_mnist, get_subsampled_mnist
-from common.experiment import (
+from legacy.common.data import GPUDataLoader, get_mnist, get_subsampled_mnist
+from legacy.common.experiment import (
     compile_log_from_results,
     sync_file_to_drive,
     sync_results_from_drive,
     train_vqvae,
 )
 from common.tracking import wandb_run
-from models.vqvae import VQVAE
+from legacy.models.vqvae import VQVAE
 
 
 # =====================================================================

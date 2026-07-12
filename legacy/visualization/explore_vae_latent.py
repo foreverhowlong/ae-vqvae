@@ -8,8 +8,8 @@ import torch
 import matplotlib.pyplot as plt
 
 from common import ROOT, get_device
-from common.data import get_test_loader
-from models.vae import VAE
+from legacy.common.data import get_test_loader
+from legacy.models.vae import VAE
 
 # ── 配置 ──────────────────────────────────────────
 model_path = ROOT / "outputs/vae2.pth"

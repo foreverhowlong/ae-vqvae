@@ -3,9 +3,9 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
 from common import ROOT, get_device
-from common.data import get_test_loader
-from models.vqvae import VQVAE
-from visualization.common import denormalize, first_test_batch
+from legacy.common.data import get_test_loader
+from legacy.models.vqvae import VQVAE
+from legacy.visualization.common import denormalize, first_test_batch
 
 # 模型参数（与训练时一致）
 latent_dim = 2

@@ -19,10 +19,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from common import ROOT, get_device, enable_tf32
-from common.data import GPUDataLoader, get_mnist, get_subsampled_mnist
-from common.experiment import compile_log_from_results, train_vqvae
+from legacy.common.data import GPUDataLoader, get_mnist, get_subsampled_mnist
+from legacy.common.experiment import compile_log_from_results, train_vqvae
 from common.tracking import wandb_run
-from models.vqvae import VQVAE
+from legacy.models.vqvae import VQVAE
 
 
 def train_single_model_extend(scale_factor, D, target_epochs, args, device_name, exp_dir):

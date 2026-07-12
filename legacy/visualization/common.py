@@ -3,7 +3,7 @@
 import matplotlib.pyplot as plt
 import torch
 
-from common.data import get_test_loader
+from legacy.common.data import get_test_loader
 
 
 def load_state_dict(model, pth_path, device):

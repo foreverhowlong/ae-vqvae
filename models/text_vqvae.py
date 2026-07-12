@@ -12,7 +12,7 @@ import torch.nn.functional as F
 class TextVQVAEConfig:
     vocab_size: int = 258
     max_seq_len: int = 256
-    latent_slots: int = 128
+    latent_slots: int = 32
     d_model: int = 448
     n_heads: int = 8
     encoder_layers: int = 4
@@ -22,7 +22,7 @@ class TextVQVAEConfig:
     memory_decoder_output_layers: int = 2
     ffn_mult: int = 4
     dropout: float = 0.1
-    codebook_size: int = 1024
+    codebook_size: int = 3072
     commitment_beta: float = 0.25
     pad_token_id: int = 257
 

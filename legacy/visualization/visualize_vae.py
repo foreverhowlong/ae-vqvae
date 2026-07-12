@@ -3,8 +3,8 @@
 import torch
 
 from common import ROOT, get_device
-from models.vae import VAE
-from visualization.common import (
+from legacy.models.vae import VAE
+from legacy.visualization.common import (
     collect_latents,
     denormalize,
     first_test_batch,

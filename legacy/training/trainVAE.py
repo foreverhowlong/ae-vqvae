@@ -4,9 +4,9 @@ import torch
 import torch.nn.functional as F
 
 from common import ROOT, get_device
-from common.data import get_train_loader
+from legacy.common.data import get_train_loader
 from common.tracking import log as wandb_log, wandb_run
-from models.vae import VAE
+from legacy.models.vae import VAE
 
 latent_dim = 2
 

@@ -3,9 +3,9 @@
 import torch
 
 from common import ROOT, get_device
-from common.data import get_train_loader
+from legacy.common.data import get_train_loader
 from common.tracking import log as wandb_log, wandb_run
-from models.ae import AE
+from legacy.models.ae import AE
 
 latent_dim = 2
 

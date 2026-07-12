@@ -3,9 +3,9 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
 from common import ROOT, get_device
-from common.data import get_test_loader
-from models.vae import VAE
-from models.vqvae import VQVAE
+from legacy.common.data import get_test_loader
+from legacy.models.vae import VAE
+from legacy.models.vqvae import VQVAE
 
 # 模型文件路径
 vae_path = ROOT / "outputs/vae32.pth"

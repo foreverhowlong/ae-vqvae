@@ -18,10 +18,8 @@ from models.text_vqvae import (
     pad_aware_adaptive_pool1d,
     text_vqvae_losses,
 )
-from training.run_text_vqvae_experiment import (
-    compute_accuracy,
-    initialize_codebook_from_first_encoder_pass,
-)
+from training.text_vqvae.codebook_init import initialize_codebook_kmeans
+from training.text_vqvae.loop import compute_accuracy
 from visualization.text_vqvae import (
     collect_encoder_vectors,
     compare_vector_distributions_pca,
@@ -310,7 +308,7 @@ class TextVQVAECodebookInitializationTest(unittest.TestCase):
             for _ in range(2)
         ]
 
-        result = initialize_codebook_from_first_encoder_pass(
+        result = initialize_codebook_kmeans(
             model,
             batches,
             torch.device("cpu"),
@@ -338,12 +336,96 @@ class TextVQVAECodebookInitializationTest(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "produced 4 vectors for 16 codes"):
-            initialize_codebook_from_first_encoder_pass(
+            initialize_codebook_kmeans(
                 model,
                 [batch],
                 torch.device("cpu"),
                 seed=7,
             )
+
+
+class ConfigDefaultsTest(unittest.TestCase):
+    """Ensure CLI defaults and dataclass defaults are in sync (no double-source drift)."""
+
+    def _parse(self, *argv):
+        import argparse
+        from training.text_vqvae.config import add_arguments
+        parser = argparse.ArgumentParser()
+        add_arguments(parser)
+        return parser.parse_args(list(argv))
+
+    def test_empty_cli_gives_none_for_all_overrideable_flags(self):
+        """With no flags, all overrideable args should be None so dataclass defaults win."""
+        args = self._parse()
+        overrideable = [
+            "seed", "epochs", "batch_size", "lr", "weight_decay", "grad_clip",
+            "eval_every", "save_every", "num_workers", "tokenizer",
+            "max_seq_len", "latent_slots", "d_model", "n_heads",
+            "encoder_layers", "decoder_layers", "decoder_type",
+            "codebook_size", "commitment_beta", "codebook_init",
+            "max_train_samples", "max_eval_samples", "val_fraction",
+            "collapse_preset",
+        ]
+        for attr in overrideable:
+            self.assertIsNone(getattr(args, attr, None), msg=f"--{attr} should default to None")
+
+    def test_dataclass_defaults_match_historical_run_values(self):
+        """Dataclass defaults must match the values all real runs used (via CLI overrides)."""
+        from training.text_vqvae.config import TrainConfig, DataConfig, default_model_config
+        train = TrainConfig()
+        data = DataConfig()
+        model = default_model_config()
+
+        self.assertEqual(train.seed, 42)
+        self.assertEqual(train.batch_size, 32)
+        self.assertAlmostEqual(train.lr, 3e-4)
+        self.assertEqual(data.max_train_samples, 50000)
+        self.assertEqual(data.val_fraction, 0.02)
+        self.assertEqual(model.latent_slots, 32)
+        self.assertEqual(model.codebook_size, 3072)
+        self.assertEqual(model.d_model, 448)
+        self.assertEqual(model.max_seq_len, 256)
+
+
+class LoadRunConfigTest(unittest.TestCase):
+    """load_run_config should round-trip a real saved config.json."""
+
+    def test_round_trip_real_config(self):
+        from pathlib import Path
+        from training.text_vqvae.config import load_run_config
+        real_config = Path(__file__).parent.parent / "outputs" / "text_vqvae" / \
+            "text_vqvae_20260712_125603" / "config.json"
+        if not real_config.exists():
+            self.skipTest("Real run config not found; skipping round-trip test.")
+
+        train_cfg, data_cfg, model_cfg, collapse_cfg = load_run_config(real_config)
+
+        self.assertEqual(model_cfg.codebook_size, 3072)
+        self.assertEqual(model_cfg.latent_slots, 32)
+        self.assertEqual(model_cfg.d_model, 448)
+        self.assertEqual(train_cfg.seed, 12)
+        self.assertEqual(data_cfg.max_train_samples, 50000)
+        self.assertFalse(collapse_cfg.use_ema_codebook)
+
+    def test_missing_keys_fill_defaults(self):
+        """A minimal config.json (missing most fields) fills defaults without crashing."""
+        import json, tempfile, os
+        from training.text_vqvae.config import load_run_config
+        minimal = {
+            "train": {"run_name": "test_run", "seed": 99},
+            "model": {"vocab_size": 256},
+            "data": {},
+            "collapse_control": {},
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(minimal, f)
+            path = f.name
+        try:
+            train_cfg, data_cfg, model_cfg, collapse_cfg = load_run_config(path)
+            self.assertEqual(train_cfg.seed, 99)
+            self.assertEqual(model_cfg.codebook_size, 3072)   # default from dataclass
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":
