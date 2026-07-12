@@ -145,7 +145,6 @@ def run_initial_pca(
     run_dir: Path,
     train_cfg,
     config_payload: dict,
-    tracker,
     *,
     enabled: bool,
     max_points: int,

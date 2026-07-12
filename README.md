@@ -79,6 +79,12 @@ python -m training.train_tokenizer --streaming --max-samples 1000 --output-dir o
 python -m visualization.text_vqvae   # initial PCA diagnostic (also run automatically at training start)
 ```
 
+### Test
+
+```bash
+uv run pytest tests/
+```
+
 ### Sync outputs from remote host
 
 ```bash

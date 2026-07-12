@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import argparse
 import time
-from dataclasses import asdict
-from pathlib import Path
 
 import torch
 
 from common import ROOT, enable_tf32, get_device
 from common.text_data import BPETokenizer, ByteTokenizer, build_text_dataset
-from common.tracking import init_wandb
+from common.tracking import wandb_run
 from models.text_vqvae import TextVQVAE, count_parameters
 from training.text_vqvae.codebook_init import initialize_codebook_kmeans
-from training.text_vqvae.config import add_arguments, build_config_payload, build_configs
+from training.text_vqvae.config import (
+    add_arguments,
+    build_config_payload,
+    build_configs,
+    build_diagnostics_config,
+    build_train_config,
+)
 from training.text_vqvae.loop import make_loader, run, split_dataset
 from training.text_vqvae.reporting import atomic_json_dump
 
@@ -26,6 +30,15 @@ def _load_tokenizer(name: str, path: str | None):
         raise ValueError("--tokenizer-path is required when --tokenizer bpe is selected.")
     tokenizer = BPETokenizer(path)
     return tokenizer, str(tokenizer.path)
+
+
+def _resolve_tokenizer(args):
+    """Resolve dataclass defaults before constructing the runtime tokenizer."""
+    train_cfg = build_train_config(args)
+    tokenizer, tokenizer_path = _load_tokenizer(
+        train_cfg.tokenizer, train_cfg.tokenizer_path
+    )
+    return train_cfg, tokenizer, tokenizer_path
 
 
 def _make_run_dir(run_name: str | None):
@@ -44,14 +57,15 @@ def main():
     add_arguments(parser)
     args = parser.parse_args()
 
-    tokenizer, tokenizer_path = _load_tokenizer(
-        args.tokenizer or "bpe", args.tokenizer_path
-    )
-    run_dir, run_name = _make_run_dir(args.run_name)
+    train_cfg, tokenizer, tokenizer_path = _resolve_tokenizer(args)
+    run_dir, run_name = _make_run_dir(train_cfg.run_name or None)
     device = get_device()
     enable_tf32(device)
 
-    train_cfg, data_cfg, model_cfg, collapse_cfg = build_configs(args, tokenizer)
+    train_cfg, data_cfg, model_cfg, collapse_cfg = build_configs(
+        args, tokenizer, train_cfg=train_cfg
+    )
+    diagnostics_cfg = build_diagnostics_config(args)
     train_cfg.run_name = run_name
     train_cfg.tokenizer_path = tokenizer_path
 
@@ -82,19 +96,14 @@ def main():
 
     model = TextVQVAE(model_cfg, collapse_config=collapse_cfg).to(device)
 
-    skip_pca = getattr(args, "skip_initial_pca", False)
-    pca_max_points = getattr(args, "initial_pca_max_points", None) or 8192
-    pca_fit_mode = getattr(args, "initial_pca_fit_mode", None) or "balanced"
-    pca_strict = getattr(args, "strict_initial_pca", False)
-
     config_payload = build_config_payload(
         train_cfg, data_cfg, model_cfg, collapse_cfg,
         run_dir=run_dir,
         device=device,
-        initial_pca_enabled=not skip_pca,
-        initial_pca_max_points=pca_max_points,
-        initial_pca_fit_mode=pca_fit_mode,
-        initial_pca_strict=pca_strict,
+        initial_pca_enabled=diagnostics_cfg.initial_pca_enabled,
+        initial_pca_max_points=diagnostics_cfg.initial_pca_max_points,
+        initial_pca_fit_mode=diagnostics_cfg.initial_pca_fit_mode,
+        initial_pca_strict=diagnostics_cfg.initial_pca_strict,
         codebook_init_method=train_cfg.codebook_init,
     )
     atomic_json_dump(config_payload, run_dir / "config.json")
@@ -126,30 +135,34 @@ def main():
     print(f"[Data] train={len(train_dataset)} eval={len(val_dataset)}")
     print(f"[Output] {run_dir}")
 
-    tracker = init_wandb(run_name, group="text-vqvae", tags=["text", "vqvae"], config=config_payload)
-
-    run(
-        model=model,
-        optimizer=optimizer,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        train_cfg=train_cfg,
-        data_cfg=data_cfg,
-        model_config=model_cfg,
-        collapse_config=collapse_cfg,
-        run_dir=run_dir,
-        run_name=run_name,
-        tokenizer=tokenizer,
-        device=device,
-        config_payload=config_payload,
-        tracker=tracker,
-        initial_pca_opts={
-            "enabled": not skip_pca,
-            "max_points": pca_max_points,
-            "fit_mode": pca_fit_mode,
-            "strict": pca_strict,
-        },
-    )
+    with wandb_run(
+        run_name,
+        group="text-vqvae",
+        tags=["text", "vqvae"],
+        config=config_payload,
+    ) as tracker:
+        run(
+            model=model,
+            optimizer=optimizer,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            train_cfg=train_cfg,
+            data_cfg=data_cfg,
+            model_config=model_cfg,
+            collapse_config=collapse_cfg,
+            run_dir=run_dir,
+            run_name=run_name,
+            tokenizer=tokenizer,
+            device=device,
+            config_payload=config_payload,
+            tracker=tracker,
+            initial_pca_opts={
+                "enabled": diagnostics_cfg.initial_pca_enabled,
+                "max_points": diagnostics_cfg.initial_pca_max_points,
+                "fit_mode": diagnostics_cfg.initial_pca_fit_mode,
+                "strict": diagnostics_cfg.initial_pca_strict,
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 class TextVQVAEConfig:
     vocab_size: int = 258
     max_seq_len: int = 256
-    latent_slots: int = 32
+    latent_slots: int = 128
     d_model: int = 448
     n_heads: int = 8
     encoder_layers: int = 4

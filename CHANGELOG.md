@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-07-12 — Refactor review fixes
+
+* Restored no-argument training by resolving `TrainConfig` defaults before
+  tokenizer construction.
+* Removed the duplicate model-default overlay and added a dataclass-backed
+  diagnostics configuration.
+* Made all legacy training modules safe to import without starting a run.
+* Ensured strict initial-PCA failures close W&B and write failure artifacts.
+* Made historical-config warnings consistent across all config groups and
+  replaced the ignored local-output test dependency with a versioned fixture.
+* Promoted `latent_slots=128` to the current model default; historical run
+  fixtures retain their recorded value of 32.
+
 ## 2026-07-12 — Text-VQVAE主线化重构
 
 ### Breaking changes (internal)

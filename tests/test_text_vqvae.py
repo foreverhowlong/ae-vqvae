@@ -1,7 +1,11 @@
 from collections import OrderedDict
+from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
+import warnings
 
 import torch
 import torch.nn as nn
@@ -357,48 +361,78 @@ class ConfigDefaultsTest(unittest.TestCase):
     def test_empty_cli_gives_none_for_all_overrideable_flags(self):
         """With no flags, all overrideable args should be None so dataclass defaults win."""
         args = self._parse()
-        overrideable = [
-            "seed", "epochs", "batch_size", "lr", "weight_decay", "grad_clip",
-            "eval_every", "save_every", "num_workers", "tokenizer",
-            "max_seq_len", "latent_slots", "d_model", "n_heads",
-            "encoder_layers", "decoder_layers", "decoder_type",
-            "codebook_size", "commitment_beta", "codebook_init",
-            "max_train_samples", "max_eval_samples", "val_fraction",
-            "collapse_preset",
-        ]
-        for attr in overrideable:
-            self.assertIsNone(getattr(args, attr, None), msg=f"--{attr} should default to None")
+        for attr, value in vars(args).items():
+            self.assertIsNone(value, msg=f"--{attr} should default to None")
 
-    def test_dataclass_defaults_match_historical_run_values(self):
-        """Dataclass defaults must match the values all real runs used (via CLI overrides)."""
-        from training.text_vqvae.config import TrainConfig, DataConfig, default_model_config
+    def test_dataclass_defaults_match_current_mainline(self):
+        """Dataclass defaults describe the configuration recommended for new runs."""
+        from training.text_vqvae.config import DataConfig, DiagnosticsConfig, TrainConfig
         train = TrainConfig()
         data = DataConfig()
-        model = default_model_config()
+        diagnostics = DiagnosticsConfig()
+        model = TextVQVAEConfig()
 
         self.assertEqual(train.seed, 42)
         self.assertEqual(train.batch_size, 32)
         self.assertAlmostEqual(train.lr, 3e-4)
         self.assertEqual(data.max_train_samples, 50000)
         self.assertEqual(data.val_fraction, 0.02)
-        self.assertEqual(model.latent_slots, 32)
+        self.assertEqual(model.latent_slots, 128)
         self.assertEqual(model.codebook_size, 3072)
         self.assertEqual(model.d_model, 448)
         self.assertEqual(model.max_seq_len, 256)
+        self.assertEqual(diagnostics.initial_pca_max_points, 8192)
+        self.assertEqual(diagnostics.initial_pca_fit_mode, "balanced")
+
+    def test_empty_cli_builds_each_dataclass_from_its_defaults(self):
+        from training.text_vqvae.config import (
+            DataConfig,
+            DiagnosticsConfig,
+            TrainConfig,
+            build_configs,
+            build_diagnostics_config,
+            build_train_config,
+        )
+
+        args = self._parse()
+        tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
+        train_cfg = build_train_config(args)
+        train_cfg, data_cfg, model_cfg, collapse_cfg = build_configs(
+            args, tokenizer, train_cfg=train_cfg
+        )
+
+        expected_model = TextVQVAEConfig(vocab_size=123, pad_token_id=0)
+        self.assertEqual(asdict(train_cfg), asdict(TrainConfig()))
+        self.assertEqual(asdict(data_cfg), asdict(DataConfig()))
+        self.assertEqual(asdict(model_cfg), asdict(expected_model))
+        self.assertEqual(asdict(collapse_cfg), asdict(CollapseControlConfig()))
+        self.assertEqual(
+            asdict(build_diagnostics_config(args)), asdict(DiagnosticsConfig())
+        )
+
+    def test_default_tokenizer_is_resolved_from_train_config(self):
+        from training.run_text_vqvae_experiment import _resolve_tokenizer
+        from training.text_vqvae.config import TrainConfig
+
+        args = self._parse()
+        with patch("training.run_text_vqvae_experiment.BPETokenizer") as tokenizer_cls:
+            tokenizer_cls.return_value.path = Path("resolved-tokenizer.json")
+            train_cfg, tokenizer, resolved_path = _resolve_tokenizer(args)
+
+        tokenizer_cls.assert_called_once_with(TrainConfig().tokenizer_path)
+        self.assertIs(tokenizer, tokenizer_cls.return_value)
+        self.assertEqual(resolved_path, "resolved-tokenizer.json")
 
 
 class LoadRunConfigTest(unittest.TestCase):
     """load_run_config should round-trip a real saved config.json."""
 
-    def test_round_trip_real_config(self):
-        from pathlib import Path
+    def test_round_trip_versioned_legacy_fixture(self):
         from training.text_vqvae.config import load_run_config
-        real_config = Path(__file__).parent.parent / "outputs" / "text_vqvae" / \
-            "text_vqvae_20260712_125603" / "config.json"
-        if not real_config.exists():
-            self.skipTest("Real run config not found; skipping round-trip test.")
+        real_config = Path(__file__).parent / "fixtures" / "legacy_run_config.json"
 
-        train_cfg, data_cfg, model_cfg, collapse_cfg = load_run_config(real_config)
+        with self.assertWarnsRegex(UserWarning, "ignoring unknown keys"):
+            train_cfg, data_cfg, model_cfg, collapse_cfg = load_run_config(real_config)
 
         self.assertEqual(model_cfg.codebook_size, 3072)
         self.assertEqual(model_cfg.latent_slots, 32)
@@ -421,11 +455,59 @@ class LoadRunConfigTest(unittest.TestCase):
             json.dump(minimal, f)
             path = f.name
         try:
-            train_cfg, data_cfg, model_cfg, collapse_cfg = load_run_config(path)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                train_cfg, data_cfg, model_cfg, collapse_cfg = load_run_config(path)
             self.assertEqual(train_cfg.seed, 99)
             self.assertEqual(model_cfg.codebook_size, 3072)   # default from dataclass
+            messages = "\n".join(str(item.message) for item in caught)
+            self.assertIn("TextVQVAEConfig", messages)
+            self.assertIn("CollapseControlConfig", messages)
         finally:
             os.unlink(path)
+
+
+class TrainingLifecycleTest(unittest.TestCase):
+    def test_strict_initial_pca_failure_writes_failed_summary(self):
+        import json
+        from training.text_vqvae.config import DataConfig, TrainConfig
+        from training.text_vqvae.loop import run
+
+        with TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            payload = {"diagnostics": {"initial_pca": {"status": "pending"}}}
+            with patch(
+                "training.text_vqvae.loop.run_initial_pca",
+                side_effect=RuntimeError("strict PCA failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "strict PCA failed"):
+                    run(
+                        model=None,
+                        optimizer=None,
+                        train_loader=None,
+                        val_loader=None,
+                        train_cfg=TrainConfig(run_name="pca_failure"),
+                        data_cfg=DataConfig(),
+                        model_config=TextVQVAEConfig(),
+                        collapse_config=CollapseControlConfig(),
+                        run_dir=run_dir,
+                        run_name="pca_failure",
+                        tokenizer=None,
+                        device=torch.device("cpu"),
+                        config_payload=payload,
+                        tracker=SimpleNamespace(),
+                        initial_pca_opts={
+                            "enabled": True,
+                            "max_points": 8,
+                            "fit_mode": "balanced",
+                            "strict": True,
+                        },
+                    )
+
+            summary = json.loads((run_dir / "summary.json").read_text())
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["steps"], 0)
+            self.assertIn("strict PCA failed", summary["error"])
 
 
 if __name__ == "__main__":

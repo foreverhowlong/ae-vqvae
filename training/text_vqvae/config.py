@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import subprocess
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -72,21 +73,17 @@ class DataConfig:
     val_fraction: float = 0.02
 
 
-# TextVQVAEConfig lives in models/text_vqvae.py but we override two defaults
-# so that they match the CLI values that have actually been used in all runs.
-# (Original dataclass had codebook_size=1024 and latent_slots=128; all real
-# runs used 3072 and 32 respectively via CLI overrides – now unified here.)
-_MODEL_DEFAULTS: dict[str, Any] = {
-    "latent_slots": 32,
-    "codebook_size": 3072,
-}
+@dataclass
+class DiagnosticsConfig:
+    initial_pca_enabled: bool = True
+    initial_pca_max_points: int = 8192
+    initial_pca_fit_mode: str = "balanced"
+    initial_pca_strict: bool = False
 
 
-def default_model_config() -> TextVQVAEConfig:
-    cfg = TextVQVAEConfig()
-    for k, v in _MODEL_DEFAULTS.items():
-        setattr(cfg, k, v)
-    return cfg
+def _default(cls, field_name: str):
+    """Read a CLI help default from its owning dataclass."""
+    return getattr(cls(), field_name)
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +92,6 @@ def default_model_config() -> TextVQVAEConfig:
 
 def add_arguments(parser) -> None:
     """Add all CLI flags to *parser* with default=None (real defaults in dataclasses)."""
-    d = dataclasses.fields
-
     # ---- training ----
     g = parser.add_argument_group("training")
     g.add_argument("--run-name", default=None, help="Output run name. Defaults to timestamp.")
@@ -112,30 +107,32 @@ def add_arguments(parser) -> None:
     g.add_argument("--num-workers", type=int, default=None)
     g.add_argument(
         "--tokenizer", choices=["bpe", "byte"], default=None,
-        help="Tokenizer to use (default: bpe).",
+        help=f"Tokenizer to use (default: {_default(TrainConfig, 'tokenizer')}).",
     )
     g.add_argument(
         "--tokenizer-path", default=None,
-        help=f"Saved tokenizer.json for --tokenizer bpe (default: {DEFAULT_BPE_TOKENIZER_PATH}).",
+        help=("Saved tokenizer.json for --tokenizer bpe "
+              f"(default: {_default(TrainConfig, 'tokenizer_path')})."),
     )
     g.add_argument(
         "--codebook-init", choices=["random", "kmeans"], default=None,
-        help="Codebook initialisation: random (default) or kmeans (one encoder pre-pass).",
+        help=("Codebook initialisation strategy "
+              f"(default: {_default(TrainConfig, 'codebook_init')})."),
     )
 
     # ---- data ----
     g = parser.add_argument_group("data")
     g.add_argument(
         "--dataset", default=None,
-        help=f"Hugging Face dataset name (default: {DEFAULT_TEXT_DATASET}).",
+        help=f"Hugging Face dataset name (default: {_default(DataConfig, 'dataset')}).",
     )
     g.add_argument("--dataset-config", default=None, help="Optional Hugging Face dataset config.")
-    g.add_argument("--split", default=None, help="Dataset split (default: train).")
-    g.add_argument("--text-field", default=None, help="Dataset/JSONL text field (default: text).")
+    g.add_argument("--split", default=None, help=f"Dataset split (default: {_default(DataConfig, 'split')}).")
+    g.add_argument("--text-field", default=None, help=f"Dataset/JSONL text field (default: {_default(DataConfig, 'text_field')}).")
     g.add_argument("--data-file", default=None, help="Optional local .txt or .jsonl file.")
     g.add_argument(
         "--cache-dir", default=None,
-        help=f"Hugging Face dataset cache (default: {DEFAULT_HF_DATASET_CACHE}).",
+        help=f"Hugging Face dataset cache (default: {_default(DataConfig, 'cache_dir')}).",
     )
     g.add_argument("--streaming", action="store_true", default=None)
     g.add_argument("--max-train-samples", type=int, default=None)
@@ -152,7 +149,7 @@ def add_arguments(parser) -> None:
     g.add_argument("--decoder-layers", type=int, default=None)
     g.add_argument(
         "--decoder-type", choices=["cross_attention", "memory_trunk"], default=None,
-        help="Decoder backbone (default: cross_attention).",
+        help=f"Decoder backbone (default: {_default(TextVQVAEConfig, 'decoder_type')}).",
     )
     g.add_argument("--memory-decoder-latent-layers", type=int, default=None)
     g.add_argument("--memory-decoder-output-layers", type=int, default=None)
@@ -190,18 +187,20 @@ def add_arguments(parser) -> None:
     g = parser.add_argument_group("diagnostics")
     g.add_argument(
         "--initial-pca-max-points", type=int, default=None,
-        help="Maximum encoder latent vectors in the initialisation PCA plot (default: 8192).",
+        help=("Maximum encoder latent vectors in the initialisation PCA plot "
+              f"(default: {_default(DiagnosticsConfig, 'initial_pca_max_points')})."),
     )
     g.add_argument(
         "--initial-pca-fit-mode", choices=["balanced", "all"], default=None,
-        help="Fit PCA with equal group sizes or all collected vectors (default: balanced).",
+        help=("Fit PCA with equal group sizes or all collected vectors "
+              f"(default: {_default(DiagnosticsConfig, 'initial_pca_fit_mode')})."),
     )
     g.add_argument(
-        "--skip-initial-pca", action="store_true", default=False,
+        "--skip-initial-pca", action="store_true", default=None,
         help="Do not generate the initialisation encoder/codebook PCA plot.",
     )
     g.add_argument(
-        "--strict-initial-pca", action="store_true", default=False,
+        "--strict-initial-pca", action="store_true", default=None,
         help="Fail the run instead of warning if the initialisation PCA diagnostic fails.",
     )
 
@@ -211,6 +210,42 @@ def _override(obj, attrs: dict[str, Any]) -> None:
     for key, value in attrs.items():
         if value is not None:
             setattr(obj, key, value)
+
+
+def build_train_config(args) -> TrainConfig:
+    """Resolve training CLI overrides before tokenizer construction."""
+    config = TrainConfig()
+    _override(config, {
+        "run_name": getattr(args, "run_name", None),
+        "seed": getattr(args, "seed", None),
+        "epochs": getattr(args, "epochs", None),
+        "batch_size": getattr(args, "batch_size", None),
+        "lr": getattr(args, "lr", None),
+        "weight_decay": getattr(args, "weight_decay", None),
+        "grad_clip": getattr(args, "grad_clip", None),
+        "eval_every": getattr(args, "eval_every", None),
+        "save_every": getattr(args, "save_every", None),
+        "num_workers": getattr(args, "num_workers", None),
+        "tokenizer": getattr(args, "tokenizer", None),
+        "tokenizer_path": getattr(args, "tokenizer_path", None),
+        "codebook_init": getattr(args, "codebook_init", None),
+        "ablation": getattr(args, "ablation", None),
+    })
+    if config.tokenizer == "bpe" and not config.tokenizer_path:
+        raise ValueError("--tokenizer-path is required when --tokenizer bpe is selected.")
+    return config
+
+
+def build_diagnostics_config(args) -> DiagnosticsConfig:
+    config = DiagnosticsConfig()
+    if getattr(args, "skip_initial_pca", None):
+        config.initial_pca_enabled = False
+    _override(config, {
+        "initial_pca_max_points": getattr(args, "initial_pca_max_points", None),
+        "initial_pca_fit_mode": getattr(args, "initial_pca_fit_mode", None),
+        "initial_pca_strict": getattr(args, "strict_initial_pca", None),
+    })
+    return config
 
 
 def build_collapse_config(args) -> CollapseControlConfig:
@@ -267,24 +302,9 @@ def build_collapse_config(args) -> CollapseControlConfig:
     return config
 
 
-def build_configs(args, tokenizer):
+def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
     """Build all config objects from parsed args, applying overrides onto dataclass defaults."""
-    train_cfg = TrainConfig()
-    _override(train_cfg, {
-        "seed": getattr(args, "seed", None),
-        "epochs": getattr(args, "epochs", None),
-        "batch_size": getattr(args, "batch_size", None),
-        "lr": getattr(args, "lr", None),
-        "weight_decay": getattr(args, "weight_decay", None),
-        "grad_clip": getattr(args, "grad_clip", None),
-        "eval_every": getattr(args, "eval_every", None),
-        "save_every": getattr(args, "save_every", None),
-        "num_workers": getattr(args, "num_workers", None),
-        "tokenizer": getattr(args, "tokenizer", None),
-        "tokenizer_path": getattr(args, "tokenizer_path", None),
-        "codebook_init": getattr(args, "codebook_init", None),
-        "ablation": getattr(args, "ablation", None),
-    })
+    train_cfg = train_cfg or build_train_config(args)
 
     data_file = getattr(args, "data_file", None)
     data_cfg = DataConfig()
@@ -312,7 +332,7 @@ def build_configs(args, tokenizer):
         "val_fraction": getattr(args, "val_fraction", None),
     })
 
-    model_cfg = default_model_config()
+    model_cfg = TextVQVAEConfig()
     model_cfg.vocab_size = tokenizer.vocab_size
     model_cfg.pad_token_id = tokenizer.pad_token_id
     _override(model_cfg, {
@@ -397,38 +417,40 @@ def build_config_payload(
 def load_run_config(path: str | Path) -> tuple[TrainConfig, DataConfig, TextVQVAEConfig, CollapseControlConfig]:
     """Reconstruct config objects from a saved config.json.
 
-    Missing keys are filled from current dataclass defaults and a warning is
-    printed.  Unknown keys are silently ignored (forward-compatibility).
+    Missing keys are filled from current dataclass defaults. Missing and
+    unknown keys both emit warnings so compatibility decisions remain visible.
     """
     with open(path, encoding="utf-8") as f:
         payload = json.load(f)
 
-    def _fill(cls, saved: dict, label: str):
-        defaults = {f.name: f.default for f in dataclasses.fields(cls)
-                    if f.default is not dataclasses.MISSING}
-        defaults.update({f.name: f.default_factory()  # type: ignore[misc]
-                         for f in dataclasses.fields(cls)
-                         if f.default is dataclasses.MISSING
-                         and f.default_factory is not dataclasses.MISSING})  # type: ignore[misc]
-        missing = [k for k in defaults if k not in saved]
+    def _fill(default_obj, saved: Any, label: str):
+        if not isinstance(saved, dict):
+            warnings.warn(
+                f"[load_run_config] {label}: expected an object; using all defaults",
+                stacklevel=2,
+            )
+            saved = {}
+        defaults = dataclasses.asdict(default_obj)
+        missing = sorted(defaults.keys() - saved.keys())
+        unknown = sorted(saved.keys() - defaults.keys())
         if missing:
-            print(f"[load_run_config] {label}: filling missing keys with defaults: {missing}")
-        kwargs = {k: saved.get(k, defaults[k]) for k in defaults}
-        return cls(**kwargs)
+            warnings.warn(
+                f"[load_run_config] {label}: filling missing keys with defaults: {missing}",
+                stacklevel=2,
+            )
+        if unknown:
+            warnings.warn(
+                f"[load_run_config] {label}: ignoring unknown keys: {unknown}",
+                stacklevel=2,
+            )
+        kwargs = {key: saved.get(key, value) for key, value in defaults.items()}
+        return type(default_obj)(**kwargs)
 
-    train_cfg = _fill(TrainConfig, payload.get("train", {}), "TrainConfig")
-    data_cfg = _fill(DataConfig, payload.get("data", {}), "DataConfig")
-
-    model_dict = payload.get("model", {})
-    model_cfg = TextVQVAEConfig(**{
-        k: model_dict.get(k, v)
-        for k, v in dataclasses.asdict(TextVQVAEConfig()).items()
-    })
-
-    collapse_dict = payload.get("collapse_control", {})
-    collapse_cfg = CollapseControlConfig(**{
-        k: collapse_dict.get(k, v)
-        for k, v in dataclasses.asdict(CollapseControlConfig()).items()
-    })
+    train_cfg = _fill(TrainConfig(), payload.get("train", {}), "TrainConfig")
+    data_cfg = _fill(DataConfig(), payload.get("data", {}), "DataConfig")
+    model_cfg = _fill(TextVQVAEConfig(), payload.get("model", {}), "TextVQVAEConfig")
+    collapse_cfg = _fill(
+        CollapseControlConfig(), payload.get("collapse_control", {}), "CollapseControlConfig"
+    )
 
     return train_cfg, data_cfg, model_cfg, collapse_cfg

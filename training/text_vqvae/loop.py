@@ -225,7 +225,24 @@ def run(
     from training.text_vqvae.reporting import atomic_json_dump
     import shutil
 
-    run_initial_pca(model, val_loader, run_dir, train_cfg, config_payload, tracker, **initial_pca_opts)
+    initialization_started = time.time()
+    try:
+        run_initial_pca(
+            model, val_loader, run_dir, train_cfg, config_payload, **initial_pca_opts
+        )
+    except Exception as exc:
+        atomic_json_dump(config_payload, run_dir / "config.json")
+        atomic_json_dump(
+            {
+                "run_name": run_name,
+                "status": "failed",
+                "steps": 0,
+                "error": repr(exc),
+                "elapsed_sec": time.time() - initialization_started,
+            },
+            run_dir / "summary.json",
+        )
+        raise
     atomic_json_dump(config_payload, run_dir / "config.json")
 
     metrics_path = run_dir / "metrics.jsonl"
@@ -343,5 +360,3 @@ def run(
             run_dir / "summary.json",
         )
         raise
-    finally:
-        tracker.finish()
