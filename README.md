@@ -1,23 +1,36 @@
-# AE / VAE / VQ-VAE on MNIST
+# Text VQ-VAE — TinyStories Compression Research
 
-PyTorch implementations of Autoencoder, Variational Autoencoder, and Vector Quantized VAE, trained on MNIST with a 2D latent space for visualization.
+Non-autoregressive VQ-VAE for text compression, with a focus on studying codebook collapse dynamics. Trained on TinyStories using a dataset-specific BPE tokenizer.
 
 ## Structure
 
-- `models/` — model definitions (`ae.py`, `vae.py`, `vqvae.py`)
-- `common/` — shared project paths, device detection, MNIST loaders, VQ-VAE experiment helpers
-- `training/` — training scripts for each model
-- `training/run_text_vqvae_experiment.py` — text-dataset compression experiment with selectable BPE/byte tokenization and a non-autoregressive VQ-VAE decoder
-- `training/train_tokenizer.py` — trains a byte-level BPE tokenizer on a local or Hugging Face text dataset
-- `visualization/` — five visualization scripts:
-  - `visualize_ae.py` / `visualize_vae.py` / `visualize_vqvae.py` — reconstruction comparison (original vs. decoded) and 2D latent space visualization
-  - `explore_ae_latent.py` / `explore_vae_latent.py` — interactive 2D latent space exploration with draggable knob and real-time decoding
-- `outputs/` — saved model checkpoints
+### Active research line (text-vqvae)
+
+- `models/text_vqvae.py` — model definition: transformer encoder → VectorQuantizer → memory-trunk decoder
+- `common/` — shared utilities (paths, device detection, wandb tracking, text data loading)
+- `training/run_text_vqvae_experiment.py` — main training entry point
+- `training/text_vqvae/` — sub-package: config, training loop, codebook init, reporting
+- `training/train_tokenizer.py` — trains a byte-level BPE tokenizer on a text dataset
+- `training/run_experiment_sequence.py` — runs a JSON-configured sequence of experiments
+- `visualization/text_vqvae.py` — PCA diagnostics and encoder/codebook distribution plots
+- `tests/` — unit and integration tests
+- `configs/` — example experiment sequence JSON configs
+
+### Legacy (AE / VAE / VQ-VAE on MNIST)
+
+`legacy/` contains the original learning-project code. Entry points are renamed:
+
+```bash
+python -m legacy.training.trainAE
+python -m legacy.training.trainVAE
+python -m legacy.training.trainVQVAE
+python -m legacy.training.run_collapse_experiments
+```
 
 ## Usage
 
 All training entry points report configs and metrics to Weights & Biases. Put the API key
-in the ignored root `.env` file (the project/entity settings are optional):
+in the ignored root `.env` file (project/entity settings are optional):
 
 ```dotenv
 WANDB_API_KEY=your_api_key
@@ -25,75 +38,54 @@ WANDB_PROJECT=ae-vqvae
 # WANDB_ENTITY=your_team_or_username
 ```
 
+### Train
+
 ```bash
-# train
-python -m training.trainAE
-python -m training.trainVAE
-python -m training.trainVQVAE
+# run TinyStories compression with the trained 8K BPE tokenizer (default)
+python -m training.run_text_vqvae_experiment --run-name my_run
 
-# run VQ-VAE collapse experiments
-python -m training.run_collapse_experiments --dry-run
+# choose decoder type: cross_attention (original) or memory_trunk (current best)
+python -m training.run_text_vqvae_experiment --decoder-type memory_trunk
 
-# run TinyStories language compression with the trained 8K BPE tokenizer (default)
-python -m training.run_text_vqvae_experiment --run-name tinystories_vqvae_baseline
+# use kmeans codebook initialization instead of random
+python -m training.run_text_vqvae_experiment --codebook-init kmeans
 
-# choose another Hugging Face dataset/config/split/text column
-python -m training.run_text_vqvae_experiment --dataset dataset/name --dataset-config config_name --split train --text-field text
+# enable all anti-collapse measures (EMA, dead-code reset, entropy loss, …)
+python -m training.run_text_vqvae_experiment --collapse-preset anti
 
-# select the legacy byte tokenizer, or use a different saved BPE tokenizer
-python -m training.run_text_vqvae_experiment --tokenizer byte
-python -m training.run_text_vqvae_experiment --tokenizer bpe --tokenizer-path path/to/tokenizer.json
+# quick offline smoke test from a local file
+python -m training.run_text_vqvae_experiment \
+    --data-file path/to/text.txt --tokenizer byte \
+    --epochs 1 --max-train-samples 200 --batch-size 8
 
-# train an 8K byte-level BPE tokenizer on the full TinyStories train split
-# The first run downloads it to data/huggingface; later runs reuse that cache.
-python -m training.train_tokenizer
-
-# authenticated download (enter the token at the hidden prompt; it is not logged)
-read -s HF_TOKEN
-export HF_TOKEN
-python -m training.train_tokenizer
-unset HF_TOKEN
-
-# alternatively, put this entry in the ignored project-root .env file:
-# HF_TOKEN=hf_your_read_token
-# python -m training.train_tokenizer will load it automatically
-
-# quick tokenizer smoke run without downloading the complete dataset
-python -m training.train_tokenizer --streaming --max-samples 1000 --output-dir outputs/tokenizers/tinystories_bpe_smoke
-
-# offline tokenizer smoke run from a local .txt/.jsonl file
-python -m training.train_tokenizer --data-file path/to/text.txt --max-samples 1000 --output-dir outputs/tokenizers/local_bpe_smoke
-
-# run TinyStories language compression with common anti-collapse measures enabled
-python -m training.run_text_vqvae_experiment --run-name tinystories_vqvae_anti --collapse-preset anti
-
-# sequentially run the experiments in a JSON config; unspecified options keep their defaults
+# run a configured sequence of experiments
 python -m training.run_experiment_sequence --config configs/text_vqvae_experiments.example.json
-
-# inspect generated run names and commands without starting training
 python -m training.run_experiment_sequence --config configs/text_vqvae_experiments.example.json --dry-run
+```
 
-# quick local smoke run from a .txt/.jsonl file
-python -m training.run_text_vqvae_experiment --data-file path/to/text.txt --max-train-samples 2000 --epochs 1
+### Train tokenizer
 
-# sync outputs from the Tailscale host configured as `mech` in ~/.ssh/config
-scripts/sync_outputs_from_mech.sh
+```bash
+# train an 8K byte-level BPE tokenizer on the full TinyStories train split
+python -m training.train_tokenizer
 
-# sync all outputs, but only pull best.pt among *.pt model files
-scripts/sync_outputs_from_mech.sh --best-only
+# quick streaming smoke run
+python -m training.train_tokenizer --streaming --max-samples 1000 --output-dir outputs/tokenizers/smoke
+```
 
-# sync outputs without model/checkpoint weight files
-scripts/sync_outputs_from_mech.sh --no-models
+### Visualize
 
-# sync only the newest output run directory
-scripts/sync_outputs_from_mech.sh --latest-only
+```bash
+python -m visualization.text_vqvae   # initial PCA diagnostic (also run automatically at training start)
+```
 
-# visualize
-python -m visualization.visualize_ae
-python -m visualization.visualize_vae
-python -m visualization.visualize_vqvae
-python -m visualization.explore_ae_latent
-python -m visualization.explore_vae_latent
+### Sync outputs from remote host
+
+```bash
+scripts/sync_outputs_from_mech.sh               # sync all outputs
+scripts/sync_outputs_from_mech.sh --best-only   # only pull best.pt among *.pt files
+scripts/sync_outputs_from_mech.sh --no-models   # skip weight files
+scripts/sync_outputs_from_mech.sh --latest-only # sync only the newest run directory
 ```
 
 Both text-data training entries read `HF_TOKEN` from the process environment first,
@@ -102,4 +94,4 @@ run configs, tokenizer artifacts, or repository files.
 
 ## Dependencies
 
-Managed via `uv` (`pyproject.toml`). Core: `torch`, `torchvision`, `matplotlib`.
+Managed via `uv` (`pyproject.toml`). Core: `torch`, `torchvision`, `matplotlib`, `tokenizers`, `datasets`, `wandb`, `scikit-learn`.
