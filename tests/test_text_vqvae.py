@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 import warnings
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -25,6 +26,7 @@ from models.text_vqvae import (
 )
 from training.text_vqvae.codebook_init import initialize_codebook_kmeans
 from training.text_vqvae.loop import compute_accuracy, save_checkpoint
+from training.text_vqvae.geometry import dump_geometry_snapshot
 from visualization.text_vqvae import (
     collect_encoder_vectors,
     compare_vector_distributions_pca,
@@ -51,6 +53,46 @@ def small_config(**overrides):
     }
     values.update(overrides)
     return TextVQVAEConfig(**values)
+
+
+class GeometrySnapshotTest(unittest.TestCase):
+    def test_snapshot_fields_shapes_mode_and_rng(self):
+        model = TextVQVAE(small_config())
+        model.train()
+        probe = [{
+            "input_ids": torch.tensor([
+                [1, 2, 3, 4, 5, 6, 7, 8, 31, 31, 31, 31],
+                [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 31, 31],
+            ]),
+            "attention_mask": torch.tensor([
+                [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+            ]),
+        }]
+        rng_before = torch.random.get_rng_state().clone()
+
+        with TemporaryDirectory() as temp_dir:
+            metrics = dump_geometry_snapshot(model, probe, 7, Path(temp_dir))
+            with np.load(Path(temp_dir) / "geometry" / "step000007.npz") as snapshot:
+                self.assertEqual(
+                    set(snapshot.files),
+                    {"z_e", "codebook", "assignments", "pad_ratios", "slot_indices"},
+                )
+                self.assertEqual(snapshot["z_e"].shape, (8, 16))
+                self.assertEqual(snapshot["z_e"].dtype, np.float16)
+                self.assertEqual(snapshot["codebook"].shape, (8, 16))
+                self.assertEqual(snapshot["codebook"].dtype, np.float16)
+                self.assertEqual(snapshot["assignments"].shape, (8,))
+                self.assertEqual(snapshot["assignments"].dtype, np.int32)
+                self.assertEqual(snapshot["pad_ratios"].shape, (8,))
+                self.assertEqual(snapshot["slot_indices"].tolist(), [0, 1, 2, 3, 0, 1, 2, 3])
+
+        self.assertTrue(model.training)
+        torch.testing.assert_close(torch.random.get_rng_state(), rng_before)
+        self.assertGreaterEqual(metrics["used_codes"], 1)
+        self.assertLessEqual(metrics["used_codes"], 8)
+        self.assertIn("participation_ratio", metrics)
+        self.assertIn("win_count_gini", metrics)
 
 
 class CheckpointRetentionTest(unittest.TestCase):
@@ -515,6 +557,19 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(model.max_seq_len, 256)
         self.assertEqual(diagnostics.initial_pca_max_points, 8192)
         self.assertEqual(diagnostics.initial_pca_fit_mode, "balanced")
+        self.assertTrue(diagnostics.geometry_snapshot_enabled)
+        self.assertEqual(diagnostics.geometry_dense_every, 50)
+        self.assertEqual(diagnostics.geometry_dense_until, 1500)
+        self.assertEqual(diagnostics.geometry_sparse_every, 500)
+        self.assertEqual(diagnostics.geometry_probe_points, 4096)
+
+    def test_geometry_snapshot_can_be_disabled_explicitly(self):
+        from training.text_vqvae.config import build_diagnostics_config
+
+        diagnostics = build_diagnostics_config(
+            self._parse("--geometry-snapshot-enabled", "false")
+        )
+        self.assertFalse(diagnostics.geometry_snapshot_enabled)
 
     def test_empty_cli_builds_each_dataclass_from_its_defaults(self):
         from training.text_vqvae.config import (

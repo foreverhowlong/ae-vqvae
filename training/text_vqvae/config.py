@@ -79,6 +79,11 @@ class DiagnosticsConfig:
     initial_pca_max_points: int = 8192
     initial_pca_fit_mode: str = "balanced"
     initial_pca_strict: bool = False
+    geometry_snapshot_enabled: bool = True
+    geometry_dense_every: int = 50
+    geometry_dense_until: int = 1500
+    geometry_sparse_every: int = 500
+    geometry_probe_points: int = 4096
 
 
 def _default(cls, field_name: str):
@@ -204,6 +209,15 @@ def add_arguments(parser) -> None:
         "--strict-initial-pca", action="store_true", default=None,
         help="Fail the run instead of warning if the initialisation PCA diagnostic fails.",
     )
+    g.add_argument(
+        "--geometry-snapshot-enabled", type=_parse_bool, default=None,
+        help=("Enable periodic raw geometry snapshots (true/false; default: "
+              f"{_default(DiagnosticsConfig, 'geometry_snapshot_enabled')})."),
+    )
+    g.add_argument("--geometry-dense-every", type=int, default=None)
+    g.add_argument("--geometry-dense-until", type=int, default=None)
+    g.add_argument("--geometry-sparse-every", type=int, default=None)
+    g.add_argument("--geometry-probe-points", type=int, default=None)
 
 
 def _override(obj, attrs: dict[str, Any]) -> None:
@@ -211,6 +225,15 @@ def _override(obj, attrs: dict[str, Any]) -> None:
     for key, value in attrs.items():
         if value is not None:
             setattr(obj, key, value)
+
+
+def _parse_bool(value: str) -> bool:
+    value = value.lower()
+    if value in {"true", "1", "yes", "on"}:
+        return True
+    if value in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"Expected a boolean value, got {value!r}.")
 
 
 def build_train_config(args) -> TrainConfig:
@@ -245,7 +268,16 @@ def build_diagnostics_config(args) -> DiagnosticsConfig:
         "initial_pca_max_points": getattr(args, "initial_pca_max_points", None),
         "initial_pca_fit_mode": getattr(args, "initial_pca_fit_mode", None),
         "initial_pca_strict": getattr(args, "strict_initial_pca", None),
+        "geometry_snapshot_enabled": getattr(args, "geometry_snapshot_enabled", None),
+        "geometry_dense_every": getattr(args, "geometry_dense_every", None),
+        "geometry_dense_until": getattr(args, "geometry_dense_until", None),
+        "geometry_sparse_every": getattr(args, "geometry_sparse_every", None),
+        "geometry_probe_points": getattr(args, "geometry_probe_points", None),
     })
+    if config.geometry_dense_every < 1 or config.geometry_sparse_every < 1:
+        raise ValueError("Geometry snapshot intervals must be positive.")
+    if config.geometry_dense_until < 0 or config.geometry_probe_points < 1:
+        raise ValueError("Geometry dense-until must be non-negative and probe-points positive.")
     return config
 
 
@@ -386,7 +418,9 @@ def build_config_payload(
     initial_pca_fit_mode: str,
     initial_pca_strict: bool,
     codebook_init_method: str,
+    geometry_config: DiagnosticsConfig | None = None,
 ) -> dict[str, Any]:
+    geometry_config = geometry_config or DiagnosticsConfig()
     return {
         "config_version": 1,
         **_git_info(),
@@ -407,7 +441,14 @@ def build_config_payload(
                 "fit_mode": initial_pca_fit_mode,
                 "strict": initial_pca_strict,
                 "status": "disabled" if not initial_pca_enabled else "pending",
-            }
+            },
+            "geometry": {
+                "snapshot_enabled": geometry_config.geometry_snapshot_enabled,
+                "dense_every": geometry_config.geometry_dense_every,
+                "dense_until": geometry_config.geometry_dense_until,
+                "sparse_every": geometry_config.geometry_sparse_every,
+                "probe_points": geometry_config.geometry_probe_points,
+            },
         },
     }
 

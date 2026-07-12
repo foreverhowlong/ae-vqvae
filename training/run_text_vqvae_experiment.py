@@ -105,6 +105,7 @@ def main():
         initial_pca_fit_mode=diagnostics_cfg.initial_pca_fit_mode,
         initial_pca_strict=diagnostics_cfg.initial_pca_strict,
         codebook_init_method=train_cfg.codebook_init,
+        geometry_config=diagnostics_cfg,
     )
     atomic_json_dump(config_payload, run_dir / "config.json")
 
@@ -160,6 +161,14 @@ def main():
                 "enabled": diagnostics_cfg.initial_pca_enabled,
                 "max_points": diagnostics_cfg.initial_pca_max_points,
                 "fit_mode": diagnostics_cfg.initial_pca_fit_mode,
+                "strict": diagnostics_cfg.initial_pca_strict,
+            },
+            geometry_snapshot_opts={
+                "enabled": diagnostics_cfg.geometry_snapshot_enabled,
+                "dense_every": diagnostics_cfg.geometry_dense_every,
+                "dense_until": diagnostics_cfg.geometry_dense_until,
+                "sparse_every": diagnostics_cfg.geometry_sparse_every,
+                "probe_points": diagnostics_cfg.geometry_probe_points,
                 "strict": diagnostics_cfg.initial_pca_strict,
             },
         )

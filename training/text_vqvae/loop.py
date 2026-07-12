@@ -18,6 +18,11 @@ from training.text_vqvae.reporting import (
     run_initial_pca,
     write_reconstruction_samples,
 )
+from training.text_vqvae.geometry import (
+    dump_geometry_snapshot,
+    geometry_snapshot_due,
+    materialize_geometry_probe,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +263,7 @@ def run(
     config_payload: dict,
     tracker,
     initial_pca_opts: dict,
+    geometry_snapshot_opts: dict | None = None,
 ):
     from training.text_vqvae.reporting import atomic_json_dump
     import shutil
@@ -288,6 +294,40 @@ def run(
     global_step = 0
     last_eval = None
     start_time = time.time()
+    geometry_opts = geometry_snapshot_opts or {"enabled": False}
+    probe_batches = None
+
+    def take_geometry_snapshot(step: int) -> None:
+        if probe_batches is None:
+            return
+        try:
+            geometry_metrics = dump_geometry_snapshot(model, probe_batches, step, run_dir)
+            append_jsonl(
+                {"split": "geometry", "step": step,
+                 "elapsed_sec": time.time() - start_time, **geometry_metrics},
+                metrics_path,
+            )
+            tracker.log({f"geometry/{k}": v for k, v in geometry_metrics.items()}, step=step)
+            print(f"[Geometry] step={step} used_codes={geometry_metrics['used_codes']}")
+        except Exception as exc:
+            if geometry_opts.get("strict", False):
+                raise
+            print(f"[Geometry] warning at step {step}: {exc!r}; training will continue.")
+
+    if geometry_opts.get("enabled", False):
+        try:
+            probe_batches = materialize_geometry_probe(
+                val_loader,
+                latent_slots=model_config.latent_slots,
+                max_points=geometry_opts["probe_points"],
+                run_dir=run_dir,
+            )
+            take_geometry_snapshot(0)
+        except Exception as exc:
+            probe_batches = None
+            if geometry_opts.get("strict", False):
+                raise
+            print(f"[Geometry] warning during probe setup: {exc!r}; snapshots disabled.")
 
     if config_payload["diagnostics"]["initial_pca"].get("status") == "completed":
         initial_metrics = {
@@ -325,6 +365,14 @@ def run(
                 )
                 tracker.log({f"train/{k}": v for k, v in train_metrics.items()}, step=global_step)
 
+                if probe_batches is not None and geometry_snapshot_due(
+                    global_step,
+                    dense_every=geometry_opts["dense_every"],
+                    dense_until=geometry_opts["dense_until"],
+                    sparse_every=geometry_opts["sparse_every"],
+                ):
+                    take_geometry_snapshot(global_step)
+
                 if global_step == 1 or global_step % train_cfg.eval_every == 0:
                     last_eval = evaluate(model, val_loader, device, model_config, collapse_config, beta)
                     append_jsonl(
@@ -359,6 +407,13 @@ def run(
             last_eval = evaluate(model, val_loader, device, model_config, collapse_config, beta)
 
         save_checkpoint(model, optimizer, global_step, train_cfg.epochs, run_dir, "last.pt")
+        if probe_batches is not None and not geometry_snapshot_due(
+            global_step,
+            dense_every=geometry_opts["dense_every"],
+            dense_until=geometry_opts["dense_until"],
+            sparse_every=geometry_opts["sparse_every"],
+        ):
+            take_geometry_snapshot(global_step)
         write_reconstruction_samples(
             model, val_loader, device, model_config, tokenizer,
             run_dir / "samples" / "recon_final.jsonl",
