@@ -24,7 +24,7 @@ from models.text_vqvae import (
     text_vqvae_losses,
 )
 from training.text_vqvae.codebook_init import initialize_codebook_kmeans
-from training.text_vqvae.loop import compute_accuracy
+from training.text_vqvae.loop import compute_accuracy, save_checkpoint
 from visualization.text_vqvae import (
     collect_encoder_vectors,
     compare_vector_distributions_pca,
@@ -51,6 +51,43 @@ def small_config(**overrides):
     }
     values.update(overrides)
     return TextVQVAEConfig(**values)
+
+
+class CheckpointRetentionTest(unittest.TestCase):
+    def test_keeps_best_and_two_most_recent_regular_checkpoints(self):
+        model = nn.Linear(2, 2)
+        optimizer = torch.optim.Adam(model.parameters())
+
+        with TemporaryDirectory() as tmp_dir:
+            run_dir = Path(tmp_dir)
+            (run_dir / "checkpoints").mkdir()
+
+            save_checkpoint(model, optimizer, 1, 1, run_dir, "best.pt")
+            save_checkpoint(model, optimizer, 10, 1, run_dir, "step10.pt")
+            save_checkpoint(model, optimizer, 20, 1, run_dir, "step20.pt")
+            save_checkpoint(model, optimizer, 30, 1, run_dir, "step30.pt")
+
+            self.assertEqual(
+                {path.name for path in (run_dir / "checkpoints").glob("*.pt")},
+                {"best.pt", "step20.pt", "step30.pt"},
+            )
+
+    def test_final_checkpoint_counts_as_one_of_the_two_recent_files(self):
+        model = nn.Linear(2, 2)
+        optimizer = torch.optim.Adam(model.parameters())
+
+        with TemporaryDirectory() as tmp_dir:
+            run_dir = Path(tmp_dir)
+            (run_dir / "checkpoints").mkdir()
+
+            save_checkpoint(model, optimizer, 10, 1, run_dir, "step10.pt")
+            save_checkpoint(model, optimizer, 20, 1, run_dir, "step20.pt")
+            save_checkpoint(model, optimizer, 20, 1, run_dir, "last.pt")
+
+            self.assertEqual(
+                {path.name for path in (run_dir / "checkpoints").glob("*.pt")},
+                {"step20.pt", "last.pt"},
+            )
 
 
 class TextVQVAEDecoderTest(unittest.TestCase):

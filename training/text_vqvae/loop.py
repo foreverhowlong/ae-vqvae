@@ -88,12 +88,25 @@ def compute_accuracy(
     return correct, total
 
 
+def prune_checkpoints(checkpoint_dir: Path, keep_recent: int = 2) -> None:
+    """Keep best.pt plus the most recently modified regular checkpoints."""
+    regular_checkpoints = sorted(
+        (path for path in checkpoint_dir.glob("*.pt") if path.name != "best.pt"),
+        key=lambda path: (path.stat().st_mtime_ns, path.name),
+        reverse=True,
+    )
+    for stale_checkpoint in regular_checkpoints[keep_recent:]:
+        stale_checkpoint.unlink()
+
+
 def save_checkpoint(model, optimizer, step: int, epoch: int, run_dir: Path, name: str) -> Path:
-    path = run_dir / "checkpoints" / name
+    checkpoint_dir = run_dir / "checkpoints"
+    path = checkpoint_dir / name
     torch.save(
         {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step, "epoch": epoch},
         path,
     )
+    prune_checkpoints(checkpoint_dir)
     return path
 
 
