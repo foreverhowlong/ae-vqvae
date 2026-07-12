@@ -14,8 +14,14 @@ from models.text_vqvae import (
     SubPixelSequenceUpsampler,
     TextVQVAE,
     TextVQVAEConfig,
+    codebook_stats,
+    pad_aware_adaptive_pool1d,
+    text_vqvae_losses,
 )
-from training.run_text_vqvae_experiment import initialize_codebook_from_first_encoder_pass
+from training.run_text_vqvae_experiment import (
+    compute_accuracy,
+    initialize_codebook_from_first_encoder_pass,
+)
 from visualization.text_vqvae import (
     collect_encoder_vectors,
     compare_vector_distributions_pca,
@@ -130,6 +136,101 @@ class TextVQVAEDecoderTest(unittest.TestCase):
             legacy_state[key] = value
 
         model.load_state_dict(legacy_state, strict=True)
+
+
+class TextVQVAEPaddingTest(unittest.TestCase):
+    def test_pad_aware_pool_excludes_pad_tokens_and_zeros_empty_segments(self):
+        hidden = torch.tensor(
+            [
+                [[1.0], [2.0], [100.0], [4.0], [100.0], [100.0]],
+                [[9.0], [9.0], [9.0], [8.0], [8.0], [8.0]],
+            ]
+        )
+        attention_mask = torch.tensor(
+            [
+                [1, 1, 0, 1, 0, 0],
+                [0, 0, 0, 0, 0, 0],
+            ]
+        )
+
+        pooled, latent_mask = pad_aware_adaptive_pool1d(
+            hidden,
+            attention_mask,
+            output_size=2,
+        )
+
+        torch.testing.assert_close(
+            pooled,
+            torch.tensor([[[1.5], [4.0]], [[0.0], [0.0]]]),
+        )
+        torch.testing.assert_close(
+            latent_mask,
+            torch.tensor([[True, True], [False, False]]),
+        )
+
+    def test_pad_aware_pool_matches_adaptive_pool_when_all_tokens_are_valid(self):
+        hidden = torch.randn(2, 11, 3)
+        pooled, latent_mask = pad_aware_adaptive_pool1d(
+            hidden,
+            torch.ones(2, 11, dtype=torch.long),
+            output_size=4,
+        )
+        expected = torch.nn.functional.adaptive_avg_pool1d(
+            hidden.transpose(1, 2), 4
+        ).transpose(1, 2)
+
+        torch.testing.assert_close(pooled, expected)
+        self.assertTrue(latent_mask.all())
+
+    def test_fully_padded_latent_slots_remain_fixed_zero_through_quantization(self):
+        model = TextVQVAE(small_config())
+        input_ids = torch.full((1, 12), 31, dtype=torch.long)
+        input_ids[:, :3] = torch.randint(0, 31, (1, 3))
+        attention_mask = torch.zeros(1, 12, dtype=torch.long)
+        attention_mask[:, :3] = 1
+
+        outputs = model(input_ids, attention_mask)
+
+        torch.testing.assert_close(
+            outputs["latent_mask"],
+            torch.tensor([[True, False, False, False]]),
+        )
+        torch.testing.assert_close(outputs["z_e"][:, 1:], torch.zeros(1, 3, 16))
+        torch.testing.assert_close(outputs["z_q_raw"][:, 1:], torch.zeros(1, 3, 16))
+        torch.testing.assert_close(outputs["z_q_st"][:, 1:], torch.zeros(1, 3, 16))
+        torch.testing.assert_close(outputs["indices"][:, 1:], -torch.ones(1, 3, dtype=torch.long))
+
+    def test_losses_accuracy_and_codebook_stats_ignore_padding(self):
+        targets = torch.tensor([[1, 3, 3]])
+        logits = torch.tensor(
+            [[[0.0, 4.0, 0.0, 0.0], [9.0, 0.0, 0.0, 0.0], [9.0, 0.0, 0.0, 0.0]]]
+        )
+        base_outputs = {
+            "logits": logits,
+            "z_e": torch.tensor([[[1.0, 1.0], [100.0, 100.0]]]),
+            "z_q_raw": torch.tensor([[[3.0, 3.0], [-100.0, -100.0]]]),
+            "latent_mask": torch.tensor([[True, False]]),
+            "distances": torch.zeros(1, 2, 4),
+        }
+
+        losses = text_vqvae_losses(
+            base_outputs,
+            targets,
+            pad_token_id=3,
+            beta=0.25,
+        )
+        correct, total = compute_accuracy(logits, targets, pad_token_id=3)
+        stats = codebook_stats(
+            torch.tensor([[2, -1]]),
+            codebook_size=4,
+            valid_mask=base_outputs["latent_mask"],
+        )
+
+        self.assertAlmostEqual(losses["codebook"].item(), 4.0)
+        self.assertAlmostEqual(losses["commitment"].item(), 4.0)
+        self.assertEqual((correct, total), (1, 1))
+        self.assertEqual(stats["used_codes"], 1)
+        self.assertEqual(stats["counts"].tolist(), [0.0, 0.0, 1.0, 0.0])
 
 
 class TextVQVAEVisualizationTest(unittest.TestCase):

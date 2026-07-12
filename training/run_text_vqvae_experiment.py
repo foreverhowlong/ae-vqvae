@@ -351,9 +351,16 @@ def initialize_codebook_from_first_encoder_pass(model, data_loader, device, seed
     try:
         for batch in data_loader:
             batch = batch_to_device(batch, device)
-            z_e = model.encode(batch["input_ids"], attention_mask=batch["attention_mask"])
-            vectors = z_e.reshape(-1, z_e.shape[-1]).detach().float().cpu().numpy()
+            z_e, latent_mask = model.encode(
+                batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                return_mask=True,
+            )
+            vectors = z_e[latent_mask].detach().float().cpu().numpy()
             vectors_seen += len(vectors)
+
+            if len(vectors) == 0:
+                continue
 
             if not fitted:
                 pending.append(vectors)
@@ -424,10 +431,15 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
         reset_count = model.quantizer.reset_dead_codes(
             outputs["z_e"],
             usage_threshold=collapse_config.dead_code_reset_usage_threshold,
+            valid_mask=outputs["latent_mask"],
         )
 
     correct, total = compute_accuracy(outputs["logits"], batch["input_ids"], model_config.pad_token_id)
-    stats = codebook_stats(outputs["indices"], model_config.codebook_size)
+    stats = codebook_stats(
+        outputs["indices"],
+        model_config.codebook_size,
+        valid_mask=outputs["latent_mask"],
+    )
     return {
         "loss": losses["total"].item(),
         "recon_nll": losses["recon"].item(),
@@ -458,6 +470,7 @@ def evaluate(model, data_loader, device, model_config, collapse_config, beta):
     total_correct = 0
     total_tokens = 0
     all_indices = []
+    all_latent_masks = []
     batches = 0
 
     for batch in data_loader:
@@ -483,10 +496,16 @@ def evaluate(model, data_loader, device, model_config, collapse_config, beta):
         total_correct += correct
         total_tokens += tokens
         all_indices.append(outputs["indices"].detach().cpu())
+        all_latent_masks.append(outputs["latent_mask"].detach().cpu())
         batches += 1
 
     merged_indices = torch.cat(all_indices, dim=0)
-    stats = codebook_stats(merged_indices, model_config.codebook_size)
+    merged_latent_masks = torch.cat(all_latent_masks, dim=0)
+    stats = codebook_stats(
+        merged_indices,
+        model_config.codebook_size,
+        valid_mask=merged_latent_masks,
+    )
     avg_recon = total_recon / max(batches, 1)
     return {
         "loss": total_loss / max(batches, 1),

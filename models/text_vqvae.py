@@ -69,8 +69,16 @@ class VectorQuantizer(nn.Module):
             self.register_buffer("ema_cluster_size", torch.zeros(codebook_size))
             self.register_buffer("ema_embed_sum", self.codebook.weight.detach().clone())
 
-    def forward(self, z_e: torch.Tensor):
+    def forward(self, z_e: torch.Tensor, valid_mask: torch.Tensor | None = None):
         flat = z_e.reshape(-1, self.d_model)
+        if valid_mask is None:
+            valid_mask = torch.ones(z_e.shape[:2], dtype=torch.bool, device=z_e.device)
+        elif valid_mask.shape != z_e.shape[:2]:
+            raise ValueError(
+                f"valid_mask must have shape {z_e.shape[:2]}, got {valid_mask.shape}."
+            )
+        valid_mask = valid_mask.to(device=z_e.device, dtype=torch.bool)
+        flat_valid_mask = valid_mask.reshape(-1)
         weights = self.codebook.weight
 
         distance_flat = flat
@@ -86,15 +94,25 @@ class VectorQuantizer(nn.Module):
         )
         indices = self._select_codes(distances)
         z_q_raw = self.codebook(indices).view_as(z_e)
+        z_q_raw = torch.where(valid_mask.unsqueeze(-1), z_q_raw, z_e.detach())
 
-        if self.training and self.collapse_config.use_ema_codebook:
-            self._ema_update(flat.detach(), indices.detach())
+        if (
+            self.training
+            and self.collapse_config.use_ema_codebook
+            and flat_valid_mask.any()
+        ):
+            self._ema_update(
+                flat[flat_valid_mask].detach(),
+                indices[flat_valid_mask].detach(),
+            )
 
         z_q_st = z_e + (z_q_raw - z_e).detach()
+        indices = indices.view(z_e.shape[0], z_e.shape[1])
+        indices = indices.masked_fill(~valid_mask, -1)
         return {
             "z_q_raw": z_q_raw,
             "z_q_st": z_q_st,
-            "indices": indices.view(z_e.shape[0], z_e.shape[1]),
+            "indices": indices,
             "distances": distances.view(z_e.shape[0], z_e.shape[1], self.codebook_size),
         }
 
@@ -139,8 +157,15 @@ class VectorQuantizer(nn.Module):
         self.codebook.weight.data.copy_(normalized_embed)
 
     @torch.no_grad()
-    def reset_dead_codes(self, z_e: torch.Tensor, usage_threshold: float = 1.0):
+    def reset_dead_codes(
+        self,
+        z_e: torch.Tensor,
+        usage_threshold: float = 1.0,
+        valid_mask: torch.Tensor | None = None,
+    ):
         flat = z_e.reshape(-1, self.d_model).detach()
+        if valid_mask is not None:
+            flat = flat[valid_mask.reshape(-1).to(device=flat.device, dtype=torch.bool)]
         if flat.numel() == 0:
             return 0
 
@@ -339,6 +364,39 @@ def _validate_decode_length(seq_len: int, max_seq_len: int) -> None:
         raise ValueError(f"seq_len must be in [1, {max_seq_len}], got {seq_len}.")
 
 
+def pad_aware_adaptive_pool1d(
+    hidden: torch.Tensor,
+    attention_mask: torch.Tensor,
+    output_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Average valid tokens in adaptive-pooling bins and zero fully padded bins."""
+    if hidden.ndim != 3:
+        raise ValueError(f"hidden must have shape (batch, sequence, channels), got {hidden.shape}.")
+    if attention_mask.shape != hidden.shape[:2]:
+        raise ValueError(
+            f"attention_mask must have shape {hidden.shape[:2]}, got {attention_mask.shape}."
+        )
+    if output_size < 1:
+        raise ValueError(f"output_size must be positive, got {output_size}.")
+
+    valid_tokens = attention_mask.to(device=hidden.device, dtype=torch.bool)
+    masked_hidden = torch.where(
+        valid_tokens.unsqueeze(-1),
+        hidden,
+        torch.zeros((), device=hidden.device, dtype=hidden.dtype),
+    )
+    pooled_with_pad_denominator = F.adaptive_avg_pool1d(
+        masked_hidden.transpose(1, 2), output_size
+    ).transpose(1, 2)
+    valid_fraction = F.adaptive_avg_pool1d(
+        valid_tokens.to(hidden.dtype).unsqueeze(1), output_size
+    ).squeeze(1)
+    latent_mask = valid_fraction > 0
+    pooled = pooled_with_pad_denominator / valid_fraction.clamp_min(1e-12).unsqueeze(-1)
+    pooled = torch.where(latent_mask.unsqueeze(-1), pooled, torch.zeros_like(pooled))
+    return pooled, latent_mask
+
+
 class TextVQVAE(nn.Module):
     """Compresses a byte sequence into discrete latent slots and decodes in parallel."""
 
@@ -384,22 +442,38 @@ class TextVQVAE(nn.Module):
         self.decoder_impl = decoder_class(config)
         self.output_head = nn.Linear(config.d_model, config.vocab_size)
 
-    def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
+    def encode(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        return_mask: bool = False,
+    ):
         batch_size, seq_len = input_ids.shape
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         hidden = self.token_embedding(input_ids) + self.encoder_pos_embedding(positions)
 
-        padding_mask = None
-        if attention_mask is not None:
-            padding_mask = attention_mask == 0
+        if attention_mask is None:
+            attention_mask = input_ids != self.config.pad_token_id
+        else:
+            attention_mask = attention_mask.to(device=input_ids.device, dtype=torch.bool)
+        padding_mask = ~attention_mask
 
         hidden = self.encoder(hidden, src_key_padding_mask=padding_mask)
         hidden = self.encoder_norm(hidden)
 
-        latents = F.adaptive_avg_pool1d(
-            hidden.transpose(1, 2), self.config.latent_slots
-        ).transpose(1, 2)
-        return self.latent_proj(latents)
+        pooled, latent_mask = pad_aware_adaptive_pool1d(
+            hidden,
+            attention_mask,
+            self.config.latent_slots,
+        )
+        latents = self.latent_proj(pooled)
+        # A fully padded segment is represented by a fixed zero vector, including
+        # after the projection bias, so it cannot become a trainable PAD prototype.
+        latents = torch.where(latent_mask.unsqueeze(-1), latents, torch.zeros_like(latents))
+        if return_mask:
+            return latents, latent_mask
+        return latents
 
     def decode(self, z_q_st: torch.Tensor, seq_len: int):
         return self.output_head(self.decoder_impl(z_q_st, seq_len))
@@ -426,8 +500,12 @@ class TextVQVAE(nn.Module):
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
-        z_e = self.encode(input_ids, attention_mask=attention_mask)
-        quantized = self.quantizer(z_e)
+        z_e, latent_mask = self.encode(
+            input_ids,
+            attention_mask=attention_mask,
+            return_mask=True,
+        )
+        quantized = self.quantizer(z_e, valid_mask=latent_mask)
         z_q_raw = quantized["z_q_raw"]
         z_q_st = quantized["z_q_st"]
         indices = quantized["indices"]
@@ -439,13 +517,22 @@ class TextVQVAE(nn.Module):
             "z_q_st": z_q_st,
             "indices": indices,
             "distances": quantized["distances"],
+            "latent_mask": latent_mask,
         }
 
 
 def assignment_entropy_loss(outputs, temperature: float, codebook_size: int):
     distances = outputs["distances"]
     probs = torch.softmax(-distances / max(temperature, 1e-6), dim=-1)
-    avg_probs = probs.mean(dim=(0, 1))
+    latent_mask = outputs.get("latent_mask")
+    if latent_mask is not None:
+        probs = probs[latent_mask]
+    else:
+        probs = probs.reshape(-1, probs.shape[-1])
+    if probs.numel() == 0:
+        zero = distances.sum() * 0.0
+        return zero, zero.detach()
+    avg_probs = probs.mean(dim=0)
     entropy = -(avg_probs * torch.log(avg_probs + 1e-12)).sum()
     normalized_entropy = entropy / torch.log(torch.tensor(float(codebook_size), device=distances.device))
     return -normalized_entropy, normalized_entropy.detach()
@@ -459,6 +546,20 @@ def codebook_diversity_loss(codebook_weight: torch.Tensor):
     return off_diag.pow(2).mean()
 
 
+def _masked_vector_mse(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    squared_error = (inputs - targets).pow(2)
+    if valid_mask is None:
+        return squared_error.mean()
+    valid_mask = valid_mask.to(device=inputs.device, dtype=torch.bool)
+    if not valid_mask.any():
+        return inputs.sum() * 0.0
+    return squared_error[valid_mask].mean()
+
+
 def text_vqvae_losses(
     outputs,
     targets,
@@ -469,18 +570,19 @@ def text_vqvae_losses(
 ):
     collapse_config = collapse_config or CollapseControlConfig()
     logits = outputs["logits"]
-    recon_loss = F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        targets.reshape(-1),
-        ignore_index=pad_token_id,
-    )
+    valid_tokens = targets != pad_token_id
+    if valid_tokens.any():
+        recon_loss = F.cross_entropy(logits[valid_tokens], targets[valid_tokens])
+    else:
+        recon_loss = logits.sum() * 0.0
     z_e = outputs["z_e"]
     z_q_raw = outputs["z_q_raw"]
+    latent_mask = outputs.get("latent_mask")
     if collapse_config.use_ema_codebook:
         codebook_loss = torch.zeros((), device=z_e.device)
     else:
-        codebook_loss = F.mse_loss(z_q_raw, z_e.detach())
-    commitment_loss = F.mse_loss(z_e, z_q_raw.detach())
+        codebook_loss = _masked_vector_mse(z_q_raw, z_e.detach(), latent_mask)
+    commitment_loss = _masked_vector_mse(z_e, z_q_raw.detach(), latent_mask)
     entropy_loss = torch.zeros((), device=z_e.device)
     normalized_entropy = torch.zeros((), device=z_e.device)
     if collapse_config.entropy_weight > 0:
@@ -513,9 +615,25 @@ def text_vqvae_losses(
 
 
 @torch.no_grad()
-def codebook_stats(indices: torch.Tensor, codebook_size: int):
-    flat = indices.reshape(-1).detach().cpu()
+def codebook_stats(
+    indices: torch.Tensor,
+    codebook_size: int,
+    valid_mask: torch.Tensor | None = None,
+):
+    if valid_mask is None:
+        flat = indices.reshape(-1)
+    else:
+        flat = indices[valid_mask.to(device=indices.device, dtype=torch.bool)]
+    flat = flat[flat >= 0].detach().cpu()
     counts = torch.bincount(flat, minlength=codebook_size).float()
+    if flat.numel() == 0:
+        return {
+            "used_codes": 0,
+            "dead_codes": codebook_size,
+            "utilization": 0.0,
+            "codebook_perplexity": 0.0,
+            "counts": counts,
+        }
     probs = counts / (counts.sum() + 1e-12)
     entropy = -(probs * torch.log(probs + 1e-12)).sum()
     perplexity = torch.exp(entropy).item()

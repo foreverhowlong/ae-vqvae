@@ -13,6 +13,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.decomposition import PCA
 
 
@@ -305,13 +306,9 @@ def _as_pad_ratios(
 
 def _slot_pad_ratios(pad_mask: torch.Tensor, latent_slots: int) -> torch.Tensor:
     """Match adaptive_avg_pool1d's input bins and average PAD masks per bin."""
-    seq_len = pad_mask.shape[1]
-    ratios = []
-    for slot in range(latent_slots):
-        start = (slot * seq_len) // latent_slots
-        end = ((slot + 1) * seq_len + latent_slots - 1) // latent_slots
-        ratios.append(pad_mask[:, start:end].mean(dim=1))
-    return torch.stack(ratios, dim=1)
+    return F.adaptive_avg_pool1d(
+        pad_mask.float().unsqueeze(1), latent_slots
+    ).squeeze(1)
 
 
 def _mean_nearest_l2_distance(encoder: np.ndarray, codebook: np.ndarray) -> float:
