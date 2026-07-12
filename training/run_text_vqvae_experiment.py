@@ -14,7 +14,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
+from sklearn.cluster import MiniBatchKMeans
 from torch.utils.data import DataLoader, random_split
 
 from common import ROOT, enable_tf32, get_device
@@ -35,6 +37,12 @@ from models.text_vqvae import (
     count_parameters,
     text_vqvae_losses,
 )
+from visualization.text_vqvae import (
+    collect_encoder_vectors,
+    compare_vector_distributions_pca,
+    render_pca_comparison,
+    save_pca_metadata,
+)
 
 
 @dataclass
@@ -51,6 +59,7 @@ class TrainConfig:
     num_workers: int
     tokenizer: str
     tokenizer_path: str | None
+    codebook_init: str
     ablation: str | None
 
 
@@ -131,7 +140,38 @@ def parse_args():
     parser.add_argument("--ffn-mult", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--codebook-size", type=int, default=3072)
+    parser.add_argument(
+        "--codebook-init",
+        choices=["random", "kmeans"],
+        default="random",
+        help=(
+            "Codebook initialization method. `random` keeps the original normal "
+            "initialization; `kmeans` clusters encoder outputs from one full pre-training pass."
+        ),
+    )
     parser.add_argument("--commitment-beta", type=float, default=0.25)
+    parser.add_argument(
+        "--initial-pca-max-points",
+        type=int,
+        default=8192,
+        help="Maximum encoder latent vectors in the initialization PCA plot.",
+    )
+    parser.add_argument(
+        "--initial-pca-fit-mode",
+        choices=["balanced", "all"],
+        default="balanced",
+        help="Fit PCA with equal group sizes or all collected vectors.",
+    )
+    parser.add_argument(
+        "--skip-initial-pca",
+        action="store_true",
+        help="Do not generate the initialization encoder/codebook PCA plot.",
+    )
+    parser.add_argument(
+        "--strict-initial-pca",
+        action="store_true",
+        help="Fail the run instead of warning if the initialization PCA diagnostic fails.",
+    )
 
     parser.add_argument(
         "--collapse-preset",
@@ -288,6 +328,68 @@ def batch_to_device(batch, device):
         "input_ids": batch["input_ids"].to(device, non_blocking=True),
         "attention_mask": batch["attention_mask"].to(device, non_blocking=True),
     }
+
+
+@torch.no_grad()
+def initialize_codebook_from_first_encoder_pass(model, data_loader, device, seed):
+    """Initialize the codebook with streaming k-means over one encoder-only data pass."""
+    codebook_size = model.config.codebook_size
+    kmeans = MiniBatchKMeans(
+        n_clusters=codebook_size,
+        init="random",
+        n_init=1,
+        random_state=seed,
+        reassignment_ratio=0.0,
+    )
+    was_training = model.training
+    model.eval()
+    pending = []
+    pending_count = 0
+    vectors_seen = 0
+    fitted = False
+
+    try:
+        for batch in data_loader:
+            batch = batch_to_device(batch, device)
+            z_e = model.encode(batch["input_ids"], attention_mask=batch["attention_mask"])
+            vectors = z_e.reshape(-1, z_e.shape[-1]).detach().float().cpu().numpy()
+            vectors_seen += len(vectors)
+
+            if not fitted:
+                pending.append(vectors)
+                pending_count += len(vectors)
+                if pending_count < codebook_size:
+                    continue
+                vectors = np.concatenate(pending, axis=0)
+                pending.clear()
+                fitted = True
+
+            kmeans.partial_fit(vectors)
+    finally:
+        model.train(was_training)
+
+    if not fitted:
+        raise ValueError(
+            "K-means codebook initialization needs at least as many encoder vectors as "
+            f"codes, but the first pass produced {vectors_seen} vectors for "
+            f"{codebook_size} codes."
+        )
+
+    centers = torch.as_tensor(
+        kmeans.cluster_centers_,
+        device=model.quantizer.codebook.weight.device,
+        dtype=model.quantizer.codebook.weight.dtype,
+    )
+    if model.collapse_config.normalize_latents:
+        centers = torch.nn.functional.normalize(centers, dim=-1)
+    model.quantizer.codebook.weight.copy_(centers)
+
+    # Keep EMA state consistent so that its first update does not restore the old random values.
+    if hasattr(model.quantizer, "ema_embed_sum"):
+        model.quantizer.ema_embed_sum.copy_(centers)
+        model.quantizer.ema_cluster_size.fill_(1.0)
+
+    return {"method": "kmeans", "encoder_vectors": vectors_seen}
 
 
 def compute_accuracy(logits, targets, pad_token_id):
@@ -537,6 +639,7 @@ def main():
         num_workers=args.num_workers,
         tokenizer=args.tokenizer,
         tokenizer_path=tokenizer_path,
+        codebook_init=args.codebook_init,
         ablation=args.ablation,
     )
     data_config = DataConfig(
@@ -579,6 +682,19 @@ def main():
         "collapse_control": collapse_config.to_dict(),
         "device": str(device),
         "output_dir": str(run_dir),
+        "codebook_initialization": {
+            "method": args.codebook_init,
+            "status": "completed" if args.codebook_init == "random" else "pending",
+        },
+        "diagnostics": {
+            "initial_pca": {
+                "enabled": not args.skip_initial_pca,
+                "max_encoder_points": args.initial_pca_max_points,
+                "fit_mode": args.initial_pca_fit_mode,
+                "strict": args.strict_initial_pca,
+                "status": "disabled" if args.skip_initial_pca else "pending",
+            }
+        },
     }
     atomic_json_dump(config_payload, run_dir / "config.json")
 
@@ -611,6 +727,23 @@ def main():
     )
 
     model = TextVQVAE(model_config, collapse_config=collapse_config).to(device)
+    if args.codebook_init == "kmeans":
+        print("[Codebook init] Running encoder pass and fitting MiniBatch K-Means...")
+        init_result = initialize_codebook_from_first_encoder_pass(
+            model,
+            train_loader,
+            device,
+            seed=train_config.seed,
+        )
+        config_payload["codebook_initialization"].update(
+            {"status": "completed", **init_result}
+        )
+        atomic_json_dump(config_payload, run_dir / "config.json")
+        print(
+            "[Codebook init] K-means completed from "
+            f"{init_result['encoder_vectors']:,} encoder vectors"
+        )
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_config.lr,
@@ -642,6 +775,40 @@ def main():
     print(f"[Data] train={len(train_dataset)} eval={len(val_dataset)}")
     print(f"[Output] {run_dir}")
 
+    if not args.skip_initial_pca:
+        pca_path = run_dir / "plots" / "initial_latent_codebook_pca.png"
+        try:
+            encoder_vectors = collect_encoder_vectors(
+                model,
+                val_loader,
+                max_points=args.initial_pca_max_points,
+            )
+            pca_result = compare_vector_distributions_pca(
+                encoder_vectors.vectors,
+                model.quantizer.codebook.weight,
+                encoder_pad_ratios=encoder_vectors.pad_ratios,
+                fit_mode=args.initial_pca_fit_mode,
+                random_state=train_config.seed,
+            )
+            render_pca_comparison(pca_result, pca_path)
+            save_pca_metadata(pca_result, pca_path.with_suffix(".json"))
+            pca_metadata = pca_result.metadata()
+            config_payload["diagnostics"]["initial_pca"].update(
+                {"status": "completed", "result": pca_metadata}
+            )
+            print(
+                f"[Initial PCA] {pca_path} "
+                f"explained={pca_metadata['total_explained_variance']:.1%}"
+            )
+        except Exception as exc:
+            config_payload["diagnostics"]["initial_pca"].update(
+                {"status": "failed", "error": repr(exc)}
+            )
+            if args.strict_initial_pca:
+                raise
+            print(f"[Initial PCA] warning: {exc!r}; training will continue.")
+        atomic_json_dump(config_payload, run_dir / "config.json")
+
     metrics_path = run_dir / "metrics.jsonl"
     best_eval_loss = float("inf")
     best_step = 0
@@ -649,6 +816,24 @@ def main():
     last_eval = None
     start_time = time.time()
     tracker = init_wandb(run_name, group="text-vqvae", tags=["text", "vqvae"], config=config_payload)
+
+    if config_payload["diagnostics"]["initial_pca"].get("status") == "completed":
+        initial_metrics = {
+            key: config_payload["diagnostics"]["initial_pca"]["result"][key]
+            for key in (
+                "encoder_mean_norm",
+                "encoder_norm_std",
+                "codebook_mean_norm",
+                "codebook_norm_std",
+                "encoder_to_nearest_code_mean_distance",
+                "encoder_pairwise_mean_distance",
+            )
+        }
+        append_jsonl(
+            {"split": "initialization", "step": 0, "elapsed_sec": 0.0, **initial_metrics},
+            metrics_path,
+        )
+        tracker.log({f"initial/{key}": value for key, value in initial_metrics.items()}, step=0)
 
     try:
         for epoch in range(1, train_config.epochs + 1):

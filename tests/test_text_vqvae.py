@@ -1,16 +1,26 @@
 from collections import OrderedDict
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
 import torch
 import torch.nn as nn
 
 from models.text_vqvae import (
+    CollapseControlConfig,
     CrossAttentionTextDecoder,
     MemoryTrunkTextDecoder,
     RotarySelfAttention,
     SubPixelSequenceUpsampler,
     TextVQVAE,
     TextVQVAEConfig,
+)
+from training.run_text_vqvae_experiment import initialize_codebook_from_first_encoder_pass
+from visualization.text_vqvae import (
+    collect_encoder_vectors,
+    compare_vector_distributions_pca,
+    render_pca_comparison,
+    save_pca_metadata,
 )
 
 
@@ -120,6 +130,119 @@ class TextVQVAEDecoderTest(unittest.TestCase):
             legacy_state[key] = value
 
         model.load_state_dict(legacy_state, strict=True)
+
+
+class TextVQVAEVisualizationTest(unittest.TestCase):
+    def test_initial_pca_steps_are_composable_and_balanced(self):
+        model = TextVQVAE(small_config())
+        model.train()
+        batch = {
+            "input_ids": torch.randint(0, 31, (3, 12)),
+            "attention_mask": torch.ones(3, 12, dtype=torch.long),
+        }
+        batch["attention_mask"][0, 6:] = 0
+
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "initial_pca.png"
+            encoder_vectors = collect_encoder_vectors(
+                model,
+                [batch],
+                max_points=7,
+            )
+            result = compare_vector_distributions_pca(
+                encoder_vectors.vectors,
+                model.quantizer.codebook.weight,
+                encoder_pad_ratios=encoder_vectors.pad_ratios,
+                fit_mode="balanced",
+            )
+            render_pca_comparison(result, output_path)
+            save_pca_metadata(result, output_path.with_suffix(".json"))
+            metadata = result.metadata()
+
+            self.assertTrue(output_path.is_file())
+            self.assertTrue(output_path.with_suffix(".json").is_file())
+            self.assertEqual(metadata["encoder_points"], 7)
+            self.assertEqual(metadata["codebook_points"], 8)
+            self.assertEqual(metadata["original_dimension"], 16)
+            self.assertEqual(metadata["fit_mode"], "balanced")
+            self.assertEqual(metadata["fit_points_per_distribution"], 7)
+            self.assertIn("encoder_norm_std", metadata)
+            self.assertIn("codebook_norm_std", metadata)
+            self.assertIn("encoder_to_nearest_code_mean_distance", metadata)
+            self.assertIn("encoder_pairwise_mean_distance", metadata)
+            self.assertEqual(len(result.encoder_pad_ratios), 7)
+            torch.testing.assert_close(
+                encoder_vectors.pad_ratios[:4], torch.tensor([0.0, 0.0, 1.0, 1.0])
+            )
+            self.assertEqual(len(metadata["explained_variance_ratio"]), 2)
+            self.assertTrue(model.training)
+
+    def test_pca_rejects_mismatched_dimensions(self):
+        with self.assertRaisesRegex(ValueError, "dimensions must match"):
+            compare_vector_distributions_pca(
+                torch.randn(3, 4),
+                torch.randn(3, 5),
+            )
+
+    def test_initial_distance_metrics_use_euclidean_distance(self):
+        result = compare_vector_distributions_pca(
+            torch.tensor([[0.0, 0.0], [3.0, 0.0], [0.0, 4.0]]),
+            torch.tensor([[0.0, 0.0]]),
+            fit_mode="all",
+        )
+
+        self.assertAlmostEqual(result.encoder_to_nearest_code_mean_distance, 7.0 / 3.0)
+        self.assertAlmostEqual(result.encoder_pairwise_mean_distance, 4.0)
+
+
+class TextVQVAECodebookInitializationTest(unittest.TestCase):
+    def test_kmeans_initialization_updates_codebook_and_ema_state(self):
+        collapse_config = CollapseControlConfig(use_ema_codebook=True)
+        model = TextVQVAE(small_config(), collapse_config=collapse_config)
+        model.train()
+        original_codebook = model.quantizer.codebook.weight.detach().clone()
+        batches = [
+            {
+                "input_ids": torch.randint(0, 31, (3, 12)),
+                "attention_mask": torch.ones(3, 12, dtype=torch.long),
+            }
+            for _ in range(2)
+        ]
+
+        result = initialize_codebook_from_first_encoder_pass(
+            model,
+            batches,
+            torch.device("cpu"),
+            seed=7,
+        )
+
+        self.assertEqual(result, {"method": "kmeans", "encoder_vectors": 24})
+        self.assertTrue(model.training)
+        self.assertFalse(torch.equal(model.quantizer.codebook.weight, original_codebook))
+        self.assertTrue(torch.isfinite(model.quantizer.codebook.weight).all())
+        torch.testing.assert_close(
+            model.quantizer.ema_embed_sum,
+            model.quantizer.codebook.weight,
+        )
+        torch.testing.assert_close(
+            model.quantizer.ema_cluster_size,
+            torch.ones(8),
+        )
+
+    def test_kmeans_initialization_requires_at_least_one_vector_per_code(self):
+        model = TextVQVAE(small_config(codebook_size=16))
+        batch = {
+            "input_ids": torch.randint(0, 31, (1, 12)),
+            "attention_mask": torch.ones(1, 12, dtype=torch.long),
+        }
+
+        with self.assertRaisesRegex(ValueError, "produced 4 vectors for 16 codes"):
+            initialize_codebook_from_first_encoder_pass(
+                model,
+                [batch],
+                torch.device("cpu"),
+                seed=7,
+            )
 
 
 if __name__ == "__main__":
