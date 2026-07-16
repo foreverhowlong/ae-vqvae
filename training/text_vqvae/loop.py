@@ -20,6 +20,7 @@ from training.text_vqvae.reporting import (
 )
 from training.text_vqvae.geometry import (
     dump_geometry_snapshot,
+    finalize_geometry_artifacts,
     geometry_snapshot_due,
     materialize_geometry_probe,
 )
@@ -421,6 +422,38 @@ def run(
         plot_training_curves(metrics_path, run_dir / "plots")
         plot_codebook_usage(last_eval["code_counts"], run_dir / "plots")
 
+        geometry_render = {"status": "disabled", "snapshots_retained": True}
+        if probe_batches is not None:
+            try:
+                geometry_render = finalize_geometry_artifacts(
+                    run_dir,
+                    enabled=geometry_opts.get("render_enabled", False),
+                    basis=geometry_opts.get("render_basis", "first_last"),
+                    fps=geometry_opts.get("render_fps", 8),
+                    keep_snapshots=geometry_opts.get("keep_snapshots", True),
+                )
+                if geometry_render["status"] == "completed":
+                    print(
+                        "[Geometry] rendered final artifacts; "
+                        f"snapshots_retained={geometry_render['snapshots_retained']}"
+                    )
+            except Exception as exc:
+                geometry_render = {
+                    "status": "failed",
+                    "error": repr(exc),
+                    "snapshots_retained": True,
+                }
+                print(
+                    f"[Geometry] final rendering failed: {exc!r}; "
+                    "raw snapshots were retained."
+                )
+
+        config_payload["diagnostics"]["geometry"].update({
+            "render_status": geometry_render["status"],
+            "render_result": geometry_render,
+        })
+        atomic_json_dump(config_payload, run_dir / "config.json")
+
         summary = {
             "run_name": run_name,
             "status": "completed",
@@ -430,6 +463,7 @@ def run(
             "best_step": best_step,
             "final_eval": {k: v for k, v in last_eval.items() if k != "code_counts"},
             "parameter_count": config_payload.get("parameter_count"),
+            "geometry_render": geometry_render,
             "elapsed_sec": time.time() - start_time,
         }
         atomic_json_dump(summary, run_dir / "summary.json")

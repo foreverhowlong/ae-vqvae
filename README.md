@@ -41,6 +41,13 @@ WANDB_PROJECT=ae-vqvae
 ### Train
 
 ```bash
+# list every flag with its effective dataclass default
+python -m training.run_text_vqvae_experiment --help
+
+# print resolved JSON to stdout without creating a run
+python -m training.run_text_vqvae_experiment --print-config
+python -m training.run_text_vqvae_experiment --collapse-preset anti --batch-size 64 --print-config
+
 # run TinyStories compression with the trained 8K BPE tokenizer (default)
 python -m training.run_text_vqvae_experiment --run-name my_run
 
@@ -91,10 +98,12 @@ uv run pytest tests/
 ### Sync outputs from remote host
 
 ```bash
-scripts/sync_outputs_from_mech.sh               # sync all outputs
-scripts/sync_outputs_from_mech.sh --best-only   # only pull best.pt among *.pt files
-scripts/sync_outputs_from_mech.sh --no-models   # skip weight files
-scripts/sync_outputs_from_mech.sh --latest-only # sync only the newest run directory
+scripts/sync_outputs_from_mech.sh                    # skip weights and raw geometry
+scripts/sync_outputs_from_mech.sh --include-pt       # also pull all model/checkpoint weights
+scripts/sync_outputs_from_mech.sh --best-only        # pull best.pt only
+scripts/sync_outputs_from_mech.sh --include-geometry # also pull raw geometry snapshots
+scripts/sync_outputs_from_mech.sh --include-pt --include-geometry
+scripts/sync_outputs_from_mech.sh --latest-only      # sync only the newest run directory
 ```
 
 Both text-data training entries read `HF_TOKEN` from the process environment first,

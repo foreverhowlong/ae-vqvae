@@ -13,8 +13,10 @@ Options:
   --host HOST           SSH host alias to read from. Default: mech
   --remote-dir DIR      Remote outputs directory. Default: ~/Developer/ae-vqvae/outputs
   --local-dir DIR       Local outputs directory. Default: <repo>/outputs
-  --best-only           Sync all outputs, but for *.pt model files only sync best.pt.
-  --no-models           Sync outputs without model/checkpoint weight files.
+  --include-pt          Include model/checkpoint weight files (excluded by default).
+  --include-geometry    Include raw geometry directories (excluded by default).
+  --best-only           Include best.pt only instead of all model/checkpoint files.
+  --no-models           Deprecated compatibility alias; model files are skipped by default.
   --latest-only         Sync only the most recently modified run directory under outputs.
   --dry-run             Print what would be transferred without copying files.
   --delete              Delete local files that no longer exist on the remote.
@@ -33,6 +35,8 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 remote_host="${REMOTE_HOST:-mech}"
 remote_outputs_dir="${REMOTE_OUTPUTS_DIR:-~/Developer/ae-vqvae/outputs}"
 local_outputs_dir="${LOCAL_OUTPUTS_DIR:-${repo_root}/outputs}"
+include_pt=false
+include_geometry=false
 best_only=false
 no_models=false
 latest_only=false
@@ -55,6 +59,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --best-only)
       best_only=true
+      shift
+      ;;
+    --include-pt)
+      include_pt=true
+      shift
+      ;;
+    --include-geometry)
+      include_geometry=true
       shift
       ;;
     --no-models)
@@ -85,6 +97,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "${include_pt}" == true && "${best_only}" == true ]]; then
+  echo "--include-pt and --best-only are mutually exclusive." >&2
+  exit 2
+fi
+
+if [[ "${include_pt}" == true && "${no_models}" == true ]]; then
+  echo "--include-pt and --no-models are mutually exclusive." >&2
+  exit 2
+fi
+
+if [[ "${best_only}" == true && "${no_models}" == true ]]; then
+  echo "--best-only and --no-models are mutually exclusive." >&2
+  exit 2
+fi
+
 if ! command -v rsync >/dev/null 2>&1; then
   echo "rsync is required but was not found in PATH." >&2
   exit 1
@@ -103,7 +130,11 @@ rsync_args=(
   --progress
 )
 
-if [[ "${no_models}" == true ]]; then
+if [[ "${include_geometry}" == false ]]; then
+  rsync_args+=(--exclude='geometry/')
+fi
+
+if [[ "${include_pt}" == false && "${best_only}" == false ]]; then
   rsync_args+=(
     --exclude='*.pt'
     --exclude='*.pth'
@@ -115,6 +146,9 @@ elif [[ "${best_only}" == true ]]; then
     --include='*/'
     --include='best.pt'
     --exclude='*.pt'
+    --exclude='*.pth'
+    --exclude='*.ckpt'
+    --exclude='*.safetensors'
     --include='*'
   )
 fi

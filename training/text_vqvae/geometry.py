@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+import shutil
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -88,6 +89,45 @@ def geometry_snapshot_due(step: int, *, dense_every: int, dense_until: int, spar
     if step <= dense_until:
         return step % dense_every == 0
     return step % sparse_every == 0
+
+
+def finalize_geometry_artifacts(
+    run_dir: Path,
+    *,
+    enabled: bool,
+    basis: str,
+    fps: int,
+    keep_snapshots: bool,
+) -> dict[str, object]:
+    """Render compact final artifacts and optionally remove raw snapshots.
+
+    Snapshot deletion happens only after every renderer output exists, so a
+    failed post-processing attempt remains recoverable.
+    """
+    if not enabled:
+        return {"status": "disabled", "snapshots_retained": True}
+
+    from visualization.render_geometry_animation import render_run
+
+    run_dir = Path(run_dir)
+    outputs = render_run(run_dir, basis=basis, fps=fps)
+    missing = [str(path) for path in outputs.values() if not Path(path).is_file()]
+    if missing:
+        raise RuntimeError(f"Geometry renderer did not create expected outputs: {missing}")
+
+    if not keep_snapshots:
+        shutil.rmtree(run_dir / "geometry")
+
+    return {
+        "status": "completed",
+        "basis": basis,
+        "fps": fps,
+        "snapshots_retained": keep_snapshots,
+        "artifacts": {
+            name: str(Path(path).relative_to(run_dir))
+            for name, path in outputs.items()
+        },
+    }
 
 
 @torch.no_grad()

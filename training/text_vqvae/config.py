@@ -5,7 +5,8 @@ Flag discipline
 * True defaults live only in the dataclass fields below.  argparse uses
   ``default=None`` everywhere so that "flag not passed" is distinguishable
   from "flag passed with the default value."  ``build_configs()`` merges
-  non-None overrides on top of the dataclass defaults.
+  non-None overrides on top of the dataclass defaults. CLI help annotates its
+  actions from those same dataclass instances instead of copying defaults.
 
 * Bug-fix / metric-validity changes → make default, delete old code path,
   record in CHANGELOG with git tag.
@@ -19,6 +20,7 @@ Flag discipline
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import subprocess
@@ -84,11 +86,64 @@ class DiagnosticsConfig:
     geometry_dense_until: int = 1500
     geometry_sparse_every: int = 500
     geometry_probe_points: int = 4096
+    geometry_render_enabled: bool = True
+    geometry_render_basis: str = "first_last"
+    geometry_render_fps: int = 8
+    geometry_keep_snapshots: bool = True
 
 
-def _default(cls, field_name: str):
-    """Read a CLI help default from its owning dataclass."""
-    return getattr(cls(), field_name)
+class ConfigDefaultsHelpFormatter(argparse.HelpFormatter):
+    """Show effective dataclass defaults while argparse still stores ``None``."""
+
+    def _get_help_string(self, action):
+        help_text = action.help or ""
+        if hasattr(action, "effective_default"):
+            default = _format_help_default(action.effective_default)
+            separator = " " if help_text else ""
+            return f"{help_text}{separator}[default: {default}]"
+        return help_text
+
+
+def _format_help_default(value: Any) -> str:
+    if value is None:
+        return "<unset>"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value == "":
+        return '""'
+    return str(value)
+
+
+def _annotate_effective_defaults(parser) -> None:
+    """Attach display-only defaults sourced from the configuration dataclasses."""
+    defaults: dict[str, Any] = {}
+    for config in (
+        TrainConfig(),
+        DataConfig(),
+        TextVQVAEConfig(),
+        CollapseControlConfig(),
+        DiagnosticsConfig(),
+    ):
+        for field in dataclasses.fields(config):
+            value = getattr(config, field.name)
+            if field.name in defaults and defaults[field.name] != value:
+                raise ValueError(f"Ambiguous CLI default for field {field.name!r}.")
+            defaults[field.name] = value
+
+    diagnostics = DiagnosticsConfig()
+    defaults.update({
+        "collapse_preset": None,
+        "skip_initial_pca": not diagnostics.initial_pca_enabled,
+        "strict_initial_pca": diagnostics.initial_pca_strict,
+        "print_config": False,
+    })
+    for action in parser._actions:
+        if action.dest in defaults:
+            action.effective_default = defaults[action.dest]
+            if action.help is None:
+                action.help = f"{action.dest.replace('_', ' ').capitalize()}."
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +152,13 @@ def _default(cls, field_name: str):
 
 def add_arguments(parser) -> None:
     """Add all CLI flags to *parser* with default=None (real defaults in dataclasses)."""
+    parser.formatter_class = ConfigDefaultsHelpFormatter
+    parser.add_argument(
+        "--print-config",
+        action="store_true",
+        default=None,
+        help="Print the resolved configuration as JSON to stdout and exit.",
+    )
     # ---- training ----
     g = parser.add_argument_group("training")
     g.add_argument("--run-name", default=None, help="Output run name. Defaults to timestamp.")
@@ -112,32 +174,30 @@ def add_arguments(parser) -> None:
     g.add_argument("--num-workers", type=int, default=None)
     g.add_argument(
         "--tokenizer", choices=["bpe", "byte"], default=None,
-        help=f"Tokenizer to use (default: {_default(TrainConfig, 'tokenizer')}).",
+        help="Tokenizer to use.",
     )
     g.add_argument(
         "--tokenizer-path", default=None,
-        help=("Saved tokenizer.json for --tokenizer bpe "
-              f"(default: {_default(TrainConfig, 'tokenizer_path')})."),
+        help="Saved tokenizer.json for --tokenizer bpe.",
     )
     g.add_argument(
         "--codebook-init", choices=["random", "kmeans"], default=None,
-        help=("Codebook initialisation strategy "
-              f"(default: {_default(TrainConfig, 'codebook_init')})."),
+        help="Codebook initialisation strategy.",
     )
 
     # ---- data ----
     g = parser.add_argument_group("data")
     g.add_argument(
         "--dataset", default=None,
-        help=f"Hugging Face dataset name (default: {_default(DataConfig, 'dataset')}).",
+        help="Hugging Face dataset name.",
     )
     g.add_argument("--dataset-config", default=None, help="Optional Hugging Face dataset config.")
-    g.add_argument("--split", default=None, help=f"Dataset split (default: {_default(DataConfig, 'split')}).")
-    g.add_argument("--text-field", default=None, help=f"Dataset/JSONL text field (default: {_default(DataConfig, 'text_field')}).")
+    g.add_argument("--split", default=None, help="Dataset split.")
+    g.add_argument("--text-field", default=None, help="Dataset/JSONL text field.")
     g.add_argument("--data-file", default=None, help="Optional local .txt or .jsonl file.")
     g.add_argument(
         "--cache-dir", default=None,
-        help=f"Hugging Face dataset cache (default: {_default(DataConfig, 'cache_dir')}).",
+        help="Hugging Face dataset cache.",
     )
     g.add_argument("--streaming", action="store_true", default=None)
     g.add_argument("--max-train-samples", type=int, default=None)
@@ -155,7 +215,7 @@ def add_arguments(parser) -> None:
     g.add_argument("--decoder-layers", type=int, default=None)
     g.add_argument(
         "--decoder-type", choices=["cross_attention", "memory_trunk"], default=None,
-        help=f"Decoder backbone (default: {_default(TextVQVAEConfig, 'decoder_type')}).",
+        help="Decoder backbone.",
     )
     g.add_argument("--memory-decoder-latent-layers", type=int, default=None)
     g.add_argument("--memory-decoder-output-layers", type=int, default=None)
@@ -193,13 +253,11 @@ def add_arguments(parser) -> None:
     g = parser.add_argument_group("diagnostics")
     g.add_argument(
         "--initial-pca-max-points", type=int, default=None,
-        help=("Maximum encoder latent vectors in the initialisation PCA plot "
-              f"(default: {_default(DiagnosticsConfig, 'initial_pca_max_points')})."),
+        help="Maximum encoder latent vectors in the initialisation PCA plot.",
     )
     g.add_argument(
         "--initial-pca-fit-mode", choices=["balanced", "all"], default=None,
-        help=("Fit PCA with equal group sizes or all collected vectors "
-              f"(default: {_default(DiagnosticsConfig, 'initial_pca_fit_mode')})."),
+        help="Fit PCA with equal group sizes or all collected vectors.",
     )
     g.add_argument(
         "--skip-initial-pca", action="store_true", default=None,
@@ -211,13 +269,26 @@ def add_arguments(parser) -> None:
     )
     g.add_argument(
         "--geometry-snapshot-enabled", type=_parse_bool, default=None,
-        help=("Enable periodic raw geometry snapshots (true/false; default: "
-              f"{_default(DiagnosticsConfig, 'geometry_snapshot_enabled')})."),
+        help="Enable periodic raw geometry snapshots (true/false).",
     )
     g.add_argument("--geometry-dense-every", type=int, default=None)
     g.add_argument("--geometry-dense-until", type=int, default=None)
     g.add_argument("--geometry-sparse-every", type=int, default=None)
     g.add_argument("--geometry-probe-points", type=int, default=None)
+    g.add_argument(
+        "--geometry-render-enabled", type=_parse_bool, default=None,
+        help="Render geometry plots and animation when training completes (true/false).",
+    )
+    g.add_argument(
+        "--geometry-render-basis", choices=["t0", "first_last", "pooled"], default=None,
+        help="PCA basis used by every animation frame.",
+    )
+    g.add_argument("--geometry-render-fps", type=int, default=None)
+    g.add_argument(
+        "--geometry-keep-snapshots", type=_parse_bool, default=None,
+        help="Keep raw geometry NPZ snapshots after a successful render (true/false).",
+    )
+    _annotate_effective_defaults(parser)
 
 
 def _override(obj, attrs: dict[str, Any]) -> None:
@@ -273,11 +344,21 @@ def build_diagnostics_config(args) -> DiagnosticsConfig:
         "geometry_dense_until": getattr(args, "geometry_dense_until", None),
         "geometry_sparse_every": getattr(args, "geometry_sparse_every", None),
         "geometry_probe_points": getattr(args, "geometry_probe_points", None),
+        "geometry_render_enabled": getattr(args, "geometry_render_enabled", None),
+        "geometry_render_basis": getattr(args, "geometry_render_basis", None),
+        "geometry_render_fps": getattr(args, "geometry_render_fps", None),
+        "geometry_keep_snapshots": getattr(args, "geometry_keep_snapshots", None),
     })
     if config.geometry_dense_every < 1 or config.geometry_sparse_every < 1:
         raise ValueError("Geometry snapshot intervals must be positive.")
     if config.geometry_dense_until < 0 or config.geometry_probe_points < 1:
         raise ValueError("Geometry dense-until must be non-negative and probe-points positive.")
+    if config.geometry_render_fps < 1:
+        raise ValueError("Geometry render FPS must be positive.")
+    if not config.geometry_snapshot_enabled:
+        if getattr(args, "geometry_render_enabled", None):
+            raise ValueError("Geometry rendering requires geometry snapshots.")
+        config.geometry_render_enabled = False
     return config
 
 
@@ -448,6 +529,11 @@ def build_config_payload(
                 "dense_until": geometry_config.geometry_dense_until,
                 "sparse_every": geometry_config.geometry_sparse_every,
                 "probe_points": geometry_config.geometry_probe_points,
+                "render_enabled": geometry_config.geometry_render_enabled,
+                "render_basis": geometry_config.geometry_render_basis,
+                "render_fps": geometry_config.geometry_render_fps,
+                "keep_snapshots": geometry_config.geometry_keep_snapshots,
+                "render_status": "pending" if geometry_config.geometry_render_enabled else "disabled",
             },
         },
     }

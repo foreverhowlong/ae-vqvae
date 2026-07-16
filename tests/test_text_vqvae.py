@@ -26,12 +26,17 @@ from models.text_vqvae import (
 )
 from training.text_vqvae.codebook_init import initialize_codebook_kmeans
 from training.text_vqvae.loop import compute_accuracy, save_checkpoint
-from training.text_vqvae.geometry import dump_geometry_snapshot
+from training.text_vqvae.geometry import dump_geometry_snapshot, finalize_geometry_artifacts
 from visualization.text_vqvae import (
     collect_encoder_vectors,
     compare_vector_distributions_pca,
     render_pca_comparison,
     save_pca_metadata,
+)
+from visualization.render_geometry_animation import (
+    compute_animation_scales,
+    fit_shared_pca,
+    render_frame,
 )
 
 
@@ -93,6 +98,120 @@ class GeometrySnapshotTest(unittest.TestCase):
         self.assertLessEqual(metrics["used_codes"], 8)
         self.assertIn("participation_ratio", metrics)
         self.assertIn("win_count_gini", metrics)
+
+    def test_successful_finalization_removes_raw_snapshots(self):
+        with TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            geometry_dir = run_dir / "geometry"
+            geometry_dir.mkdir()
+            (geometry_dir / "step000000.npz").write_bytes(b"raw snapshot")
+
+            def fake_render(received_run_dir, basis, fps):
+                self.assertEqual(received_run_dir, run_dir)
+                self.assertEqual(basis, "first_last")
+                self.assertEqual(fps, 8)
+                plots_dir = run_dir / "plots"
+                plots_dir.mkdir()
+                outputs = {
+                    "animation": plots_dir / "geometry_animation.mp4",
+                    "trajectories": plots_dir / "geometry_code_trajectories.png",
+                    "metrics": plots_dir / "geometry_metrics.png",
+                }
+                for path in outputs.values():
+                    path.write_bytes(b"artifact")
+                return outputs
+
+            with patch(
+                "visualization.render_geometry_animation.render_run",
+                side_effect=fake_render,
+            ):
+                result = finalize_geometry_artifacts(
+                    run_dir,
+                    enabled=True,
+                    basis="first_last",
+                    fps=8,
+                    keep_snapshots=False,
+                )
+
+            self.assertEqual(result["status"], "completed")
+            self.assertFalse(result["snapshots_retained"])
+            self.assertFalse(geometry_dir.exists())
+            self.assertEqual(
+                result["artifacts"]["animation"],
+                "plots/geometry_animation.mp4",
+            )
+
+    def test_failed_finalization_preserves_raw_snapshots(self):
+        with TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            geometry_dir = run_dir / "geometry"
+            geometry_dir.mkdir()
+            snapshot = geometry_dir / "step000000.npz"
+            snapshot.write_bytes(b"raw snapshot")
+
+            with patch(
+                "visualization.render_geometry_animation.render_run",
+                side_effect=RuntimeError("render failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "render failed"):
+                    finalize_geometry_artifacts(
+                        run_dir,
+                        enabled=True,
+                        basis="first_last",
+                        fps=8,
+                        keep_snapshots=False,
+                    )
+
+            self.assertTrue(snapshot.exists())
+
+
+class GeometryAnimationTest(unittest.TestCase):
+    def test_frames_use_global_scales_without_pad_coloring(self):
+        with TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            geometry_dir = run_dir / "geometry"
+            geometry_dir.mkdir()
+            snapshots = []
+            payloads = [
+                (
+                    np.array([[0.0, 0.0], [1.0, 0.5], [2.0, 1.0]], dtype=np.float32),
+                    np.array([[0.0, 0.0], [2.0, 1.0], [4.0, 2.0], [6.0, 3.0]], dtype=np.float32),
+                    np.array([0, 1, 1], dtype=np.int32),
+                ),
+                (
+                    np.array([[8.0, 4.0], [10.0, 5.0], [12.0, 6.0]], dtype=np.float32),
+                    np.array([[1.0, 0.0], [5.0, 2.0], [9.0, 4.0], [13.0, 6.0]], dtype=np.float32),
+                    np.array([2, 2, 3], dtype=np.int32),
+                ),
+            ]
+            for step, (encoder, codebook, assignments) in enumerate(payloads):
+                path = geometry_dir / f"step{step:06d}.npz"
+                # Deliberately omit pad_ratios: animation color must not depend on it.
+                np.savez_compressed(
+                    path,
+                    z_e=encoder,
+                    codebook=codebook,
+                    assignments=assignments,
+                )
+                snapshots.append((step, path))
+
+            pca = fit_shared_pca(snapshots, "first_last")
+            scales = compute_animation_scales(snapshots, pca)
+            self.assertEqual(scales.rank_xlim, (1.0, 4.0))
+            self.assertGreaterEqual(scales.norm_bins[-1], np.linalg.norm(payloads[-1][1], axis=1).max())
+            per_frame_nearest_max = max(
+                np.histogram(
+                    np.linalg.norm(encoder - codebook[assignments], axis=1),
+                    bins=scales.nearest_bins,
+                )[0].max()
+                for encoder, codebook, assignments in payloads
+            )
+            self.assertAlmostEqual(scales.nearest_ylim[1], per_frame_nearest_max * 1.08)
+
+            for step, path in snapshots:
+                output = run_dir / f"frame{step}.png"
+                render_frame(step, path, pca, output, scales)
+                self.assertTrue(output.is_file())
 
 
 class CheckpointRetentionTest(unittest.TestCase):
@@ -524,18 +643,73 @@ class TextVQVAECodebookInitializationTest(unittest.TestCase):
 class ConfigDefaultsTest(unittest.TestCase):
     """Ensure CLI defaults and dataclass defaults are in sync (no double-source drift)."""
 
-    def _parse(self, *argv):
+    def _parser(self):
         import argparse
         from training.text_vqvae.config import add_arguments
         parser = argparse.ArgumentParser()
         add_arguments(parser)
-        return parser.parse_args(list(argv))
+        return parser
+
+    def _parse(self, *argv):
+        return self._parser().parse_args(list(argv))
 
     def test_empty_cli_gives_none_for_all_overrideable_flags(self):
         """With no flags, all overrideable args should be None so dataclass defaults win."""
         args = self._parse()
         for attr, value in vars(args).items():
             self.assertIsNone(value, msg=f"--{attr} should default to None")
+
+    def test_help_shows_dataclass_defaults_for_every_config_flag(self):
+        parser = self._parser()
+        for action in parser._actions:
+            if action.dest != "help":
+                self.assertTrue(
+                    hasattr(action, "effective_default"),
+                    msg=f"{action.option_strings} has no displayed effective default",
+                )
+        help_text = parser.format_help()
+        self.assertIn("--batch-size BATCH_SIZE", help_text)
+        self.assertIn("Batch size. [default: 32]", help_text)
+        self.assertIn("Latent slots. [default: 128]", help_text)
+        self.assertIn("Commitment beta start. [default: <unset>]", help_text)
+        self.assertIn("Geometry render fps. [default: 8]", help_text)
+
+    def test_print_config_writes_resolved_json_to_stdout_without_creating_a_run(self):
+        import json
+        import subprocess
+        import sys
+        import uuid
+
+        repo_root = Path(__file__).resolve().parents[1]
+        run_name = f"print_config_test_{uuid.uuid4().hex}"
+        run_dir = repo_root / "outputs" / "text_vqvae" / run_name
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "training.run_text_vqvae_experiment",
+                "--print-config",
+                "--tokenizer",
+                "byte",
+                "--batch-size",
+                "17",
+                "--collapse-preset",
+                "anti",
+                "--run-name",
+                run_name,
+            ],
+            cwd=repo_root,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(payload["train"]["batch_size"], 17)
+        self.assertEqual(payload["train"]["run_name"], run_name)
+        self.assertTrue(payload["collapse_control"]["use_ema_codebook"])
+        self.assertEqual(payload["model"]["vocab_size"], 258)
+        self.assertFalse(run_dir.exists())
 
     def test_dataclass_defaults_match_current_mainline(self):
         """Dataclass defaults describe the configuration recommended for new runs."""
@@ -562,6 +736,10 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(diagnostics.geometry_dense_until, 1500)
         self.assertEqual(diagnostics.geometry_sparse_every, 500)
         self.assertEqual(diagnostics.geometry_probe_points, 4096)
+        self.assertTrue(diagnostics.geometry_render_enabled)
+        self.assertEqual(diagnostics.geometry_render_basis, "first_last")
+        self.assertEqual(diagnostics.geometry_render_fps, 8)
+        self.assertTrue(diagnostics.geometry_keep_snapshots)
 
     def test_geometry_snapshot_can_be_disabled_explicitly(self):
         from training.text_vqvae.config import build_diagnostics_config
@@ -570,6 +748,15 @@ class ConfigDefaultsTest(unittest.TestCase):
             self._parse("--geometry-snapshot-enabled", "false")
         )
         self.assertFalse(diagnostics.geometry_snapshot_enabled)
+        self.assertFalse(diagnostics.geometry_render_enabled)
+
+    def test_geometry_snapshots_can_be_retained_after_rendering(self):
+        from training.text_vqvae.config import build_diagnostics_config
+
+        diagnostics = build_diagnostics_config(
+            self._parse("--geometry-keep-snapshots", "true")
+        )
+        self.assertTrue(diagnostics.geometry_keep_snapshots)
 
     def test_empty_cli_builds_each_dataclass_from_its_defaults(self):
         from training.text_vqvae.config import (

@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-07-16 — Automatic geometry rendering
+
+* Geometry snapshots are rendered automatically after successful training with
+  one shared PCA basis, producing an MP4, code trajectories, and metric plots.
+* Raw geometry NPZ files are retained after rendering; only intermediate frame
+  PNGs are removed after all final artifacts exist.
+* Added explicit Pillow and bundled FFmpeg runtime dependencies for reproducible
+  headless rendering through uv.
+* Replaced PAD-ratio coloring with fixed, high-contrast encoder/dead/winner
+  styling and locked every animation panel's axes, bins, legends, and layout
+  across all frames.
+* Output sync now excludes model weights and raw geometry by default, with
+  independent `--include-pt` and `--include-geometry` opt-ins.
+* Training CLI help now derives every displayed default from the configuration
+  dataclasses, and `--print-config` writes resolved JSON to stdout without
+  creating a run or loading training data.
+
 ## 2026-07-12 — Text-VQVAE mask and inference contract
 
 * Added the persisted `slot_pad_ratio_threshold` model setting (default 0.5)

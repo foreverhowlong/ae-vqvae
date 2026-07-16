@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
+from dataclasses import asdict
 
 import torch
 
@@ -19,8 +21,6 @@ from training.text_vqvae.config import (
     build_diagnostics_config,
     build_train_config,
 )
-from training.text_vqvae.loop import make_loader, run, split_dataset
-from training.text_vqvae.reporting import atomic_json_dump
 
 
 def _load_tokenizer(name: str, path: str | None):
@@ -52,22 +52,46 @@ def _make_run_dir(run_name: str | None):
     return run_dir, run_name
 
 
+def _resolved_config_dict(train_cfg, data_cfg, model_cfg, collapse_cfg, diagnostics_cfg):
+    """Return the same resolved configuration objects consumed by training."""
+    return {
+        "train": asdict(train_cfg),
+        "data": asdict(data_cfg),
+        "model": model_cfg.to_dict(),
+        "collapse_control": collapse_cfg.to_dict(),
+        "diagnostics": asdict(diagnostics_cfg),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Text VQ-VAE experiment")
     add_arguments(parser)
     args = parser.parse_args()
 
     train_cfg, tokenizer, tokenizer_path = _resolve_tokenizer(args)
-    run_dir, run_name = _make_run_dir(train_cfg.run_name or None)
-    device = get_device()
-    enable_tf32(device)
-
     train_cfg, data_cfg, model_cfg, collapse_cfg = build_configs(
         args, tokenizer, train_cfg=train_cfg
     )
     diagnostics_cfg = build_diagnostics_config(args)
-    train_cfg.run_name = run_name
     train_cfg.tokenizer_path = tokenizer_path
+
+    if args.print_config:
+        print(json.dumps(
+            _resolved_config_dict(
+                train_cfg, data_cfg, model_cfg, collapse_cfg, diagnostics_cfg
+            ),
+            indent=2,
+            ensure_ascii=False,
+        ))
+        return
+
+    from training.text_vqvae.loop import make_loader, run, split_dataset
+    from training.text_vqvae.reporting import atomic_json_dump
+
+    run_dir, run_name = _make_run_dir(train_cfg.run_name or None)
+    device = get_device()
+    enable_tf32(device)
+    train_cfg.run_name = run_name
 
     torch.manual_seed(train_cfg.seed)
     if device.type == "cuda":
@@ -170,6 +194,10 @@ def main():
                 "sparse_every": diagnostics_cfg.geometry_sparse_every,
                 "probe_points": diagnostics_cfg.geometry_probe_points,
                 "strict": diagnostics_cfg.initial_pca_strict,
+                "render_enabled": diagnostics_cfg.geometry_render_enabled,
+                "render_basis": diagnostics_cfg.geometry_render_basis,
+                "render_fps": diagnostics_cfg.geometry_render_fps,
+                "keep_snapshots": diagnostics_cfg.geometry_keep_snapshots,
             },
         )
 
