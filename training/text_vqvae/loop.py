@@ -14,9 +14,11 @@ from models.text_vqvae import TextVQVAEConfig, CollapseControlConfig, codebook_s
 from training.text_vqvae.config import TrainConfig, DataConfig
 from training.text_vqvae.reporting import (
     append_jsonl,
+    build_reconstruction_rows,
     plot_codebook_usage,
     plot_training_curves,
     run_initial_pca,
+    write_reconstruction_rows,
     write_reconstruction_samples,
 )
 from training.text_vqvae.geometry import (
@@ -31,7 +33,15 @@ from training.text_vqvae.geometry import (
 # Data helpers
 # ---------------------------------------------------------------------------
 
-def make_loader(dataset, batch_size: int, shuffle: bool, device, num_workers: int) -> DataLoader:
+def make_loader(
+    dataset,
+    batch_size: int,
+    shuffle: bool,
+    device,
+    num_workers: int,
+    *,
+    persistent_workers: bool = False,
+) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -39,6 +49,7 @@ def make_loader(dataset, batch_size: int, shuffle: bool, device, num_workers: in
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
         drop_last=shuffle,
+        persistent_workers=persistent_workers and num_workers > 0,
     )
 
 
@@ -191,8 +202,18 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
 
 
 @torch.no_grad()
-def evaluate(model, data_loader, device, model_config, collapse_config, beta: float):
-    model.eval()
+def evaluate(
+    model,
+    data_loader,
+    device,
+    model_config,
+    collapse_config,
+    beta: float,
+    *,
+    tokenizer=None,
+    max_reconstruction_items: int = 16,
+):
+    was_training = model.training
     total_loss = 0.0
     total_recon = 0.0
     total_codebook = 0.0
@@ -204,45 +225,61 @@ def evaluate(model, data_loader, device, model_config, collapse_config, beta: fl
     total_tokens = 0
     all_indices: list[torch.Tensor] = []
     all_latent_masks: list[torch.Tensor] = []
+    reconstruction_rows: list[dict[str, str]] = []
     batches = 0
 
-    for batch in data_loader:
-        batch = batch_to_device(batch, device)
-        outputs = model(batch["input_ids"], batch["attention_mask"])
-        losses = text_vqvae_losses(
-            outputs,
-            batch["input_ids"],
-            pad_token_id=model_config.pad_token_id,
-            beta=beta,
-            attention_mask=batch["attention_mask"],
-            collapse_config=collapse_config,
-            codebook_weight=model.quantizer.codebook.weight,
-        )
-        correct, tokens = compute_accuracy(
-            outputs["logits"],
-            batch["input_ids"],
-            model_config.pad_token_id,
-            attention_mask=batch["attention_mask"],
-        )
+    try:
+        model.eval()
+        for batch in data_loader:
+            batch = batch_to_device(batch, device)
+            outputs = model(batch["input_ids"], batch["attention_mask"])
+            losses = text_vqvae_losses(
+                outputs,
+                batch["input_ids"],
+                pad_token_id=model_config.pad_token_id,
+                beta=beta,
+                attention_mask=batch["attention_mask"],
+                collapse_config=collapse_config,
+                codebook_weight=model.quantizer.codebook.weight,
+            )
+            correct, tokens = compute_accuracy(
+                outputs["logits"],
+                batch["input_ids"],
+                model_config.pad_token_id,
+                attention_mask=batch["attention_mask"],
+            )
 
-        total_loss += losses["total"].item()
-        total_recon += losses["recon"].item()
-        total_codebook += losses["codebook"].item()
-        total_commit += losses["commitment"].item()
-        total_entropy += losses["entropy"].item()
-        total_assignment_entropy += losses["normalized_assignment_entropy"].item()
-        total_diversity += losses["diversity"].item()
-        total_correct += correct
-        total_tokens += tokens
-        all_indices.append(outputs["indices"].detach().cpu())
-        all_latent_masks.append(outputs["latent_mask"].detach().cpu())
-        batches += 1
+            total_loss += losses["total"].item()
+            total_recon += losses["recon"].item()
+            total_codebook += losses["codebook"].item()
+            total_commit += losses["commitment"].item()
+            total_entropy += losses["entropy"].item()
+            total_assignment_entropy += losses["normalized_assignment_entropy"].item()
+            total_diversity += losses["diversity"].item()
+            total_correct += correct
+            total_tokens += tokens
+            all_indices.append(outputs["indices"].detach().cpu())
+            all_latent_masks.append(outputs["latent_mask"].detach().cpu())
+            batches += 1
+
+            remaining = max_reconstruction_items - len(reconstruction_rows)
+            if tokenizer is not None and remaining > 0:
+                pred_ids = outputs["logits"].argmax(dim=-1).detach().cpu()
+                reconstruction_rows.extend(build_reconstruction_rows(
+                    batch["input_ids"],
+                    pred_ids,
+                    outputs["lengths"],
+                    tokenizer,
+                    max_items=remaining,
+                ))
+    finally:
+        model.train(was_training)
 
     merged_indices = torch.cat(all_indices, dim=0)
     merged_latent_masks = torch.cat(all_latent_masks, dim=0)
     stats = codebook_stats(merged_indices, model_config.codebook_size, valid_mask=merged_latent_masks)
     avg_recon = total_recon / max(batches, 1)
-    return {
+    metrics = {
         "loss": total_loss / max(batches, 1),
         "recon_nll": avg_recon,
         "token_ppl": math.exp(min(avg_recon, 20.0)),
@@ -264,6 +301,7 @@ def evaluate(model, data_loader, device, model_config, collapse_config, beta: fl
         "dead_codes": stats["dead_codes"],
         "code_counts": stats["counts"].tolist(),
     }
+    return metrics, reconstruction_rows
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +435,15 @@ def run(
                     take_geometry_snapshot(global_step)
 
                 if global_step == 1 or global_step % train_cfg.eval_every == 0:
-                    last_eval = evaluate(model, val_loader, device, model_config, collapse_config, beta)
+                    last_eval, reconstruction_rows = evaluate(
+                        model,
+                        val_loader,
+                        device,
+                        model_config,
+                        collapse_config,
+                        beta,
+                        tokenizer=tokenizer,
+                    )
                     append_jsonl(
                         {"split": "eval", "epoch": epoch, "step": global_step,
                          "elapsed_sec": time.time() - start_time,
@@ -408,8 +454,8 @@ def run(
                         {f"eval/{k}": v for k, v in last_eval.items() if k != "code_counts"},
                         step=global_step,
                     )
-                    write_reconstruction_samples(
-                        model, val_loader, device, model_config, tokenizer,
+                    write_reconstruction_rows(
+                        reconstruction_rows,
                         run_dir / "samples" / f"recon_step{global_step}.jsonl",
                     )
                     if last_eval["loss"] < best_eval_loss:
@@ -427,7 +473,9 @@ def run(
 
         if last_eval is None:
             beta = scheduled_commitment_beta(model_config, collapse_config, global_step)
-            last_eval = evaluate(model, val_loader, device, model_config, collapse_config, beta)
+            last_eval, _ = evaluate(
+                model, val_loader, device, model_config, collapse_config, beta
+            )
 
         save_checkpoint(model, optimizer, global_step, train_cfg.epochs, run_dir, "last.pt")
         if probe_batches is not None and not geometry_snapshot_due(

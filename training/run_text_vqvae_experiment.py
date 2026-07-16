@@ -115,8 +115,21 @@ def main():
         seed=train_cfg.seed,
         max_eval_samples=data_cfg.max_eval_samples,
     )
-    train_loader = make_loader(train_dataset, train_cfg.batch_size, shuffle=True, device=device, num_workers=train_cfg.num_workers)
-    val_loader = make_loader(val_dataset, train_cfg.batch_size, shuffle=False, device=device, num_workers=train_cfg.num_workers)
+    train_loader = make_loader(
+        train_dataset,
+        train_cfg.batch_size,
+        shuffle=True,
+        device=device,
+        num_workers=train_cfg.num_workers,
+    )
+    val_loader = make_loader(
+        val_dataset,
+        train_cfg.batch_size,
+        shuffle=False,
+        device=device,
+        num_workers=train_cfg.num_workers,
+        persistent_workers=True,
+    )
 
     model = TextVQVAE(model_cfg, collapse_config=collapse_cfg).to(device)
 

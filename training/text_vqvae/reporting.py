@@ -39,26 +39,60 @@ def append_jsonl(row, path: Path) -> None:
 # Sample writing
 # ---------------------------------------------------------------------------
 
+def build_reconstruction_rows(
+    input_ids: torch.Tensor,
+    pred_ids,
+    lengths: torch.Tensor,
+    tokenizer,
+    *,
+    max_items: int,
+) -> list[dict[str, str]]:
+    """Decode already-computed predictions without another model forward."""
+    rows = []
+    for original, reconstructed, length in zip(
+        input_ids.detach().cpu(), pred_ids, lengths.detach().cpu()
+    ):
+        defined_length = int(length.item())
+        rows.append({
+            "original": tokenizer.decode(original[:defined_length].tolist()),
+            "reconstruction": tokenizer.decode(
+                reconstructed[:defined_length].tolist()
+            ),
+        })
+        if len(rows) >= max_items:
+            break
+    return rows
+
+
+def write_reconstruction_rows(rows: list[dict[str, str]], path: Path) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 @torch.no_grad()
 def write_reconstruction_samples(model, data_loader, device, model_config, tokenizer, path: Path, max_items: int = 16) -> None:
-    model.eval()
-    written = 0
-    with path.open("w", encoding="utf-8") as handle:
+    was_training = model.training
+    rows = []
+    try:
+        model.eval()
         for batch in data_loader:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             outputs = model.infer(input_ids, attention_mask)
             pred_ids = [logits.argmax(dim=-1).cpu() for logits in outputs["logits"]]
-            lengths = outputs["lengths"].cpu()
-            for original, reconstructed, length in zip(input_ids.cpu(), pred_ids, lengths):
-                row = {
-                    "original": tokenizer.decode(original[: int(length.item())].tolist()),
-                    "reconstruction": tokenizer.decode(reconstructed.tolist()),
-                }
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-                written += 1
-                if written >= max_items:
-                    return
+            rows.extend(build_reconstruction_rows(
+                input_ids,
+                pred_ids,
+                outputs["lengths"],
+                tokenizer,
+                max_items=max_items - len(rows),
+            ))
+            if len(rows) >= max_items:
+                break
+    finally:
+        model.train(was_training)
+    write_reconstruction_rows(rows, path)
 
 
 # ---------------------------------------------------------------------------

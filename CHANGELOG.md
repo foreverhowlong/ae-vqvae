@@ -16,6 +16,9 @@
 * Training CLI help now derives every displayed default from the configuration
   dataclasses, and `--print-config` writes resolved JSON to stdout without
   creating a run or loading training data.
+* Evaluation now collects reconstruction samples during its existing validation
+  pass, keeps validation workers alive between evaluations, and restores the
+  model's prior train/eval mode so EMA and dropout continue correctly afterward.
 
 ## 2026-07-12 — Text-VQVAE mask and inference contract
 

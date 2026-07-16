@@ -25,7 +25,13 @@ from models.text_vqvae import (
     text_vqvae_losses,
 )
 from training.text_vqvae.codebook_init import initialize_codebook_kmeans
-from training.text_vqvae.loop import compute_accuracy, compute_bits_per_token, save_checkpoint
+from training.text_vqvae.loop import (
+    compute_accuracy,
+    compute_bits_per_token,
+    evaluate,
+    make_loader,
+    save_checkpoint,
+)
 from training.text_vqvae.geometry import dump_geometry_snapshot, finalize_geometry_artifacts
 from visualization.text_vqvae import (
     collect_encoder_vectors,
@@ -58,6 +64,80 @@ def small_config(**overrides):
     }
     values.update(overrides)
     return TextVQVAEConfig(**values)
+
+
+class EvaluationPipelineTest(unittest.TestCase):
+    def test_evaluate_collects_reconstructions_in_one_pass_and_restores_mode(self):
+        config = small_config()
+        collapse_config = CollapseControlConfig()
+        model = TextVQVAE(config, collapse_config=collapse_config)
+        model.train()
+        batches = [{
+            "input_ids": torch.tensor([
+                [1, 2, 3, 4, 5, 6, 31, 31, 31, 31, 31, 31],
+                [7, 8, 9, 10, 11, 12, 13, 14, 31, 31, 31, 31],
+            ]),
+            "attention_mask": torch.tensor([
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+            ]),
+        }]
+
+        class CountingLoader:
+            iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return iter(batches)
+
+        loader = CountingLoader()
+        tokenizer = SimpleNamespace(
+            decode=lambda ids: " ".join(str(token_id) for token_id in ids)
+        )
+
+        metrics, rows = evaluate(
+            model,
+            loader,
+            torch.device("cpu"),
+            config,
+            collapse_config,
+            beta=config.commitment_beta,
+            tokenizer=tokenizer,
+        )
+
+        self.assertEqual(loader.iterations, 1)
+        self.assertTrue(model.training)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["original"], "1 2 3 4 5 6")
+        self.assertEqual(len(rows[0]["reconstruction"].split()), 6)
+        self.assertIn("loss", metrics)
+        self.assertEqual(len(metrics["code_counts"]), config.codebook_size)
+
+    def test_persistent_workers_are_opt_in_and_require_workers(self):
+        device = torch.device("cpu")
+        train_loader = make_loader(
+            [0, 1], 1, shuffle=True, device=device, num_workers=1
+        )
+        val_loader = make_loader(
+            [0, 1],
+            1,
+            shuffle=False,
+            device=device,
+            num_workers=1,
+            persistent_workers=True,
+        )
+        single_process_loader = make_loader(
+            [0, 1],
+            1,
+            shuffle=False,
+            device=device,
+            num_workers=0,
+            persistent_workers=True,
+        )
+
+        self.assertFalse(train_loader.persistent_workers)
+        self.assertTrue(val_loader.persistent_workers)
+        self.assertFalse(single_process_loader.persistent_workers)
 
 
 class GeometrySnapshotTest(unittest.TestCase):
