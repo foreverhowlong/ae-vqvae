@@ -25,7 +25,7 @@ from models.text_vqvae import (
     text_vqvae_losses,
 )
 from training.text_vqvae.codebook_init import initialize_codebook_kmeans
-from training.text_vqvae.loop import compute_accuracy, save_checkpoint
+from training.text_vqvae.loop import compute_accuracy, compute_bits_per_token, save_checkpoint
 from training.text_vqvae.geometry import dump_geometry_snapshot, finalize_geometry_artifacts
 from visualization.text_vqvae import (
     collect_encoder_vectors,
@@ -466,6 +466,17 @@ class TextVQVAEPaddingTest(unittest.TestCase):
         self.assertEqual((correct, total), (1, 1))
         self.assertEqual(stats["used_codes"], 1)
         self.assertEqual(stats["counts"].tolist(), [0.0, 0.0, 1.0, 0.0])
+
+    def test_bits_per_token_uses_code_entropy_and_valid_counts(self):
+        self.assertAlmostEqual(
+            compute_bits_per_token(
+                codebook_perplexity=2.0,
+                latent_count=4,
+                token_count=8,
+            ),
+            0.5,
+        )
+        self.assertEqual(compute_bits_per_token(0.0, 0, 8), 0.0)
 
     def test_reconstruction_loss_and_accuracy_prefer_attention_mask(self):
         targets = torch.tensor([[1, 3, 3]])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 
@@ -94,6 +95,18 @@ def compute_accuracy(
     return correct, total
 
 
+def compute_bits_per_token(
+    codebook_perplexity: float,
+    latent_count: int,
+    token_count: int,
+) -> float:
+    """Estimate zero-order entropy-coded latent bits per valid input token."""
+    if latent_count <= 0 or token_count <= 0:
+        return 0.0
+    entropy_bits = math.log2(max(codebook_perplexity, 1.0))
+    return latent_count * entropy_bits / token_count
+
+
 def prune_checkpoints(checkpoint_dir: Path, keep_recent: int = 2) -> None:
     """Keep best.pt plus the most recently modified regular checkpoints."""
     regular_checkpoints = sorted(
@@ -168,6 +181,11 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
         "grad_norm": float(grad_norm),
         "codebook_utilization": stats["utilization"],
         "codebook_perplexity": stats["codebook_perplexity"],
+        "bits_per_token": compute_bits_per_token(
+            stats["codebook_perplexity"],
+            int(stats["counts"].sum().item()),
+            total,
+        ),
         "dead_code_resets": reset_count,
     }
 
@@ -224,7 +242,6 @@ def evaluate(model, data_loader, device, model_config, collapse_config, beta: fl
     merged_latent_masks = torch.cat(all_latent_masks, dim=0)
     stats = codebook_stats(merged_indices, model_config.codebook_size, valid_mask=merged_latent_masks)
     avg_recon = total_recon / max(batches, 1)
-    import math
     return {
         "loss": total_loss / max(batches, 1),
         "recon_nll": avg_recon,
@@ -238,6 +255,11 @@ def evaluate(model, data_loader, device, model_config, collapse_config, beta: fl
         "token_accuracy": total_correct / max(total_tokens, 1),
         "codebook_utilization": stats["utilization"],
         "codebook_perplexity": stats["codebook_perplexity"],
+        "bits_per_token": compute_bits_per_token(
+            stats["codebook_perplexity"],
+            int(stats["counts"].sum().item()),
+            total_tokens,
+        ),
         "used_codes": stats["used_codes"],
         "dead_codes": stats["dead_codes"],
         "code_counts": stats["counts"].tolist(),

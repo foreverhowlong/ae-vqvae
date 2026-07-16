@@ -20,6 +20,9 @@ build/
 .vscode/
 .idea/
 
+# Local code index
+.codegraph/
+
 # OS
 .DS_Store
 
