@@ -15,10 +15,14 @@ from models.text_vqvae import (
     CollapseControlConfig,
     CrossAttentionTextDecoder,
     MemoryTrunkTextDecoder,
+    PlainSelfAttention,
     RotarySelfAttention,
+    RotaryTextEncoder,
     SubPixelSequenceUpsampler,
     TextVQVAE,
     TextVQVAEConfig,
+    VQGANTextDecoder,
+    VQGANTextEncoder,
     VectorQuantizer,
     codebook_stats,
     pad_aware_adaptive_pool1d,
@@ -332,8 +336,8 @@ class CheckpointRetentionTest(unittest.TestCase):
 
 
 class TextVQVAEDecoderTest(unittest.TestCase):
-    def test_both_decoders_forward_and_backward(self):
-        for decoder_type in ("cross_attention", "memory_trunk"):
+    def test_all_decoders_forward_and_backward(self):
+        for decoder_type in ("cross_attention", "memory_trunk", "vqgans"):
             with self.subTest(decoder_type=decoder_type):
                 model = TextVQVAE(small_config(decoder_type=decoder_type))
                 memory = torch.randn(2, 4, 16, requires_grad=True)
@@ -400,8 +404,19 @@ class TextVQVAEDecoderTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown decoder_type"):
             TextVQVAE(small_config(decoder_type="unknown"))
 
+    def test_vqgans_decoder_is_symmetric_and_uses_dynamic_stride(self):
+        decoder = TextVQVAE(
+            small_config(decoder_type="vqgans")
+        ).decoder_impl
+
+        self.assertIsInstance(decoder, VQGANTextDecoder)
+        self.assertEqual(decoder.compression_factor, 3)
+        self.assertEqual(decoder.transposed_conv.kernel_size, (3,))
+        self.assertEqual(decoder.transposed_conv.stride, (3,))
+        self.assertEqual(len(decoder.attention_blocks), 2)
+
     def test_decode_rejects_length_above_configured_maximum(self):
-        for decoder_type in ("cross_attention", "memory_trunk"):
+        for decoder_type in ("cross_attention", "memory_trunk", "vqgans"):
             with self.subTest(decoder_type=decoder_type):
                 model = TextVQVAE(small_config(decoder_type=decoder_type))
                 with self.assertRaisesRegex(ValueError, "seq_len"):
@@ -433,6 +448,128 @@ class TextVQVAEDecoderTest(unittest.TestCase):
             legacy_state[key] = value
 
         model.load_state_dict(legacy_state, strict=True)
+
+
+class TextVQVAEEncoderTest(unittest.TestCase):
+    def test_absolute_position_encoder_remains_default(self):
+        model = TextVQVAE(small_config())
+
+        self.assertEqual(model.config.encoder_type, "absolute")
+        self.assertIsInstance(model.encoder, nn.TransformerEncoder)
+        self.assertIsInstance(model.encoder_pos_embedding, nn.Embedding)
+
+    def test_rope_encoder_has_no_absolute_position_embedding(self):
+        model = TextVQVAE(small_config(encoder_type="rope"))
+
+        self.assertIsInstance(model.encoder, RotaryTextEncoder)
+        self.assertIsNone(model.encoder_pos_embedding)
+        self.assertTrue(
+            all(
+                isinstance(layer.attention, RotarySelfAttention)
+                for layer in model.encoder.layers
+            )
+        )
+
+    def test_all_encoders_forward_and_backward(self):
+        for encoder_type in ("absolute", "rope", "vqgans"):
+            with self.subTest(encoder_type=encoder_type):
+                model = TextVQVAE(small_config(encoder_type=encoder_type))
+                outputs = model(torch.randint(0, 31, (2, 12)))
+
+                self.assertEqual(outputs["logits"].shape, (2, 12, 32))
+                outputs["logits"].sum().backward()
+                self.assertIsNotNone(model.token_embedding.weight.grad)
+
+    def test_rope_encoder_masks_padding_keys(self):
+        model = TextVQVAE(small_config(encoder_type="rope"))
+        model.eval()
+        attention_mask = torch.tensor(
+            [[1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]]
+        )
+        first = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]])
+        second = first.clone()
+        second[:, 6:] = torch.tensor([13, 14, 15, 16, 17, 18])
+
+        with torch.no_grad():
+            first_latents = model.encode(first, attention_mask=attention_mask)
+            second_latents = model.encode(second, attention_mask=attention_mask)
+
+        torch.testing.assert_close(first_latents, second_latents)
+
+    def test_invalid_encoder_type_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "Unknown encoder_type"):
+            TextVQVAE(small_config(encoder_type="unknown"))
+
+    def test_vqgans_encoder_decoder_are_symmetric(self):
+        model = TextVQVAE(
+            small_config(encoder_type="vqgans", decoder_type="vqgans")
+        )
+
+        self.assertIsInstance(model.encoder, VQGANTextEncoder)
+        self.assertIsInstance(model.decoder_impl, VQGANTextDecoder)
+        self.assertIsNone(model.encoder_pos_embedding)
+        self.assertEqual(model.encoder.compression_factor, 3)
+        self.assertEqual(model.encoder.strided_conv.kernel_size, (3,))
+        self.assertEqual(model.encoder.strided_conv.stride, (3,))
+        self.assertEqual(model.decoder_impl.transposed_conv.kernel_size, (3,))
+        self.assertEqual(model.decoder_impl.transposed_conv.stride, (3,))
+        self.assertEqual(len(model.encoder.attention_blocks), 2)
+        self.assertEqual(len(model.decoder_impl.attention_blocks), 2)
+        self.assertTrue(
+            all(
+                isinstance(block.attention, PlainSelfAttention)
+                for block in (
+                    *model.encoder.attention_blocks,
+                    *model.decoder_impl.attention_blocks,
+                )
+            )
+        )
+
+        outputs = model(torch.randint(0, 31, (2, 12)))
+        self.assertEqual(outputs["z_e"].shape, (2, 4, 16))
+        self.assertEqual(outputs["logits"].shape, (2, 12, 32))
+        outputs["logits"].sum().backward()
+
+        shorter_outputs = model(torch.randint(0, 31, (2, 9)))
+        self.assertEqual(shorter_outputs["z_e"].shape, (2, 4, 16))
+        self.assertEqual(shorter_outputs["logits"].shape, (2, 9, 32))
+
+    def test_vqgans_stride_tracks_compression_ratio(self):
+        model = TextVQVAE(
+            small_config(
+                max_seq_len=20,
+                latent_slots=4,
+                encoder_type="vqgans",
+                decoder_type="vqgans",
+            )
+        )
+
+        self.assertEqual(model.encoder.compression_factor, 5)
+        self.assertEqual(model.decoder_impl.compression_factor, 5)
+        self.assertEqual(model(torch.randint(0, 31, (2, 20)))["logits"].shape, (2, 20, 32))
+
+    def test_vqgans_requires_integer_compression_ratio(self):
+        for field in ("encoder_type", "decoder_type"):
+            with self.subTest(field=field):
+                overrides = {field: "vqgans", "max_seq_len": 10, "latent_slots": 4}
+                with self.assertRaisesRegex(ValueError, "integer multiple"):
+                    TextVQVAE(small_config(**overrides))
+
+    def test_vqgans_encoder_masks_padding_before_strided_conv(self):
+        model = TextVQVAE(small_config(encoder_type="vqgans"))
+        model.eval()
+        attention_mask = torch.tensor(
+            [[1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]]
+        )
+        first = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]])
+        second = first.clone()
+        second[:, 6:] = torch.tensor([13, 14, 15, 16, 17, 18])
+
+        with torch.no_grad():
+            first_latents = model.encode(first, attention_mask=attention_mask)
+            second_latents = model.encode(second, attention_mask=attention_mask)
+
+        torch.testing.assert_close(first_latents, second_latents)
 
 
 class TextVQVAEPaddingTest(unittest.TestCase):
@@ -820,6 +957,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(model.codebook_size, 3072)
         self.assertEqual(model.d_model, 448)
         self.assertEqual(model.max_seq_len, 256)
+        self.assertEqual(model.encoder_type, "absolute")
         self.assertEqual(diagnostics.initial_pca_max_points, 8192)
         self.assertEqual(diagnostics.initial_pca_fit_mode, "balanced")
         self.assertTrue(diagnostics.geometry_snapshot_enabled)
@@ -840,6 +978,39 @@ class ConfigDefaultsTest(unittest.TestCase):
         )
         self.assertFalse(diagnostics.geometry_snapshot_enabled)
         self.assertFalse(diagnostics.geometry_render_enabled)
+
+    def test_encoder_type_can_be_selected_from_cli(self):
+        from training.text_vqvae.config import build_configs
+
+        tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
+        _, _, absolute, _ = build_configs(
+            self._parse("--encoder-type", "absolute"),
+            tokenizer,
+        )
+        _, _, rope, _ = build_configs(
+            self._parse("--encoder-type", "rope"),
+            tokenizer,
+        )
+
+        self.assertEqual(absolute.encoder_type, "absolute")
+        self.assertEqual(rope.encoder_type, "rope")
+
+    def test_vqgans_encoder_and_decoder_can_be_selected_from_cli(self):
+        from training.text_vqvae.config import build_configs
+
+        tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
+        _, _, model, _ = build_configs(
+            self._parse(
+                "--encoder-type",
+                "vqgans",
+                "--decoder-type",
+                "vqgans",
+            ),
+            tokenizer,
+        )
+
+        self.assertEqual(model.encoder_type, "vqgans")
+        self.assertEqual(model.decoder_type, "vqgans")
 
     def test_geometry_snapshots_can_be_retained_after_rendering(self):
         from training.text_vqvae.config import build_diagnostics_config

@@ -1,0 +1,15 @@
+{
+  "module": "training.run_text_vqvae_experiment",
+  "experiments": [
+    {
+      "encoder-type": "rope",
+      "codebook-init": "kmeans"
+    },
+    {
+      "encoder-type": "vqgans",
+      "decoder-type": "vqgans",
+      "codebook-init": "kmeans"
+    }
+  ],
+  "_comments": "实验用rope的encoder与简化的taming transformer enc/dec"
+}

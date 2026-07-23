@@ -8,6 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+ENCODER_TYPES = ("absolute", "rope", "vqgans")
+DECODER_TYPES = ("cross_attention", "memory_trunk", "vqgans")
+
+
 @dataclass
 class TextVQVAEConfig:
     vocab_size: int = 258
@@ -16,8 +20,9 @@ class TextVQVAEConfig:
     d_model: int = 448
     n_heads: int = 8
     encoder_layers: int = 4
+    encoder_type: Literal["absolute", "rope", "vqgans"] = "absolute"
     decoder_layers: int = 6
-    decoder_type: Literal["cross_attention", "memory_trunk"] = "cross_attention"
+    decoder_type: Literal["cross_attention", "memory_trunk", "vqgans"] = "memory_trunk"
     memory_decoder_latent_layers: int = 4
     memory_decoder_output_layers: int = 2
     ffn_mult: int = 4
@@ -268,7 +273,11 @@ class RotarySelfAttention(nn.Module):
         rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1)
         return rotated.flatten(-2)
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         batch_size, seq_len, d_model = hidden.shape
         qkv = self.qkv(hidden).reshape(
             batch_size, seq_len, 3, self.n_heads, self.head_dim
@@ -276,10 +285,19 @@ class RotarySelfAttention(nn.Module):
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
         query = self._apply_rope(query)
         key = self._apply_rope(key)
+        attention_mask = None
+        if padding_mask is not None:
+            if padding_mask.shape != hidden.shape[:2]:
+                raise ValueError(
+                    f"padding_mask must have shape {hidden.shape[:2]}, got {padding_mask.shape}."
+                )
+            attention_mask = ~padding_mask.to(device=hidden.device, dtype=torch.bool)
+            attention_mask = attention_mask[:, None, None, :]
         attended = F.scaled_dot_product_attention(
             query,
             key,
             value,
+            attn_mask=attention_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=False,
         )
@@ -288,7 +306,7 @@ class RotarySelfAttention(nn.Module):
 
 
 class RotaryResidualBlock(nn.Module):
-    """Pre-norm Transformer block used by both memory-trunk stages."""
+    """Pre-norm Transformer block with rotary self-attention."""
 
     def __init__(self, config: TextVQVAEConfig):
         super().__init__()
@@ -304,9 +322,181 @@ class RotaryResidualBlock(nn.Module):
             nn.Dropout(config.dropout),
         )
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        hidden = hidden + self.attention(self.attention_norm(hidden))
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden = hidden + self.attention(
+            self.attention_norm(hidden),
+            padding_mask=padding_mask,
+        )
         return hidden + self.ffn(self.ffn_norm(hidden))
+
+
+class RotaryTextEncoder(nn.Module):
+    """Bidirectional Transformer encoder using RoPE instead of absolute positions."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            RotaryResidualBlock(config) for _ in range(config.encoder_layers)
+        )
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            hidden = layer(hidden, padding_mask=padding_mask)
+        return hidden
+
+
+def _vqgans_compression_factor(config: TextVQVAEConfig) -> int:
+    if config.latent_slots < 1:
+        raise ValueError(f"latent_slots must be positive, got {config.latent_slots}.")
+    if config.max_seq_len % config.latent_slots != 0:
+        raise ValueError(
+            "vqgans requires max_seq_len to be an integer multiple of latent_slots, "
+            f"got {config.max_seq_len} and {config.latent_slots}."
+        )
+    return config.max_seq_len // config.latent_slots
+
+
+class PlainSelfAttention(nn.Module):
+    """Bidirectional self-attention without an additional position encoding."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float):
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads}).")
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.output = nn.Linear(d_model, d_model)
+        self.attention_dropout = dropout
+        self.output_dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size, seq_len, d_model = hidden.shape
+        qkv = self.qkv(hidden).reshape(
+            batch_size, seq_len, 3, self.n_heads, self.head_dim
+        )
+        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
+        attention_mask = None
+        if padding_mask is not None:
+            if padding_mask.shape != hidden.shape[:2]:
+                raise ValueError(
+                    f"padding_mask must have shape {hidden.shape[:2]}, got {padding_mask.shape}."
+                )
+            attention_mask = ~padding_mask.to(device=hidden.device, dtype=torch.bool)
+            attention_mask = attention_mask[:, None, None, :]
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        attended = attended.transpose(1, 2).contiguous().reshape(
+            batch_size, seq_len, d_model
+        )
+        return self.output_dropout(self.output(attended))
+
+
+class VQGANAttentionBlock(nn.Module):
+    """Taming-style residual attention block at the compressed resolution."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__()
+        self.norm = nn.LayerNorm(config.d_model)
+        self.attention = PlainSelfAttention(
+            config.d_model,
+            config.n_heads,
+            config.dropout,
+        )
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return hidden + self.attention(
+            self.norm(hidden),
+            padding_mask=padding_mask,
+        )
+
+
+class VQGANTextEncoder(nn.Module):
+    """Strided convolution followed by two bottleneck attention blocks."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__()
+        self.max_seq_len = config.max_seq_len
+        self.latent_slots = config.latent_slots
+        self.slot_pad_ratio_threshold = config.slot_pad_ratio_threshold
+        self.compression_factor = _vqgans_compression_factor(config)
+        self.strided_conv = nn.Conv1d(
+            config.d_model,
+            config.d_model,
+            kernel_size=self.compression_factor,
+            stride=self.compression_factor,
+        )
+        self.attention_blocks = nn.ModuleList(
+            VQGANAttentionBlock(config) for _ in range(2)
+        )
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, d_model = hidden.shape
+        if not 0 < seq_len <= self.max_seq_len:
+            raise ValueError(
+                f"encoder sequence length must be in [1, {self.max_seq_len}], got {seq_len}."
+            )
+        if attention_mask.shape != hidden.shape[:2]:
+            raise ValueError(
+                f"attention_mask must have shape {hidden.shape[:2]}, got {attention_mask.shape}."
+            )
+
+        attention_mask = attention_mask.to(device=hidden.device, dtype=torch.bool)
+        if seq_len < self.max_seq_len:
+            pad_length = self.max_seq_len - seq_len
+            hidden = F.pad(hidden, (0, 0, 0, pad_length))
+            attention_mask = F.pad(attention_mask, (0, pad_length), value=False)
+
+        hidden = torch.where(
+            attention_mask.unsqueeze(-1),
+            hidden,
+            torch.zeros((), device=hidden.device, dtype=hidden.dtype),
+        )
+        hidden = self.strided_conv(hidden.transpose(1, 2)).transpose(1, 2)
+        valid_fraction = F.avg_pool1d(
+            attention_mask.to(hidden.dtype).unsqueeze(1),
+            kernel_size=self.compression_factor,
+            stride=self.compression_factor,
+        ).squeeze(1)
+        latent_mask = (1.0 - valid_fraction) <= self.slot_pad_ratio_threshold
+        hidden = torch.where(latent_mask.unsqueeze(-1), hidden, torch.zeros_like(hidden))
+
+        padding_mask = not latent_mask
+        for block in self.attention_blocks:
+            hidden = block(hidden, padding_mask=padding_mask)
+        hidden = torch.where(latent_mask.unsqueeze(-1), hidden, torch.zeros_like(hidden))
+        if hidden.shape != (batch_size, self.latent_slots, d_model):
+            raise RuntimeError(
+                "vqgans encoder produced an unexpected shape: "
+                f"{hidden.shape}, expected {(batch_size, self.latent_slots, d_model)}."
+            )
+        return hidden, latent_mask
 
 
 class SubPixelSequenceUpsampler(nn.Module):
@@ -365,6 +555,38 @@ class MemoryTrunkTextDecoder(TextDecoder):
         hidden = self.upsampler(hidden)
         for block in self.output_blocks:
             hidden = block(hidden)
+        return self.norm(hidden[:, :seq_len])
+
+
+class VQGANTextDecoder(TextDecoder):
+    """Two bottleneck attention blocks followed by symmetric transposed convolution."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__()
+        self.latent_slots = config.latent_slots
+        self.max_seq_len = config.max_seq_len
+        self.compression_factor = _vqgans_compression_factor(config)
+        self.attention_blocks = nn.ModuleList(
+            VQGANAttentionBlock(config) for _ in range(2)
+        )
+        self.transposed_conv = nn.ConvTranspose1d(
+            config.d_model,
+            config.d_model,
+            kernel_size=self.compression_factor,
+            stride=self.compression_factor,
+        )
+        self.norm = nn.LayerNorm(config.d_model)
+
+    def forward(self, memory: torch.Tensor, seq_len: int) -> torch.Tensor:
+        _validate_decode_length(seq_len, self.max_seq_len)
+        if memory.shape[1] != self.latent_slots:
+            raise ValueError(
+                f"Expected {self.latent_slots} latent slots, got {memory.shape[1]}."
+            )
+        hidden = memory
+        for block in self.attention_blocks:
+            hidden = block(hidden)
+        hidden = self.transposed_conv(hidden.transpose(1, 2)).transpose(1, 2)
         return self.norm(hidden[:, :seq_len])
 
 
@@ -428,22 +650,33 @@ class TextVQVAE(nn.Module):
         ffn_dim = config.d_model * config.ffn_mult
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.encoder_pos_embedding = nn.Embedding(config.max_seq_len, config.d_model)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
-            nhead=config.n_heads,
-            dim_feedforward=ffn_dim,
-            dropout=config.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=config.encoder_layers,
-            enable_nested_tensor=False,
-        )
+        if config.encoder_type == "vqgans":
+            self.encoder_pos_embedding = None
+            self.encoder = VQGANTextEncoder(config)
+        elif config.encoder_type == "rope":
+            self.encoder_pos_embedding = None
+            self.encoder = RotaryTextEncoder(config)
+        elif config.encoder_type == "absolute":
+            self.encoder_pos_embedding = nn.Embedding(config.max_seq_len, config.d_model)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=config.d_model,
+                nhead=config.n_heads,
+                dim_feedforward=ffn_dim,
+                dropout=config.dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=config.encoder_layers,
+                enable_nested_tensor=False,
+            )
+        else:
+            choices = ", ".join(ENCODER_TYPES)
+            raise ValueError(
+                f"Unknown encoder_type {config.encoder_type!r}; expected one of: {choices}."
+            )
         self.encoder_norm = nn.LayerNorm(config.d_model)
 
         self.latent_proj = nn.Linear(config.d_model, config.d_model)
@@ -452,6 +685,7 @@ class TextVQVAE(nn.Module):
         decoder_types: dict[str, type[TextDecoder]] = {
             "cross_attention": CrossAttentionTextDecoder,
             "memory_trunk": MemoryTrunkTextDecoder,
+            "vqgans": VQGANTextDecoder,
         }
         try:
             decoder_class = decoder_types[config.decoder_type]
@@ -471,8 +705,12 @@ class TextVQVAE(nn.Module):
         return_mask: bool = False,
     ):
         batch_size, seq_len = input_ids.shape
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        hidden = self.token_embedding(input_ids) + self.encoder_pos_embedding(positions)
+        hidden = self.token_embedding(input_ids)
+        if self.encoder_pos_embedding is not None:
+            positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(
+                batch_size, -1
+            )
+            hidden = hidden + self.encoder_pos_embedding(positions)
 
         if attention_mask is None:
             attention_mask = input_ids != self.config.pad_token_id
@@ -480,15 +718,25 @@ class TextVQVAE(nn.Module):
             attention_mask = attention_mask.to(device=input_ids.device, dtype=torch.bool)
         padding_mask = ~attention_mask
 
-        hidden = self.encoder(hidden, src_key_padding_mask=padding_mask)
-        hidden = self.encoder_norm(hidden)
+        if self.config.encoder_type == "vqgans":
+            pooled, latent_mask = self.encoder(hidden, attention_mask)
+            hidden = self.encoder_norm(pooled)
+        elif self.config.encoder_type == "rope":
+            hidden = self.encoder(hidden, padding_mask=padding_mask)
+            hidden = self.encoder_norm(hidden)
+        else:
+            hidden = self.encoder(hidden, src_key_padding_mask=padding_mask)
+            hidden = self.encoder_norm(hidden)
 
-        pooled, latent_mask = pad_aware_adaptive_pool1d(
-            hidden,
-            attention_mask,
-            self.config.latent_slots,
-            slot_pad_ratio_threshold=self.config.slot_pad_ratio_threshold,
-        )
+        if self.config.encoder_type != "vqgans":
+            pooled, latent_mask = pad_aware_adaptive_pool1d(
+                hidden,
+                attention_mask,
+                self.config.latent_slots,
+                slot_pad_ratio_threshold=self.config.slot_pad_ratio_threshold,
+            )
+        else:
+            pooled = hidden
         latents = self.latent_proj(pooled)
         # A fully padded segment is represented by a fixed zero vector, including
         # after the projection bias, so it cannot become a trainable PAD prototype.

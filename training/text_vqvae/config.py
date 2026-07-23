@@ -30,7 +30,12 @@ from pathlib import Path
 from typing import Any
 
 from common.text_data import DEFAULT_BPE_TOKENIZER_PATH, DEFAULT_HF_DATASET_CACHE, DEFAULT_TEXT_DATASET
-from models.text_vqvae import CollapseControlConfig, TextVQVAEConfig
+from models.text_vqvae import (
+    DECODER_TYPES,
+    ENCODER_TYPES,
+    CollapseControlConfig,
+    TextVQVAEConfig,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +61,7 @@ class TrainConfig:
     # "kmeans"  → MiniBatch KMeans over one encoder pre-pass.
     # Hypothesis tested: does data-driven init eliminate the early high-active-
     # code spike and reduce/delay collapse? (see technical summary §2.3)
-    codebook_init: str = "random"
+    codebook_init: str = "kmeans"
     ablation: str | None = None
 
 
@@ -212,9 +217,15 @@ def add_arguments(parser) -> None:
     g.add_argument("--d-model", type=int, default=None)
     g.add_argument("--n-heads", type=int, default=None)
     g.add_argument("--encoder-layers", type=int, default=None)
+    g.add_argument(
+        "--encoder-type",
+        choices=ENCODER_TYPES,
+        default=None,
+        help="Encoder position encoding.",
+    )
     g.add_argument("--decoder-layers", type=int, default=None)
     g.add_argument(
-        "--decoder-type", choices=["cross_attention", "memory_trunk"], default=None,
+        "--decoder-type", choices=DECODER_TYPES, default=None,
         help="Decoder backbone.",
     )
     g.add_argument("--memory-decoder-latent-layers", type=int, default=None)
@@ -456,6 +467,7 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
         "d_model": getattr(args, "d_model", None),
         "n_heads": getattr(args, "n_heads", None),
         "encoder_layers": getattr(args, "encoder_layers", None),
+        "encoder_type": getattr(args, "encoder_type", None),
         "decoder_layers": getattr(args, "decoder_layers", None),
         "decoder_type": getattr(args, "decoder_type", None),
         "memory_decoder_latent_layers": getattr(args, "memory_decoder_latent_layers", None),
