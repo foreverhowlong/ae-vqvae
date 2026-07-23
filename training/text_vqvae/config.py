@@ -234,6 +234,18 @@ def add_arguments(parser) -> None:
     g.add_argument("--dropout", type=float, default=None)
     g.add_argument("--codebook-size", type=int, default=None)
     g.add_argument("--commitment-beta", type=float, default=None)
+    g.add_argument(
+        "--l2-normalize-before-vq",
+        dest="l2_normalize_before_vq",
+        action="store_true",
+        default=None,
+        help="L2-normalize valid encoder latents immediately before vector quantization.",
+    )
+    g.add_argument(
+        "--no-l2-normalize-before-vq",
+        dest="l2_normalize_before_vq",
+        action="store_false",
+    )
 
     # ---- collapse control ----
     g = parser.add_argument_group("collapse control")
@@ -476,6 +488,7 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
         "dropout": getattr(args, "dropout", None),
         "codebook_size": getattr(args, "codebook_size", None),
         "commitment_beta": getattr(args, "commitment_beta", None),
+        "l2_normalize_before_vq": getattr(args, "l2_normalize_before_vq", None),
     })
 
     collapse_cfg = build_collapse_config(args)

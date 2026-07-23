@@ -31,6 +31,7 @@ class TextVQVAEConfig:
     commitment_beta: float = 0.25
     pad_token_id: int = 257
     slot_pad_ratio_threshold: float = 0.5
+    l2_normalize_before_vq: bool = False
 
     def to_dict(self):
         return asdict(self)
@@ -741,6 +742,8 @@ class TextVQVAE(nn.Module):
         # A fully padded segment is represented by a fixed zero vector, including
         # after the projection bias, so it cannot become a trainable PAD prototype.
         latents = torch.where(latent_mask.unsqueeze(-1), latents, torch.zeros_like(latents))
+        if self.config.l2_normalize_before_vq:
+            latents = F.normalize(latents, p=2, dim=-1)
         if return_mask:
             return latents, latent_mask
         return latents

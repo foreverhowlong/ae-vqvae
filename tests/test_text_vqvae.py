@@ -755,6 +755,23 @@ class VectorQuantizerMaskingTest(unittest.TestCase):
         torch.testing.assert_close(outputs["indices"], -torch.ones(1, 2, dtype=torch.long))
 
 
+class PreVQL2NormalizationTest(unittest.TestCase):
+    def test_normalizes_valid_latents_and_preserves_invalid_zero_slots(self):
+        model = TextVQVAE(small_config(l2_normalize_before_vq=True))
+        input_ids = torch.tensor([[1, 2, 3, 31, 31, 31, 31, 31, 31, 31, 31, 31]])
+        attention_mask = input_ids != 31
+
+        latents, latent_mask = model.encode(
+            input_ids,
+            attention_mask=attention_mask,
+            return_mask=True,
+        )
+
+        valid_norms = latents[latent_mask].norm(dim=-1)
+        torch.testing.assert_close(valid_norms, torch.ones_like(valid_norms))
+        torch.testing.assert_close(latents[~latent_mask], torch.zeros_like(latents[~latent_mask]))
+
+
 class TextVQVAEVisualizationTest(unittest.TestCase):
     def test_initial_pca_steps_are_composable_and_balanced(self):
         model = TextVQVAE(small_config())
@@ -958,6 +975,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(model.d_model, 448)
         self.assertEqual(model.max_seq_len, 256)
         self.assertEqual(model.encoder_type, "absolute")
+        self.assertFalse(model.l2_normalize_before_vq)
         self.assertEqual(diagnostics.initial_pca_max_points, 8192)
         self.assertEqual(diagnostics.initial_pca_fit_mode, "balanced")
         self.assertTrue(diagnostics.geometry_snapshot_enabled)
@@ -994,6 +1012,22 @@ class ConfigDefaultsTest(unittest.TestCase):
 
         self.assertEqual(absolute.encoder_type, "absolute")
         self.assertEqual(rope.encoder_type, "rope")
+
+    def test_pre_vq_l2_normalization_can_be_selected_from_cli(self):
+        from training.text_vqvae.config import build_configs
+
+        tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
+        _, _, enabled, _ = build_configs(
+            self._parse("--l2-normalize-before-vq"),
+            tokenizer,
+        )
+        _, _, disabled, _ = build_configs(
+            self._parse("--no-l2-normalize-before-vq"),
+            tokenizer,
+        )
+
+        self.assertTrue(enabled.l2_normalize_before_vq)
+        self.assertFalse(disabled.l2_normalize_before_vq)
 
     def test_vqgans_encoder_and_decoder_can_be_selected_from_cli(self):
         from training.text_vqvae.config import build_configs
