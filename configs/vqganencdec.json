@@ -3,12 +3,12 @@
   "experiments": [
     {
       "encoder-type": "rope",
-      "codebook-init": "kmeans"
+      "use-ema-codebook":true
     },
     {
       "encoder-type": "vqgans",
       "decoder-type": "vqgans",
-      "codebook-init": "kmeans"
+      "use-ema-codebook":true
     }
   ],
   "_comments": "实验用rope的encoder与简化的taming transformer enc/dec"
