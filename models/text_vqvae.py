@@ -488,7 +488,7 @@ class VQGANTextEncoder(nn.Module):
         latent_mask = (1.0 - valid_fraction) <= self.slot_pad_ratio_threshold
         hidden = torch.where(latent_mask.unsqueeze(-1), hidden, torch.zeros_like(hidden))
 
-        padding_mask = not latent_mask
+        padding_mask = ~latent_mask
         for block in self.attention_blocks:
             hidden = block(hidden, padding_mask=padding_mask)
         hidden = torch.where(latent_mask.unsqueeze(-1), hidden, torch.zeros_like(hidden))
