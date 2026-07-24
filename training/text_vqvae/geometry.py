@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from common.text_vqvae_config import GeometryRenderBasis
 
 @contextmanager
 def preserve_rng_state():
@@ -95,7 +96,7 @@ def finalize_geometry_artifacts(
     run_dir: Path,
     *,
     enabled: bool,
-    basis: str,
+    basis: GeometryRenderBasis,
     fps: int,
     keep_snapshots: bool,
 ) -> dict[str, object]:

@@ -11,6 +11,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 
+from common.text_vqvae_config import PCAFitMode
 from visualization.text_vqvae import (
     collect_encoder_vectors,
     compare_vector_distributions_pca,
@@ -183,7 +184,7 @@ def run_initial_pca(
     *,
     enabled: bool,
     max_points: int,
-    fit_mode: str,
+    fit_mode: PCAFitMode,
     strict: bool,
 ) -> None:
     if not enabled:

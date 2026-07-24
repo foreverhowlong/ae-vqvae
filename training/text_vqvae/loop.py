@@ -10,8 +10,13 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, random_split
 
-from models.text_vqvae import TextVQVAEConfig, CollapseControlConfig, codebook_stats, text_vqvae_losses
-from training.text_vqvae.config import TrainConfig, DataConfig
+from common.text_vqvae_config import (
+    CollapseControlConfig,
+    DataConfig,
+    TextVQVAEConfig,
+    TrainConfig,
+)
+from models.text_vqvae import codebook_stats, text_vqvae_losses
 from training.text_vqvae.reporting import (
     append_jsonl,
     build_reconstruction_rows,

@@ -18,6 +18,8 @@ import numpy as np
 from PIL import Image
 from sklearn.decomposition import PCA
 
+from common.text_vqvae_config import GeometryRenderBasis
+
 
 @dataclass(frozen=True)
 class AnimationScales:
@@ -40,7 +42,12 @@ def load_snapshots(run_dir: Path):
     return [(int(path.stem.removeprefix("step")), path) for path in paths]
 
 
-def fit_shared_pca(snapshots, basis: str, random_state: int = 0, max_fit_points: int = 8192) -> PCA:
+def fit_shared_pca(
+    snapshots,
+    basis: GeometryRenderBasis,
+    random_state: int = 0,
+    max_fit_points: int = 8192,
+) -> PCA:
     if basis == "t0":
         selected = snapshots[:1]
     elif basis == "first_last":
@@ -302,7 +309,7 @@ def assemble_animation(frame_paths, plots_dir: Path, fps: int) -> Path:
 
 def render_run(
     run_dir: Path,
-    basis: str = "first_last",
+    basis: GeometryRenderBasis = "first_last",
     fps: int = 8,
     *,
     keep_frames: bool = False,

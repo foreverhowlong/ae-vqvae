@@ -2,7 +2,7 @@
 
 Flag discipline
 ---------------
-* True defaults live only in the dataclass fields below.  argparse uses
+* True defaults live only in ``common.text_vqvae_config``. argparse uses
   ``default=None`` everywhere so that "flag not passed" is distinguishable
   from "flag passed with the default value."  ``build_configs()`` merges
   non-None overrides on top of the dataclass defaults. CLI help annotates its
@@ -25,76 +25,24 @@ import dataclasses
 import json
 import subprocess
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
-from common.text_data import DEFAULT_BPE_TOKENIZER_PATH, DEFAULT_HF_DATASET_CACHE, DEFAULT_TEXT_DATASET
-from models.text_vqvae import (
-    DECODER_TYPES,
-    ENCODER_TYPES,
+from common.text_vqvae_config import (
+    CodebookInitialization,
+    CollapsePreset,
     CollapseControlConfig,
+    DataConfig,
+    DecoderType,
+    DiagnosticsConfig,
+    EncoderType,
+    GeometryRenderBasis,
+    PCAFitMode,
     TextVQVAEConfig,
+    TokenizerType,
+    TrainConfig,
 )
-
-
-# ---------------------------------------------------------------------------
-# Dataclasses – single source of truth for defaults
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TrainConfig:
-    run_name: str = ""                  # filled in at runtime from timestamp
-    seed: int = 42
-    epochs: int = 5
-    batch_size: int = 32
-    lr: float = 3e-4
-    weight_decay: float = 0.01
-    grad_clip: float = 1.0
-    eval_every: int = 200
-    save_every: int = 1000
-    num_workers: int = 0
-    tokenizer: str = "bpe"
-    tokenizer_path: str | None = str(DEFAULT_BPE_TOKENIZER_PATH)
-    # Research flag: codebook initialisation strategy.
-    # "random"  → normal_(std=d**-0.5); keep as control group, do not modify.
-    # "kmeans"  → MiniBatch KMeans over one encoder pre-pass.
-    # Hypothesis tested: does data-driven init eliminate the early high-active-
-    # code spike and reduce/delay collapse? (see technical summary §2.3)
-    codebook_init: str = "kmeans"
-    ablation: str | None = None
-
-
-@dataclass
-class DataConfig:
-    source: str = "huggingface"
-    dataset: str | None = DEFAULT_TEXT_DATASET
-    dataset_config: str | None = None
-    split: str | None = "train"
-    text_field: str = "text"
-    data_file: str | None = None
-    cache_dir: str | None = str(DEFAULT_HF_DATASET_CACHE)
-    streaming: bool | None = False
-    max_train_samples: int | None = 50000
-    max_eval_samples: int = 2048
-    val_fraction: float = 0.02
-
-
-@dataclass
-class DiagnosticsConfig:
-    initial_pca_enabled: bool = True
-    initial_pca_max_points: int = 8192
-    initial_pca_fit_mode: str = "balanced"
-    initial_pca_strict: bool = False
-    geometry_snapshot_enabled: bool = True
-    geometry_dense_every: int = 50
-    geometry_dense_until: int = 1500
-    geometry_sparse_every: int = 500
-    geometry_probe_points: int = 4096
-    geometry_render_enabled: bool = True
-    geometry_render_basis: str = "first_last"
-    geometry_render_fps: int = 8
-    geometry_keep_snapshots: bool = True
 
 
 class ConfigDefaultsHelpFormatter(argparse.HelpFormatter):
@@ -178,7 +126,7 @@ def add_arguments(parser) -> None:
     g.add_argument("--save-every", type=int, default=None)
     g.add_argument("--num-workers", type=int, default=None)
     g.add_argument(
-        "--tokenizer", choices=["bpe", "byte"], default=None,
+        "--tokenizer", choices=get_args(TokenizerType), default=None,
         help="Tokenizer to use.",
     )
     g.add_argument(
@@ -186,7 +134,7 @@ def add_arguments(parser) -> None:
         help="Saved tokenizer.json for --tokenizer bpe.",
     )
     g.add_argument(
-        "--codebook-init", choices=["random", "kmeans"], default=None,
+        "--codebook-init", choices=get_args(CodebookInitialization), default=None,
         help="Codebook initialisation strategy.",
     )
 
@@ -219,13 +167,13 @@ def add_arguments(parser) -> None:
     g.add_argument("--encoder-layers", type=int, default=None)
     g.add_argument(
         "--encoder-type",
-        choices=ENCODER_TYPES,
+        choices=get_args(EncoderType),
         default=None,
         help="Encoder position encoding.",
     )
     g.add_argument("--decoder-layers", type=int, default=None)
     g.add_argument(
-        "--decoder-type", choices=DECODER_TYPES, default=None,
+        "--decoder-type", choices=get_args(DecoderType), default=None,
         help="Decoder backbone.",
     )
     g.add_argument("--memory-decoder-latent-layers", type=int, default=None)
@@ -250,7 +198,7 @@ def add_arguments(parser) -> None:
     # ---- collapse control ----
     g = parser.add_argument_group("collapse control")
     g.add_argument(
-        "--collapse-preset", choices=["none", "anti"], default=None,
+        "--collapse-preset", choices=get_args(CollapsePreset), default=None,
         help="'anti' enables all common anti-collapse measures.",
     )
     g.add_argument("--use-ema-codebook", dest="use_ema_codebook", action="store_true", default=None)
@@ -279,7 +227,7 @@ def add_arguments(parser) -> None:
         help="Maximum encoder latent vectors in the initialisation PCA plot.",
     )
     g.add_argument(
-        "--initial-pca-fit-mode", choices=["balanced", "all"], default=None,
+        "--initial-pca-fit-mode", choices=get_args(PCAFitMode), default=None,
         help="Fit PCA with equal group sizes or all collected vectors.",
     )
     g.add_argument(
@@ -303,7 +251,7 @@ def add_arguments(parser) -> None:
         help="Render geometry plots and animation when training completes (true/false).",
     )
     g.add_argument(
-        "--geometry-render-basis", choices=["t0", "first_last", "pooled"], default=None,
+        "--geometry-render-basis", choices=get_args(GeometryRenderBasis), default=None,
         help="PCA basis used by every animation frame.",
     )
     g.add_argument("--geometry-render-fps", type=int, default=None)
@@ -521,9 +469,9 @@ def build_config_payload(
     device,
     initial_pca_enabled: bool,
     initial_pca_max_points: int,
-    initial_pca_fit_mode: str,
+    initial_pca_fit_mode: PCAFitMode,
     initial_pca_strict: bool,
-    codebook_init_method: str,
+    codebook_init_method: CodebookInitialization,
     geometry_config: DiagnosticsConfig | None = None,
 ) -> dict[str, Any]:
     geometry_config = geometry_config or DiagnosticsConfig()
@@ -532,8 +480,8 @@ def build_config_payload(
         **_git_info(),
         "train": asdict(train_cfg),
         "data": asdict(data_cfg),
-        "model": model_cfg.to_dict(),
-        "collapse_control": collapse_cfg.to_dict(),
+        "model": asdict(model_cfg),
+        "collapse_control": asdict(collapse_cfg),
         "device": str(device),
         "output_dir": str(run_dir),
         "codebook_initialization": {

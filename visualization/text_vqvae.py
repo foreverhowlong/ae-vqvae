@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 import matplotlib
 
@@ -16,8 +15,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.decomposition import PCA
 
-
-PCAFitMode = Literal["balanced", "all"]
+from common.text_vqvae_config import PCAFitMode
 
 
 @dataclass(frozen=True)

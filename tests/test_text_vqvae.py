@@ -14,6 +14,8 @@ import torch.nn as nn
 from models.text_vqvae import (
     CollapseControlConfig,
     CrossAttentionTextDecoder,
+    DECODER_TYPES,
+    ENCODER_TYPES,
     MemoryTrunkTextDecoder,
     PlainSelfAttention,
     RotarySelfAttention,
@@ -337,7 +339,7 @@ class CheckpointRetentionTest(unittest.TestCase):
 
 class TextVQVAEDecoderTest(unittest.TestCase):
     def test_all_decoders_forward_and_backward(self):
-        for decoder_type in ("cross_attention", "memory_trunk", "vqgans"):
+        for decoder_type in DECODER_TYPES:
             with self.subTest(decoder_type=decoder_type):
                 model = TextVQVAE(small_config(decoder_type=decoder_type))
                 memory = torch.randn(2, 4, 16, requires_grad=True)
@@ -350,9 +352,9 @@ class TextVQVAEDecoderTest(unittest.TestCase):
                 self.assertEqual(outputs["logits"].shape, (2, 12, 32))
                 outputs["logits"].sum().backward()
 
-    def test_cross_attention_is_default(self):
+    def test_memory_trunk_is_default(self):
         model = TextVQVAE(small_config())
-        self.assertIsInstance(model.decoder_impl, CrossAttentionTextDecoder)
+        self.assertIsInstance(model.decoder_impl, MemoryTrunkTextDecoder)
 
     def test_memory_trunk_uses_rope_without_cross_attention_or_position_embedding(self):
         model = TextVQVAE(small_config(decoder_type="memory_trunk"))
@@ -416,7 +418,7 @@ class TextVQVAEDecoderTest(unittest.TestCase):
         self.assertEqual(len(decoder.attention_blocks), 2)
 
     def test_decode_rejects_length_above_configured_maximum(self):
-        for decoder_type in ("cross_attention", "memory_trunk", "vqgans"):
+        for decoder_type in DECODER_TYPES:
             with self.subTest(decoder_type=decoder_type):
                 model = TextVQVAE(small_config(decoder_type=decoder_type))
                 with self.assertRaisesRegex(ValueError, "seq_len"):
@@ -439,7 +441,7 @@ class TextVQVAEDecoderTest(unittest.TestCase):
         )
 
     def test_original_cross_attention_checkpoint_keys_are_migrated(self):
-        model = TextVQVAE(small_config())
+        model = TextVQVAE(small_config(decoder_type="cross_attention"))
         legacy_state = OrderedDict()
         for key, value in model.state_dict().items():
             key = key.replace("decoder_impl.position_embedding.", "decoder_pos_embedding.")
@@ -451,12 +453,12 @@ class TextVQVAEDecoderTest(unittest.TestCase):
 
 
 class TextVQVAEEncoderTest(unittest.TestCase):
-    def test_absolute_position_encoder_remains_default(self):
+    def test_rope_encoder_remains_default(self):
         model = TextVQVAE(small_config())
 
-        self.assertEqual(model.config.encoder_type, "absolute")
-        self.assertIsInstance(model.encoder, nn.TransformerEncoder)
-        self.assertIsInstance(model.encoder_pos_embedding, nn.Embedding)
+        self.assertEqual(model.config.encoder_type, "rope")
+        self.assertIsInstance(model.encoder, RotaryTextEncoder)
+        self.assertIsNone(model.encoder_pos_embedding)
 
     def test_rope_encoder_has_no_absolute_position_embedding(self):
         model = TextVQVAE(small_config(encoder_type="rope"))
@@ -471,7 +473,7 @@ class TextVQVAEEncoderTest(unittest.TestCase):
         )
 
     def test_all_encoders_forward_and_backward(self):
-        for encoder_type in ("absolute", "rope", "vqgans"):
+        for encoder_type in ENCODER_TYPES:
             with self.subTest(encoder_type=encoder_type):
                 model = TextVQVAE(small_config(encoder_type=encoder_type))
                 outputs = model(torch.randint(0, 31, (2, 12)))
@@ -479,6 +481,25 @@ class TextVQVAEEncoderTest(unittest.TestCase):
                 self.assertEqual(outputs["logits"].shape, (2, 12, 32))
                 outputs["logits"].sum().backward()
                 self.assertIsNotNone(model.token_embedding.weight.grad)
+
+    def test_all_encoder_decoder_combinations_forward_and_backward(self):
+        for encoder_type in ENCODER_TYPES:
+            for decoder_type in DECODER_TYPES:
+                with self.subTest(
+                    encoder_type=encoder_type,
+                    decoder_type=decoder_type,
+                ):
+                    model = TextVQVAE(
+                        small_config(
+                            encoder_type=encoder_type,
+                            decoder_type=decoder_type,
+                        )
+                    )
+                    outputs = model(torch.randint(0, 31, (2, 12)))
+                    self.assertEqual(outputs["z_e"].shape, (2, 4, 16))
+                    self.assertEqual(outputs["logits"].shape, (2, 12, 32))
+                    outputs["logits"].sum().backward()
+                    self.assertIsNotNone(model.token_embedding.weight.grad)
 
     def test_rope_encoder_masks_padding_keys(self):
         model = TextVQVAE(small_config(encoder_type="rope"))
@@ -499,6 +520,26 @@ class TextVQVAEEncoderTest(unittest.TestCase):
     def test_invalid_encoder_type_fails_fast(self):
         with self.assertRaisesRegex(ValueError, "Unknown encoder_type"):
             TextVQVAE(small_config(encoder_type="unknown"))
+
+    def test_pre_registry_encoder_checkpoint_keys_are_migrated(self):
+        for encoder_type in ("absolute", "rope", "vqgans"):
+            with self.subTest(encoder_type=encoder_type):
+                model = TextVQVAE(small_config(encoder_type=encoder_type))
+                legacy_state = OrderedDict()
+                for key, value in model.state_dict().items():
+                    key = key.replace("encoder.norm.", "encoder_norm.")
+                    if encoder_type == "absolute":
+                        key = key.replace(
+                            "encoder.position_embedding.",
+                            "encoder_pos_embedding.",
+                        )
+                        key = key.replace(
+                            "encoder.transformer.layers.",
+                            "encoder.layers.",
+                        )
+                    legacy_state[key] = value
+
+                model.load_state_dict(legacy_state, strict=True)
 
     def test_vqgans_encoder_decoder_are_symmetric(self):
         model = TextVQVAE(
@@ -888,6 +929,49 @@ class TextVQVAECodebookInitializationTest(unittest.TestCase):
 class ConfigDefaultsTest(unittest.TestCase):
     """Ensure CLI defaults and dataclass defaults are in sync (no double-source drift)."""
 
+    def test_all_configuration_dataclasses_live_in_one_module(self):
+        from common.text_vqvae_config import (
+            CollapseControlConfig,
+            DataConfig,
+            DiagnosticsConfig,
+            TextVQVAEConfig,
+            TrainConfig,
+        )
+
+        config_classes = (
+            TrainConfig,
+            DataConfig,
+            TextVQVAEConfig,
+            CollapseControlConfig,
+            DiagnosticsConfig,
+        )
+        self.assertTrue(all(cls.__module__ == "common.text_vqvae_config" for cls in config_classes))
+
+    def test_categorical_text_configuration_fields_use_literal(self):
+        from typing import Literal, get_origin, get_type_hints
+
+        from common.text_vqvae_config import (
+            DataConfig,
+            DiagnosticsConfig,
+            TextVQVAEConfig,
+            TrainConfig,
+        )
+
+        categorical_fields = {
+            TrainConfig: ("tokenizer", "codebook_init"),
+            DataConfig: ("source",),
+            TextVQVAEConfig: ("encoder_type", "decoder_type"),
+            DiagnosticsConfig: ("initial_pca_fit_mode", "geometry_render_basis"),
+        }
+        for config_class, field_names in categorical_fields.items():
+            hints = get_type_hints(config_class)
+            for field_name in field_names:
+                with self.subTest(
+                    config_class=config_class.__name__,
+                    field=field_name,
+                ):
+                    self.assertIs(get_origin(hints[field_name]), Literal)
+
     def _parser(self):
         import argparse
         from training.text_vqvae.config import add_arguments
@@ -974,7 +1058,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(model.codebook_size, 3072)
         self.assertEqual(model.d_model, 448)
         self.assertEqual(model.max_seq_len, 256)
-        self.assertEqual(model.encoder_type, "absolute")
+        self.assertEqual(model.encoder_type, "rope")
         self.assertFalse(model.l2_normalize_before_vq)
         self.assertEqual(diagnostics.initial_pca_max_points, 8192)
         self.assertEqual(diagnostics.initial_pca_fit_mode, "balanced")

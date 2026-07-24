@@ -11,6 +11,7 @@ import torch
 
 from common import ROOT, enable_tf32, get_device
 from common.text_data import BPETokenizer, ByteTokenizer, build_text_dataset
+from common.text_vqvae_config import TokenizerType
 from common.tracking import wandb_run
 from models.text_vqvae import TextVQVAE, count_parameters
 from training.text_vqvae.codebook_init import initialize_codebook_kmeans
@@ -23,7 +24,7 @@ from training.text_vqvae.config import (
 )
 
 
-def _load_tokenizer(name: str, path: str | None):
+def _load_tokenizer(name: TokenizerType, path: str | None):
     if name == "byte":
         return ByteTokenizer(), None
     if not path:
@@ -57,8 +58,8 @@ def _resolved_config_dict(train_cfg, data_cfg, model_cfg, collapse_cfg, diagnost
     return {
         "train": asdict(train_cfg),
         "data": asdict(data_cfg),
-        "model": model_cfg.to_dict(),
-        "collapse_control": collapse_cfg.to_dict(),
+        "model": asdict(model_cfg),
+        "collapse_control": asdict(collapse_cfg),
         "diagnostics": asdict(diagnostics_cfg),
     }
 
