@@ -11,6 +11,7 @@ from models.text_decoders import (
     MemoryTrunkTextDecoder,
     SubPixelSequenceUpsampler,
     TextDecoder,
+    VQGANPreAttentionTextDecoder,
     VQGANTextDecoder,
     build_text_decoder,
 )
@@ -19,6 +20,7 @@ from models.text_encoders import (
     AbsoluteTextEncoder,
     RotaryTextEncoder,
     TextEncoder,
+    VQGANPreAttentionTextEncoder,
     VQGANTextEncoder,
     build_text_encoder,
     pad_aware_adaptive_pool1d,

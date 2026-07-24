@@ -14,8 +14,8 @@ from common.text_data import (
 )
 
 
-EncoderType = Literal["absolute", "rope", "vqgans"]
-DecoderType = Literal["cross_attention", "memory_trunk", "vqgans"]
+EncoderType = Literal["absolute", "rope", "vqgans", "vqganpa"]
+DecoderType = Literal["cross_attention", "memory_trunk", "vqgans", "vqganpa"]
 TokenizerType = Literal["bpe", "byte"]
 CodebookInitialization = Literal["random", "kmeans"]
 DataSource = Literal["huggingface", "file"]

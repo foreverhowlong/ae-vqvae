@@ -143,13 +143,29 @@ class VQGANTextDecoder(TextDecoder):
         for block in self.attention_blocks:
             hidden = block(hidden)
         hidden = self.transposed_conv(hidden.transpose(1, 2)).transpose(1, 2)
-        return self.norm(hidden[:, :seq_len])
+        hidden = self._postprocess_full_resolution(hidden[:, :seq_len])
+        return self.norm(hidden)
+
+    def _postprocess_full_resolution(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden
+
+
+class VQGANPreAttentionTextDecoder(VQGANTextDecoder):
+    """Mirror VQGANPA encoding with attention after transposed convolution."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__(config)
+        self.post_attention = VQGANAttentionBlock(config)
+
+    def _postprocess_full_resolution(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.post_attention(hidden)
 
 
 DECODER_REGISTRY: dict[str, type[TextDecoder]] = {
     "cross_attention": CrossAttentionTextDecoder,
     "memory_trunk": MemoryTrunkTextDecoder,
     "vqgans": VQGANTextDecoder,
+    "vqganpa": VQGANPreAttentionTextDecoder,
 }
 DECODER_TYPES = get_args(DecoderType)
 

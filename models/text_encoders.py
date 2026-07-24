@@ -149,6 +149,10 @@ class VQGANTextEncoder(TextEncoder):
             hidden = F.pad(hidden, (0, 0, 0, pad_length))
             attention_mask = F.pad(attention_mask, (0, pad_length), value=False)
 
+        hidden = self._preprocess_full_resolution(
+            hidden,
+            padding_mask=~attention_mask,
+        )
         hidden = torch.where(
             attention_mask.unsqueeze(-1),
             hidden,
@@ -174,10 +178,34 @@ class VQGANTextEncoder(TextEncoder):
             )
         return hidden, latent_mask
 
+    def _preprocess_full_resolution(
+        self,
+        hidden: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden
+
+
+class VQGANPreAttentionTextEncoder(VQGANTextEncoder):
+    """Add full-resolution attention before the VQGANS strided convolution."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__(config)
+        self.pre_attention = VQGANAttentionBlock(config)
+
+    def _preprocess_full_resolution(
+        self,
+        hidden: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.pre_attention(hidden, padding_mask=padding_mask)
+
+
 ENCODER_REGISTRY: dict[str, type[TextEncoder]] = {
     "absolute": AbsoluteTextEncoder,
     "rope": RotaryTextEncoder,
     "vqgans": VQGANTextEncoder,
+    "vqganpa": VQGANPreAttentionTextEncoder,
 }
 ENCODER_TYPES = get_args(EncoderType)
 

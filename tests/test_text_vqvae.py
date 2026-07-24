@@ -23,6 +23,8 @@ from models.text_vqvae import (
     SubPixelSequenceUpsampler,
     TextVQVAE,
     TextVQVAEConfig,
+    VQGANPreAttentionTextDecoder,
+    VQGANPreAttentionTextEncoder,
     VQGANTextDecoder,
     VQGANTextEncoder,
     VectorQuantizer,
@@ -575,6 +577,69 @@ class TextVQVAEEncoderTest(unittest.TestCase):
         self.assertEqual(shorter_outputs["z_e"].shape, (2, 4, 16))
         self.assertEqual(shorter_outputs["logits"].shape, (2, 9, 32))
 
+    def test_vqganpa_adds_symmetric_full_resolution_attention(self):
+        model = TextVQVAE(
+            small_config(encoder_type="vqganpa", decoder_type="vqganpa")
+        )
+
+        self.assertIsInstance(model.encoder, VQGANPreAttentionTextEncoder)
+        self.assertIsInstance(model.decoder_impl, VQGANPreAttentionTextDecoder)
+        self.assertIsInstance(model.encoder.pre_attention.attention, PlainSelfAttention)
+        self.assertIsInstance(model.decoder_impl.post_attention.attention, PlainSelfAttention)
+        self.assertEqual(len(model.encoder.attention_blocks), 2)
+        self.assertEqual(len(model.decoder_impl.attention_blocks), 2)
+        self.assertEqual(model.encoder.strided_conv.stride, (3,))
+        self.assertEqual(model.decoder_impl.transposed_conv.stride, (3,))
+
+        encoder_attention_params = sum(
+            parameter.numel() for parameter in model.encoder.pre_attention.parameters()
+        )
+        decoder_attention_params = sum(
+            parameter.numel() for parameter in model.decoder_impl.post_attention.parameters()
+        )
+        self.assertEqual(encoder_attention_params, decoder_attention_params)
+
+        encoder_order = []
+        decoder_order = []
+        encoder_modules = (
+            ("pre", model.encoder.pre_attention),
+            ("conv", model.encoder.strided_conv),
+            ("bottleneck0", model.encoder.attention_blocks[0]),
+            ("bottleneck1", model.encoder.attention_blocks[1]),
+        )
+        decoder_modules = (
+            ("bottleneck0", model.decoder_impl.attention_blocks[0]),
+            ("bottleneck1", model.decoder_impl.attention_blocks[1]),
+            ("conv", model.decoder_impl.transposed_conv),
+            ("post", model.decoder_impl.post_attention),
+        )
+        handles = [
+            module.register_forward_hook(
+                lambda _module, _inputs, _output, name=name: encoder_order.append(name)
+            )
+            for name, module in encoder_modules
+        ]
+        handles.extend(
+            module.register_forward_hook(
+                lambda _module, _inputs, _output, name=name: decoder_order.append(name)
+            )
+            for name, module in decoder_modules
+        )
+        try:
+            model.encoder(torch.randn(2, 12, 16), torch.ones(2, 12, dtype=torch.bool))
+            model.decoder_impl(torch.randn(2, 4, 16), seq_len=12)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self.assertEqual(encoder_order, ["pre", "conv", "bottleneck0", "bottleneck1"])
+        self.assertEqual(decoder_order, ["bottleneck0", "bottleneck1", "conv", "post"])
+
+        outputs = model(torch.randint(0, 31, (2, 12)))
+        self.assertEqual(outputs["z_e"].shape, (2, 4, 16))
+        self.assertEqual(outputs["logits"].shape, (2, 12, 32))
+        outputs["logits"].sum().backward()
+
     def test_vqgans_stride_tracks_compression_ratio(self):
         model = TextVQVAE(
             small_config(
@@ -590,27 +655,45 @@ class TextVQVAEEncoderTest(unittest.TestCase):
         self.assertEqual(model(torch.randint(0, 31, (2, 20)))["logits"].shape, (2, 20, 32))
 
     def test_vqgans_requires_integer_compression_ratio(self):
-        for field in ("encoder_type", "decoder_type"):
-            with self.subTest(field=field):
-                overrides = {field: "vqgans", "max_seq_len": 10, "latent_slots": 4}
-                with self.assertRaisesRegex(ValueError, "integer multiple"):
-                    TextVQVAE(small_config(**overrides))
+        for architecture_type in ("vqgans", "vqganpa"):
+            for field in ("encoder_type", "decoder_type"):
+                with self.subTest(
+                    architecture_type=architecture_type,
+                    field=field,
+                ):
+                    overrides = {
+                        field: architecture_type,
+                        "max_seq_len": 10,
+                        "latent_slots": 4,
+                    }
+                    with self.assertRaisesRegex(ValueError, "integer multiple"):
+                        TextVQVAE(small_config(**overrides))
 
-    def test_vqgans_encoder_masks_padding_before_strided_conv(self):
-        model = TextVQVAE(small_config(encoder_type="vqgans"))
-        model.eval()
-        attention_mask = torch.tensor(
-            [[1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]]
-        )
-        first = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]])
-        second = first.clone()
-        second[:, 6:] = torch.tensor([13, 14, 15, 16, 17, 18])
+    def test_vqgan_encoders_mask_padding_before_strided_conv(self):
+        for encoder_type in ("vqgans", "vqganpa"):
+            with self.subTest(encoder_type=encoder_type):
+                model = TextVQVAE(small_config(encoder_type=encoder_type))
+                model.eval()
+                attention_mask = torch.tensor(
+                    [[1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]]
+                )
+                first = torch.tensor(
+                    [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]]
+                )
+                second = first.clone()
+                second[:, 6:] = torch.tensor([13, 14, 15, 16, 17, 18])
 
-        with torch.no_grad():
-            first_latents = model.encode(first, attention_mask=attention_mask)
-            second_latents = model.encode(second, attention_mask=attention_mask)
+                with torch.no_grad():
+                    first_latents = model.encode(
+                        first,
+                        attention_mask=attention_mask,
+                    )
+                    second_latents = model.encode(
+                        second,
+                        attention_mask=attention_mask,
+                    )
 
-        torch.testing.assert_close(first_latents, second_latents)
+                torch.testing.assert_close(first_latents, second_latents)
 
 
 class TextVQVAEPaddingTest(unittest.TestCase):
@@ -1113,22 +1196,24 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertTrue(enabled.l2_normalize_before_vq)
         self.assertFalse(disabled.l2_normalize_before_vq)
 
-    def test_vqgans_encoder_and_decoder_can_be_selected_from_cli(self):
+    def test_vqgan_encoder_and_decoder_variants_can_be_selected_from_cli(self):
         from training.text_vqvae.config import build_configs
 
         tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
-        _, _, model, _ = build_configs(
-            self._parse(
-                "--encoder-type",
-                "vqgans",
-                "--decoder-type",
-                "vqgans",
-            ),
-            tokenizer,
-        )
+        for architecture_type in ("vqgans", "vqganpa"):
+            with self.subTest(architecture_type=architecture_type):
+                _, _, model, _ = build_configs(
+                    self._parse(
+                        "--encoder-type",
+                        architecture_type,
+                        "--decoder-type",
+                        architecture_type,
+                    ),
+                    tokenizer,
+                )
 
-        self.assertEqual(model.encoder_type, "vqgans")
-        self.assertEqual(model.decoder_type, "vqgans")
+                self.assertEqual(model.encoder_type, architecture_type)
+                self.assertEqual(model.decoder_type, architecture_type)
 
     def test_geometry_snapshots_can_be_retained_after_rendering(self):
         from training.text_vqvae.config import build_diagnostics_config
