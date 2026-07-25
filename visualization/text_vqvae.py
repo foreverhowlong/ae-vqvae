@@ -168,7 +168,12 @@ def compare_vector_distributions_pca(
     )
 
 
-def render_pca_comparison(result: PCAComparisonResult, output_path: str | Path) -> Path:
+def render_pca_comparison(
+    result: PCAComparisonResult,
+    output_path: str | Path,
+    *,
+    run_name: str | None = None,
+) -> Path:
     """Render a PCA comparison result to a PNG file."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,7 +238,17 @@ def render_pca_comparison(result: PCAComparisonResult, output_path: str | Path) 
         ax.set_title("Text VQ-VAE initialization: encoder outputs vs. codebook")
         ax.grid(True, alpha=0.2)
         ax.legend(frameon=True)
-        fig.tight_layout()
+        if run_name:
+            fig.text(
+                0.995,
+                0.995,
+                f"run: {run_name}",
+                ha="right",
+                va="top",
+                fontsize=7,
+                color="0.35",
+            )
+        fig.tight_layout(rect=(0, 0, 1, 0.985))
         fig.savefig(output_path, dpi=180, bbox_inches="tight")
     finally:
         plt.close(fig)

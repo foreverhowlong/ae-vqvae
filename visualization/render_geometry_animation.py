@@ -77,6 +77,8 @@ def render_frame(
     pca: PCA,
     output_path: Path,
     scales: AnimationScales,
+    *,
+    run_name: str | None = None,
 ) -> None:
     with np.load(path) as data:
         encoder = data["z_e"].astype(np.float32)
@@ -153,6 +155,11 @@ def render_frame(
         x=.5,
         y=.975,
     )
+    if run_name:
+        fig.text(
+            .995, .995, f"run: {run_name}",
+            ha="right", va="top", fontsize=7, color="0.35",
+        )
     fig.subplots_adjust(left=.075, right=.975, bottom=.075, top=.91, wspace=.22, hspace=.28)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=140)
@@ -227,7 +234,14 @@ def _fixed_bin_edges(values: np.ndarray, count: int) -> np.ndarray:
     return np.linspace(low - margin, high + margin, count + 1)
 
 
-def render_code_trajectories(snapshots, pca: PCA, output_path: Path, random_state: int = 0) -> None:
+def render_code_trajectories(
+    snapshots,
+    pca: PCA,
+    output_path: Path,
+    random_state: int = 0,
+    *,
+    run_name: str | None = None,
+) -> None:
     with np.load(snapshots[-1][1]) as final:
         wins = np.bincount(final["assignments"].astype(np.int64), minlength=len(final["codebook"]))
     top = np.argsort(wins)[-min(16, len(wins)):][::-1]
@@ -253,12 +267,22 @@ def render_code_trajectories(snapshots, pca: PCA, output_path: Path, random_stat
         ax.annotate(str(code_id), tracks[-1, column], fontsize=7, color=color)
     ax.set(title="Code trajectories in the shared PCA basis\n(top-16 final winners + up to 16 final dead codes)", xlabel="PC1", ylabel="PC2")
     ax.grid(alpha=.2)
-    fig.tight_layout()
+    if run_name:
+        fig.text(
+            .995, .995, f"run: {run_name}",
+            ha="right", va="top", fontsize=7, color="0.35",
+        )
+    fig.tight_layout(rect=(0, 0, 1, .985))
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
 
-def render_metric_series(run_dir: Path, output_path: Path) -> None:
+def render_metric_series(
+    run_dir: Path,
+    output_path: Path,
+    *,
+    run_name: str | None = None,
+) -> None:
     rows = []
     with (run_dir / "metrics.jsonl").open(encoding="utf-8") as handle:
         for line in handle:
@@ -278,7 +302,12 @@ def render_metric_series(run_dir: Path, output_path: Path) -> None:
         ax.grid(alpha=.2)
     for ax in axes.flat[len(keys):]:
         ax.axis("off")
-    fig.tight_layout()
+    if run_name:
+        fig.text(
+            .995, .995, f"run: {run_name}",
+            ha="right", va="top", fontsize=7, color="0.35",
+        )
+    fig.tight_layout(rect=(0, 0, 1, .985))
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
 
@@ -318,6 +347,7 @@ def render_run(
     pca = fit_shared_pca(snapshots, basis)
     scales = compute_animation_scales(snapshots, pca)
     plots_dir = run_dir / "plots"
+    run_name = run_dir.name
     frames_dir = plots_dir / "geometry_frames"
     if frames_dir.exists():
         shutil.rmtree(frames_dir)
@@ -325,12 +355,24 @@ def render_run(
     frame_paths = []
     for frame_index, (step, path) in enumerate(snapshots):
         frame_path = frames_dir / f"frame{frame_index:06d}.png"
-        render_frame(step, path, pca, frame_path, scales)
+        render_frame(
+            step,
+            path,
+            pca,
+            frame_path,
+            scales,
+            run_name=run_name,
+        )
         frame_paths.append(frame_path)
     trajectory_path = plots_dir / "geometry_code_trajectories.png"
     metrics_path = plots_dir / "geometry_metrics.png"
-    render_code_trajectories(snapshots, pca, trajectory_path)
-    render_metric_series(run_dir, metrics_path)
+    render_code_trajectories(
+        snapshots,
+        pca,
+        trajectory_path,
+        run_name=run_name,
+    )
+    render_metric_series(run_dir, metrics_path, run_name=run_name)
     animation_path = assemble_animation(frame_paths, plots_dir, fps)
     if not keep_frames:
         shutil.rmtree(frames_dir)
