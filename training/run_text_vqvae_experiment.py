@@ -211,6 +211,8 @@ def main():
     config_payload["compression"] = {
         "tokens_per_example": model_cfg.max_seq_len,
         "latent_slots": model_cfg.latent_slots,
+        "embedding_dim": model_cfg.d_model,
+        "latent_dim": model_cfg.resolved_latent_dim,
         "nominal_token_to_latent_ratio": model_cfg.max_seq_len / model_cfg.latent_slots,
     }
     config_payload["data"]["train_examples"] = len(train_dataset)
@@ -222,6 +224,10 @@ def main():
     print(f"[Device] {device}")
     print(f"[Params] {param_count:,}")
     print(f"[Bottleneck] {model_cfg.bottleneck_type}")
+    print(
+        f"[Dimensions] embedding={model_cfg.d_model} "
+        f"latent={model_cfg.resolved_latent_dim}"
+    )
     print(f"[Tokenizer] {train_cfg.tokenizer} vocab={tokenizer.vocab_size} pad={tokenizer.pad_token_id}")
     print(f"[Data] train={len(train_dataset)} eval={len(val_dataset)}")
     print(f"[Output] {run_dir}")

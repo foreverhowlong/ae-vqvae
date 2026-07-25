@@ -683,6 +683,47 @@ class CheckpointRetentionTest(unittest.TestCase):
 
 
 class TextVQVAEDecoderTest(unittest.TestCase):
+    def test_embedding_and_latent_dimensions_can_be_controlled_independently(self):
+        for bottleneck_type in ("vq", "continuous"):
+            with self.subTest(bottleneck_type=bottleneck_type):
+                model = TextVQVAE(
+                    small_config(
+                        bottleneck_type=bottleneck_type,
+                        latent_dim=7,
+                    )
+                )
+                input_ids = torch.randint(0, 31, (2, 12))
+                outputs = model(input_ids)
+
+                self.assertEqual(model.token_embedding.embedding_dim, 16)
+                self.assertEqual(model.latent_dim, 7)
+                self.assertEqual(model.latent_proj.in_features, 16)
+                self.assertEqual(model.latent_proj.out_features, 7)
+                self.assertIsInstance(model.decoder_input_proj, nn.Linear)
+                self.assertEqual(model.decoder_input_proj.in_features, 7)
+                self.assertEqual(model.decoder_input_proj.out_features, 16)
+                self.assertEqual(outputs["z_e"].shape, (2, 4, 7))
+                self.assertEqual(outputs["z_latent"].shape, (2, 4, 7))
+                self.assertEqual(outputs["logits"].shape, (2, 12, 32))
+                if bottleneck_type == "vq":
+                    self.assertEqual(
+                        model.quantizer.codebook.weight.shape,
+                        (8, 7),
+                    )
+                else:
+                    self.assertIsNone(model.quantizer)
+
+                outputs["logits"].sum().backward()
+                self.assertIsNotNone(model.latent_proj.weight.grad)
+                self.assertIsNotNone(model.decoder_input_proj.weight.grad)
+
+    def test_default_latent_dimension_still_follows_d_model(self):
+        model = TextVQVAE(small_config())
+
+        self.assertEqual(model.latent_dim, 16)
+        self.assertIsInstance(model.decoder_input_proj, nn.Identity)
+        self.assertEqual(model.quantizer.codebook.weight.shape, (8, 16))
+
     def test_continuous_bottleneck_bypasses_quantization_and_vq_losses(self):
         model = TextVQVAE(small_config(bottleneck_type="continuous"))
         input_ids = torch.randint(0, 31, (2, 12))
@@ -718,6 +759,10 @@ class TextVQVAEDecoderTest(unittest.TestCase):
     def test_unknown_bottleneck_type_fails_fast(self):
         with self.assertRaisesRegex(ValueError, "Unknown bottleneck_type"):
             TextVQVAE(small_config(bottleneck_type="unknown"))
+
+    def test_nonpositive_latent_dimension_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "latent_dim must be positive"):
+            TextVQVAE(small_config(latent_dim=0))
 
     def test_all_decoders_forward_and_backward(self):
         for decoder_type in DECODER_TYPES:
@@ -1519,6 +1564,8 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(model.slot_pad_ratio_threshold, 0.5)
         self.assertEqual(model.codebook_size, 3072)
         self.assertEqual(model.d_model, 448)
+        self.assertIsNone(model.latent_dim)
+        self.assertEqual(model.resolved_latent_dim, 448)
         self.assertEqual(model.max_seq_len, 256)
         self.assertEqual(model.bottleneck_type, "vq")
         self.assertEqual(model.encoder_type, "rope")
@@ -1575,6 +1622,24 @@ class ConfigDefaultsTest(unittest.TestCase):
 
         self.assertTrue(enabled.l2_normalize_before_vq)
         self.assertFalse(disabled.l2_normalize_before_vq)
+
+    def test_embedding_and_latent_dimensions_can_be_selected_from_cli(self):
+        from training.text_vqvae.config import build_configs
+
+        tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
+        _, _, model, _ = build_configs(
+            self._parse(
+                "--d-model",
+                "96",
+                "--latent-dim",
+                "24",
+            ),
+            tokenizer,
+        )
+
+        self.assertEqual(model.d_model, 96)
+        self.assertEqual(model.latent_dim, 24)
+        self.assertEqual(model.resolved_latent_dim, 24)
 
     def test_continuous_bottleneck_can_be_selected_from_cli(self):
         from training.text_vqvae.config import build_configs

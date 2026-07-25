@@ -81,6 +81,13 @@ class TextVQVAEConfig:
     pad_token_id: int = 257
     slot_pad_ratio_threshold: float = 0.5
     l2_normalize_before_vq: bool = False
+    # None preserves the historical behavior where latent width follows d_model.
+    latent_dim: int | None = None
+
+    @property
+    def resolved_latent_dim(self) -> int:
+        return self.d_model if self.latent_dim is None else self.latent_dim
+
 
 @dataclass
 class CollapseControlConfig:

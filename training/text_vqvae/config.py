@@ -164,6 +164,12 @@ def add_arguments(parser) -> None:
     g.add_argument("--latent-slots", type=int, default=None)
     g.add_argument("--slot-pad-ratio-threshold", type=float, default=None)
     g.add_argument("--d-model", type=int, default=None)
+    g.add_argument(
+        "--latent-dim",
+        type=int,
+        default=None,
+        help="Latent/codebook vector width. When unset, follows d-model.",
+    )
     g.add_argument("--n-heads", type=int, default=None)
     g.add_argument("--encoder-layers", type=int, default=None)
     g.add_argument(
@@ -432,6 +438,7 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
         "latent_slots": getattr(args, "latent_slots", None),
         "slot_pad_ratio_threshold": getattr(args, "slot_pad_ratio_threshold", None),
         "d_model": getattr(args, "d_model", None),
+        "latent_dim": getattr(args, "latent_dim", None),
         "n_heads": getattr(args, "n_heads", None),
         "encoder_layers": getattr(args, "encoder_layers", None),
         "encoder_type": getattr(args, "encoder_type", None),

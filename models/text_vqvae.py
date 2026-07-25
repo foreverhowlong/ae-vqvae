@@ -182,12 +182,17 @@ class TextVQVAE(nn.Module):
         super().__init__()
         if config.bottleneck_type not in ("vq", "continuous"):
             raise ValueError(f"Unknown bottleneck_type {config.bottleneck_type!r}.")
+        if config.resolved_latent_dim < 1:
+            raise ValueError(
+                f"latent_dim must be positive, got {config.resolved_latent_dim}."
+            )
         if not 0.0 <= config.slot_pad_ratio_threshold < 1.0:
             raise ValueError(
                 "slot_pad_ratio_threshold must be in [0, 1), got "
                 f"{config.slot_pad_ratio_threshold}."
             )
         self.config = config
+        self.latent_dim = config.resolved_latent_dim
         self.collapse_config = collapse_config or CollapseControlConfig()
         if config.bottleneck_type == "continuous":
             active_vq_controls = any((
@@ -212,15 +217,20 @@ class TextVQVAE(nn.Module):
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.encoder: TextEncoder = build_text_encoder(config)
-        self.latent_proj = nn.Linear(config.d_model, config.d_model)
+        self.latent_proj = nn.Linear(config.d_model, self.latent_dim)
         self.quantizer = (
             VectorQuantizer(
                 config.codebook_size,
-                config.d_model,
+                self.latent_dim,
                 self.collapse_config,
             )
             if config.bottleneck_type == "vq"
             else None
+        )
+        self.decoder_input_proj = (
+            nn.Identity()
+            if self.latent_dim == config.d_model
+            else nn.Linear(self.latent_dim, config.d_model)
         )
         self.decoder_impl: TextDecoder = build_text_decoder(config)
         self.output_head = nn.Linear(config.d_model, config.vocab_size)
@@ -249,7 +259,12 @@ class TextVQVAE(nn.Module):
         return latents
 
     def decode(self, latents: torch.Tensor, seq_len: int):
-        return self.output_head(self.decoder_impl(latents, seq_len))
+        if latents.shape[-1] != self.latent_dim:
+            raise ValueError(
+                f"Expected latent dimension {self.latent_dim}, got {latents.shape[-1]}."
+            )
+        hidden = self.decoder_input_proj(latents)
+        return self.output_head(self.decoder_impl(hidden, seq_len))
 
     @property
     def encoder_pos_embedding(self):
