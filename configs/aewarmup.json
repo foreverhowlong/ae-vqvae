@@ -1,0 +1,17 @@
+{
+  "module": "training.run_text_vqvae_experiment",
+  "experiments": [
+    {
+      "encoder-type": "rope",
+      "use-ema-codebook":true,
+      "latent_dim": 32,
+      "ae_warmup_steps": 3000
+    },
+    {
+      "encoder-type": "rope",
+      "use-ema-codebook":true,
+      "ae_warmup_steps": 3000
+    }
+  ],
+  "_comments": "尝试使用aewarmup"
+}
