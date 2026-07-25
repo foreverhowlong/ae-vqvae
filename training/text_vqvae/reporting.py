@@ -130,6 +130,7 @@ def plot_training_curves(
     eval_rows = [r for r in rows if r["split"] == "eval"]
     train_window_rows = [r for r in rows if r["split"] == "train_window"]
     probe_rows = [r for r in rows if r["split"] == "codebook_probe"]
+    geometry_rows = [r for r in rows if r["split"] == "geometry"]
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
@@ -165,18 +166,20 @@ def plot_training_curves(
             [r["eval_utilization"] for r in probe_rows],
             label="eval probe, current codebook (matched N)",
         )
-    else:
+    elif any("codebook_utilization" in r for r in train_rows + eval_rows):
         # Compatibility fallback for metrics written before matched probes.
-        if train_rows:
+        vq_train_rows = [r for r in train_rows if "codebook_utilization" in r]
+        if vq_train_rows:
             axes[1, 1].plot(
-                [r["step"] for r in train_rows],
-                [r["codebook_utilization"] for r in train_rows],
+                [r["step"] for r in vq_train_rows],
+                [r["codebook_utilization"] for r in vq_train_rows],
                 label="train batch, current codebook",
             )
-        if eval_rows:
+        vq_eval_rows = [r for r in eval_rows if "codebook_utilization" in r]
+        if vq_eval_rows:
             axes[1, 1].plot(
-                [r["step"] for r in eval_rows],
-                [r["codebook_utilization"] for r in eval_rows],
+                [r["step"] for r in vq_eval_rows],
+                [r["codebook_utilization"] for r in vq_eval_rows],
                 label="eval full-set, current codebook",
             )
 
@@ -202,6 +205,10 @@ def plot_training_curves(
             alpha=0.7,
             label="eval batch mean, current codebook",
         )
+    has_codebook_curves = bool(
+        probe_rows or train_window_rows or eval_batch_rows or frozen_c0_rows
+        or any("codebook_utilization" in r for r in train_rows + eval_rows)
+    )
     if frozen_c0_rows:
         axes[1, 1].plot(
             [r["step"] for r in frozen_c0_rows],
@@ -213,10 +220,29 @@ def plot_training_curves(
         utilization_title = (
             "Codebook utilization: current codebook vs frozen K-means C0"
         )
-    else:
+    elif has_codebook_curves:
         utilization_title = "Codebook utilization: current codebook"
+    else:
+        latent_rows = [
+            r for r in geometry_rows if "encoder_mean_norm" in r
+        ]
+        if latent_rows:
+            axes[1, 1].plot(
+                [r["step"] for r in latent_rows],
+                [r["encoder_mean_norm"] for r in latent_rows],
+                label="encoder latent mean norm",
+            )
+            axes[1, 1].plot(
+                [r["step"] for r in latent_rows],
+                [r["encoder_norm_std"] for r in latent_rows],
+                label="encoder latent norm std",
+            )
+            utilization_title = "Continuous bottleneck: latent norm dynamics"
+        else:
+            utilization_title = "Codebook metrics not applicable (continuous bottleneck)"
     axes[1, 1].set_title(utilization_title)
-    axes[1, 1].legend()
+    if axes[1, 1].lines:
+        axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
 
     _add_run_label(fig, run_name)
@@ -272,6 +298,13 @@ def run_initial_pca(
     strict: bool,
 ) -> None:
     if not enabled:
+        return
+    if model.quantizer is None:
+        config_payload["diagnostics"]["initial_pca"].update({
+            "status": "not_applicable",
+            "reason": "continuous bottleneck has no codebook",
+        })
+        print("[Initial PCA] skipped: continuous bottleneck has no codebook.")
         return
 
     pca_path = run_dir / "plots" / "initial_latent_codebook_pca.png"

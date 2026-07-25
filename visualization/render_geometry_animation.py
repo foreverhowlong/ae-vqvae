@@ -61,14 +61,20 @@ def fit_shared_pca(
     for _, path in selected:
         with np.load(path) as data:
             encoders.append(data["z_e"].astype(np.float32))
-            codebooks.append(data["codebook"].astype(np.float32))
+            if "codebook" in data:
+                codebooks.append(data["codebook"].astype(np.float32))
     encoder = np.concatenate(encoders)
-    codebook = np.concatenate(codebooks)
-    count = min(len(encoder), len(codebook), max_fit_points)
     rng = np.random.default_rng(random_state)
-    encoder_fit = encoder[rng.choice(len(encoder), count, replace=False)]
-    codebook_fit = codebook[rng.choice(len(codebook), count, replace=False)]
-    return PCA(n_components=2).fit(np.concatenate([encoder_fit, codebook_fit]))
+    if codebooks:
+        codebook = np.concatenate(codebooks)
+        count = min(len(encoder), len(codebook), max_fit_points)
+        encoder_fit = encoder[rng.choice(len(encoder), count, replace=False)]
+        codebook_fit = codebook[rng.choice(len(codebook), count, replace=False)]
+        fit_points = np.concatenate([encoder_fit, codebook_fit])
+    else:
+        count = min(len(encoder), max_fit_points)
+        fit_points = encoder[rng.choice(len(encoder), count, replace=False)]
+    return PCA(n_components=2).fit(fit_points)
 
 
 def render_frame(
@@ -82,6 +88,20 @@ def render_frame(
 ) -> None:
     with np.load(path) as data:
         encoder = data["z_e"].astype(np.float32)
+        if "codebook" not in data:
+            slot_indices = data["slot_indices"].astype(np.int64)
+            pad_ratios = data["pad_ratios"].astype(np.float32)
+            _render_continuous_frame(
+                step,
+                encoder,
+                slot_indices,
+                pad_ratios,
+                pca,
+                output_path,
+                scales,
+                run_name=run_name,
+            )
+            return
         codebook = data["codebook"].astype(np.float32)
         assignments = data["assignments"].astype(np.int64)
     wins = np.bincount(assignments, minlength=len(codebook))
@@ -166,12 +186,108 @@ def render_frame(
     plt.close(fig)
 
 
+def _render_continuous_frame(
+    step: int,
+    encoder: np.ndarray,
+    slot_indices: np.ndarray,
+    pad_ratios: np.ndarray,
+    pca: PCA,
+    output_path: Path,
+    scales: AnimationScales,
+    *,
+    run_name: str | None = None,
+) -> None:
+    """Render latent-only diagnostics for a continuous autoencoder."""
+    encoder_2d = pca.transform(encoder)
+    norms = np.linalg.norm(encoder, axis=1)
+    unique_slots = np.unique(slot_indices)
+    slot_mean_norms = [
+        float(norms[slot_indices == slot].mean()) for slot in unique_slots
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+    scatter = axes[0, 0].scatter(
+        encoder_2d[:, 0],
+        encoder_2d[:, 1],
+        c=slot_indices,
+        cmap="viridis",
+        s=8,
+        alpha=.28,
+        linewidths=0,
+        rasterized=True,
+    )
+    axes[0, 0].set(
+        xlim=scales.pca_xlim,
+        ylim=scales.pca_ylim,
+        title="Shared-basis PCA of continuous encoder latents",
+        xlabel="PC1",
+        ylabel="PC2",
+    )
+    fig.colorbar(scatter, ax=axes[0, 0], label="latent slot")
+
+    axes[0, 1].hist(
+        norms,
+        bins=scales.norm_bins,
+        color="#4C78A8",
+        alpha=.75,
+        density=True,
+    )
+    axes[0, 1].set(
+        xlim=(scales.norm_bins[0], scales.norm_bins[-1]),
+        ylim=scales.norm_ylim,
+        title="Continuous latent vector norms",
+        xlabel="L2 norm",
+        ylabel="density",
+    )
+
+    axes[1, 0].plot(unique_slots, slot_mean_norms, marker=".", color="#F58518")
+    axes[1, 0].set(
+        title="Mean latent norm by slot",
+        xlabel="latent slot",
+        ylabel="mean L2 norm",
+    )
+
+    axes[1, 1].scatter(
+        pad_ratios,
+        norms,
+        s=8,
+        alpha=.22,
+        color="#54A24B",
+        linewidths=0,
+        rasterized=True,
+    )
+    axes[1, 1].set(
+        title="Padding exposure versus latent norm",
+        xlabel="PAD ratio in receptive segment",
+        ylabel="L2 norm",
+    )
+    for axis in axes.flat:
+        axis.grid(alpha=.2)
+        axis.set_title(axis.get_title(), pad=9)
+    fig.suptitle(
+        f"Continuous AE latent geometry — step {step:,}",
+        fontsize=15,
+        x=.5,
+        y=.975,
+    )
+    if run_name:
+        fig.text(
+            .995, .995, f"run: {run_name}",
+            ha="right", va="top", fontsize=7, color="0.35",
+        )
+    fig.subplots_adjust(left=.075, right=.975, bottom=.075, top=.91, wspace=.28, hspace=.28)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=140)
+    plt.close(fig)
+
+
 def projection_limits(snapshots, pca: PCA):
     points = []
     for _, path in snapshots:
         with np.load(path) as data:
             points.append(pca.transform(data["z_e"].astype(np.float32)))
-            points.append(pca.transform(data["codebook"].astype(np.float32)))
+            if "codebook" in data:
+                points.append(pca.transform(data["codebook"].astype(np.float32)))
     merged = np.concatenate(points)
     low = np.quantile(merged, .002, axis=0)
     high = np.quantile(merged, .998, axis=0)
@@ -190,28 +306,39 @@ def compute_animation_scales(snapshots, pca: PCA) -> AnimationScales:
     for _, path in snapshots:
         with np.load(path) as data:
             encoder = data["z_e"].astype(np.float32)
-            codebook = data["codebook"].astype(np.float32)
-            assignments = data["assignments"].astype(np.int64)
-        encoder_norm_frames.append(np.linalg.norm(encoder, axis=1))
-        codebook_norm_frames.append(np.linalg.norm(codebook, axis=1))
-        nearest_distance_frames.append(np.linalg.norm(encoder - codebook[assignments], axis=1))
-        wins = np.bincount(assignments, minlength=len(codebook))
-        maximum_win_count = max(maximum_win_count, int(wins.max(initial=0)))
-        codebook_size = max(codebook_size, len(codebook))
+            encoder_norm_frames.append(np.linalg.norm(encoder, axis=1))
+            if "codebook" in data:
+                codebook = data["codebook"].astype(np.float32)
+                assignments = data["assignments"].astype(np.int64)
+                codebook_norm_frames.append(np.linalg.norm(codebook, axis=1))
+                nearest_distance_frames.append(
+                    np.linalg.norm(encoder - codebook[assignments], axis=1)
+                )
+                wins = np.bincount(assignments, minlength=len(codebook))
+                maximum_win_count = max(
+                    maximum_win_count, int(wins.max(initial=0))
+                )
+                codebook_size = max(codebook_size, len(codebook))
 
     encoder_norms = np.concatenate(encoder_norm_frames)
-    codebook_norms = np.concatenate(codebook_norm_frames)
-    nearest_distances = np.concatenate(nearest_distance_frames)
-    norm_bins = _fixed_bin_edges(np.concatenate([encoder_norms, codebook_norms]), 50)
-    nearest_bins = _fixed_bin_edges(nearest_distances, 60)
+    all_norms = encoder_norms
+    if codebook_norm_frames:
+        all_norms = np.concatenate([encoder_norms, *codebook_norm_frames])
+    norm_bins = _fixed_bin_edges(all_norms, 50)
     norm_density_max = max(
         float(np.histogram(values, bins=norm_bins, density=True)[0].max(initial=0))
         for values in encoder_norm_frames + codebook_norm_frames
     )
-    nearest_count_max = max(
-        int(np.histogram(values, bins=nearest_bins)[0].max(initial=0))
-        for values in nearest_distance_frames
-    )
+    if nearest_distance_frames:
+        nearest_distances = np.concatenate(nearest_distance_frames)
+        nearest_bins = _fixed_bin_edges(nearest_distances, 60)
+        nearest_count_max = max(
+            int(np.histogram(values, bins=nearest_bins)[0].max(initial=0))
+            for values in nearest_distance_frames
+        )
+    else:
+        nearest_bins = np.linspace(0.0, 1.0, 61)
+        nearest_count_max = 1
     return AnimationScales(
         pca_xlim=pca_xlim,
         pca_ylim=pca_ylim,
@@ -267,6 +394,57 @@ def render_code_trajectories(
         ax.annotate(str(code_id), tracks[-1, column], fontsize=7, color=color)
     ax.set(title="Code trajectories in the shared PCA basis\n(top-16 final winners + up to 16 final dead codes)", xlabel="PC1", ylabel="PC2")
     ax.grid(alpha=.2)
+    if run_name:
+        fig.text(
+            .995, .995, f"run: {run_name}",
+            ha="right", va="top", fontsize=7, color="0.35",
+        )
+    fig.tight_layout(rect=(0, 0, 1, .985))
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def render_latent_centroid_trajectory(
+    snapshots,
+    pca: PCA,
+    output_path: Path,
+    *,
+    run_name: str | None = None,
+) -> None:
+    """Render continuous-latent center and spread dynamics across snapshots."""
+    steps = []
+    centroids = []
+    mean_norms = []
+    norm_stds = []
+    for step, path in snapshots:
+        with np.load(path) as data:
+            encoder = data["z_e"].astype(np.float32)
+        steps.append(step)
+        centroids.append(encoder.mean(axis=0))
+        norms = np.linalg.norm(encoder, axis=1)
+        mean_norms.append(float(norms.mean()))
+        norm_stds.append(float(norms.std()))
+    projected = pca.transform(np.stack(centroids))
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    axes[0].plot(projected[:, 0], projected[:, 1], marker="o", color="#4C78A8")
+    for index in {0, len(steps) - 1}:
+        axes[0].annotate(f"step {steps[index]:,}", projected[index], fontsize=8)
+    axes[0].set(
+        title="Continuous latent centroid trajectory in shared PCA basis",
+        xlabel="PC1",
+        ylabel="PC2",
+    )
+    axes[1].plot(steps, mean_norms, label="mean norm", color="#F58518")
+    axes[1].plot(steps, norm_stds, label="norm std", color="#54A24B")
+    axes[1].set(
+        title="Continuous latent norm dynamics",
+        xlabel="step",
+        ylabel="L2 norm",
+    )
+    axes[1].legend()
+    for axis in axes:
+        axis.grid(alpha=.2)
     if run_name:
         fig.text(
             .995, .995, f"run: {run_name}",
@@ -344,6 +522,8 @@ def render_run(
     keep_frames: bool = False,
 ) -> dict[str, Path]:
     snapshots = load_snapshots(run_dir)
+    with np.load(snapshots[0][1]) as first_snapshot:
+        has_codebook = "codebook" in first_snapshot
     pca = fit_shared_pca(snapshots, basis)
     scales = compute_animation_scales(snapshots, pca)
     plots_dir = run_dir / "plots"
@@ -364,14 +544,26 @@ def render_run(
             run_name=run_name,
         )
         frame_paths.append(frame_path)
-    trajectory_path = plots_dir / "geometry_code_trajectories.png"
-    metrics_path = plots_dir / "geometry_metrics.png"
-    render_code_trajectories(
-        snapshots,
-        pca,
-        trajectory_path,
-        run_name=run_name,
+    trajectory_path = plots_dir / (
+        "geometry_code_trajectories.png"
+        if has_codebook
+        else "continuous_latent_trajectory.png"
     )
+    metrics_path = plots_dir / "geometry_metrics.png"
+    if has_codebook:
+        render_code_trajectories(
+            snapshots,
+            pca,
+            trajectory_path,
+            run_name=run_name,
+        )
+    else:
+        render_latent_centroid_trajectory(
+            snapshots,
+            pca,
+            trajectory_path,
+            run_name=run_name,
+        )
     render_metric_series(run_dir, metrics_path, run_name=run_name)
     animation_path = assemble_animation(frame_paths, plots_dir, fps)
     if not keep_frames:

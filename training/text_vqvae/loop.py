@@ -182,6 +182,12 @@ def _nearest_code_indices(
 
 def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_clip: float, beta: float, step: int):
     outputs = model(batch["input_ids"], batch["attention_mask"])
+    is_vq = outputs.get("bottleneck_type", "vq") == "vq"
+    codebook_weight = (
+        model.quantizer.codebook.weight
+        if model.quantizer is not None
+        else None
+    )
     losses = text_vqvae_losses(
         outputs,
         batch["input_ids"],
@@ -189,7 +195,7 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
         beta=beta,
         attention_mask=batch["attention_mask"],
         collapse_config=collapse_config,
-        codebook_weight=model.quantizer.codebook.weight,
+        codebook_weight=codebook_weight,
     )
     optimizer.zero_grad(set_to_none=True)
     losses["total"].backward()
@@ -200,6 +206,7 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
     if (
         collapse_config.dead_code_reset_every > 0
         and step % collapse_config.dead_code_reset_every == 0
+        and model.quantizer is not None
         and hasattr(model.quantizer, "reset_dead_codes")
     ):
         reset_count = model.quantizer.reset_dead_codes(
@@ -214,19 +221,28 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
         model_config.pad_token_id,
         attention_mask=batch["attention_mask"],
     )
-    stats = codebook_stats(outputs["indices"], model_config.codebook_size, valid_mask=outputs["latent_mask"])
-    assignment_count = int(stats["counts"].sum().item())
-    return {
+    metrics = {
         "loss": losses["total"].item(),
         "recon_nll": losses["recon"].item(),
+        "token_accuracy": correct / max(total, 1),
+        "grad_norm": float(grad_norm),
+    }
+    if not is_vq:
+        return metrics
+
+    stats = codebook_stats(
+        outputs["indices"],
+        model_config.codebook_size,
+        valid_mask=outputs["latent_mask"],
+    )
+    assignment_count = int(stats["counts"].sum().item())
+    metrics.update({
         "codebook_loss": losses["codebook"].item(),
         "commitment_loss": losses["commitment"].item(),
         "entropy_loss": losses["entropy"].item(),
         "assignment_entropy": losses["normalized_assignment_entropy"].item(),
         "diversity_loss": losses["diversity"].item(),
         "commitment_beta": beta,
-        "token_accuracy": correct / max(total, 1),
-        "grad_norm": float(grad_norm),
         # Compatibility field: this is the utilization of one training batch.
         "codebook_utilization": stats["utilization"],
         "codebook_utilization_batch": stats["utilization"],
@@ -238,7 +254,8 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
             total,
         ),
         "dead_code_resets": reset_count,
-    }
+    })
+    return metrics
 
 
 @torch.no_grad()
@@ -255,6 +272,7 @@ def evaluate(
     frozen_codebook_c0: torch.Tensor | None = None,
 ):
     was_training = model.training
+    is_vq = model_config.bottleneck_type == "vq"
     total_loss = 0.0
     total_recon = 0.0
     total_codebook = 0.0
@@ -279,6 +297,11 @@ def evaluate(
         for batch in data_loader:
             batch = batch_to_device(batch, device)
             outputs = model(batch["input_ids"], batch["attention_mask"])
+            codebook_weight = (
+                model.quantizer.codebook.weight
+                if model.quantizer is not None
+                else None
+            )
             losses = text_vqvae_losses(
                 outputs,
                 batch["input_ids"],
@@ -286,7 +309,7 @@ def evaluate(
                 beta=beta,
                 attention_mask=batch["attention_mask"],
                 collapse_config=collapse_config,
-                codebook_weight=model.quantizer.codebook.weight,
+                codebook_weight=codebook_weight,
             )
             correct, tokens = compute_accuracy(
                 outputs["logits"],
@@ -297,33 +320,36 @@ def evaluate(
 
             total_loss += losses["total"].item()
             total_recon += losses["recon"].item()
-            total_codebook += losses["codebook"].item()
-            total_commit += losses["commitment"].item()
-            total_entropy += losses["entropy"].item()
-            total_assignment_entropy += losses["normalized_assignment_entropy"].item()
-            total_diversity += losses["diversity"].item()
             total_correct += correct
             total_tokens += tokens
-            all_indices.append(outputs["indices"].detach().cpu())
-            all_latent_masks.append(outputs["latent_mask"].detach().cpu())
-            if frozen_codebook_c0 is not None:
-                frozen_c0_indices.append(
-                    _nearest_code_indices(
-                        outputs["z_e"],
-                        outputs["latent_mask"],
-                        frozen_codebook_c0,
-                        normalize_latents=collapse_config.normalize_latents,
-                    ).cpu()
+            if is_vq:
+                total_codebook += losses["codebook"].item()
+                total_commit += losses["commitment"].item()
+                total_entropy += losses["entropy"].item()
+                total_assignment_entropy += losses[
+                    "normalized_assignment_entropy"
+                ].item()
+                total_diversity += losses["diversity"].item()
+                all_indices.append(outputs["indices"].detach().cpu())
+                all_latent_masks.append(outputs["latent_mask"].detach().cpu())
+                if frozen_codebook_c0 is not None:
+                    frozen_c0_indices.append(
+                        _nearest_code_indices(
+                            outputs["z_e"],
+                            outputs["latent_mask"],
+                            frozen_codebook_c0,
+                            normalize_latents=collapse_config.normalize_latents,
+                        ).cpu()
+                    )
+                batch_stats = codebook_stats(
+                    outputs["indices"],
+                    model_config.codebook_size,
+                    valid_mask=outputs["latent_mask"],
                 )
-            batch_stats = codebook_stats(
-                outputs["indices"],
-                model_config.codebook_size,
-                valid_mask=outputs["latent_mask"],
-            )
-            batch_utilizations.append(batch_stats["utilization"])
-            batch_assignment_counts.append(
-                int(batch_stats["counts"].sum().item())
-            )
+                batch_utilizations.append(batch_stats["utilization"])
+                batch_assignment_counts.append(
+                    int(batch_stats["counts"].sum().item())
+                )
             batch_example_counts.append(int(batch["input_ids"].shape[0]))
             batches += 1
             total_examples += int(batch["input_ids"].shape[0])
@@ -341,10 +367,6 @@ def evaluate(
     finally:
         model.train(was_training)
 
-    merged_indices = torch.cat(all_indices, dim=0)
-    merged_latent_masks = torch.cat(all_latent_masks, dim=0)
-    stats = codebook_stats(merged_indices, model_config.codebook_size, valid_mask=merged_latent_masks)
-    assignment_count = int(stats["counts"].sum().item())
     comparison_batch_size = max(batch_example_counts, default=0)
     comparison_batch_indices = [
         index
@@ -357,13 +379,26 @@ def evaluate(
         "loss": total_loss / max(batches, 1),
         "recon_nll": avg_recon,
         "token_ppl": math.exp(min(avg_recon, 20.0)),
+        "token_accuracy": total_correct / max(total_tokens, 1),
+    }
+    if not is_vq:
+        return metrics, reconstruction_rows
+
+    merged_indices = torch.cat(all_indices, dim=0)
+    merged_latent_masks = torch.cat(all_latent_masks, dim=0)
+    stats = codebook_stats(
+        merged_indices,
+        model_config.codebook_size,
+        valid_mask=merged_latent_masks,
+    )
+    assignment_count = int(stats["counts"].sum().item())
+    metrics.update({
         "codebook_loss": total_codebook / max(batches, 1),
         "commitment_loss": total_commit / max(batches, 1),
         "entropy_loss": total_entropy / max(batches, 1),
         "assignment_entropy": total_assignment_entropy / max(batches, 1),
         "diversity_loss": total_diversity / max(batches, 1),
         "commitment_beta": beta,
-        "token_accuracy": total_correct / max(total_tokens, 1),
         # Compatibility field: evaluation utilization is aggregated over the
         # full validation loader.
         "codebook_utilization": stats["utilization"],
@@ -391,7 +426,7 @@ def evaluate(
         "used_codes": stats["used_codes"],
         "dead_codes": stats["dead_codes"],
         "code_counts": stats["counts"].tolist(),
-    }
+    })
     if frozen_codebook_c0 is not None:
         frozen_c0_stats = codebook_stats(
             torch.cat(frozen_c0_indices, dim=0),
@@ -404,6 +439,8 @@ def evaluate(
 @torch.no_grad()
 def evaluate_codebook_usage(model, data_loader, device, model_config):
     """Measure codebook usage in eval mode without running the decoder."""
+    if model.quantizer is None:
+        raise ValueError("Codebook usage is not applicable to a continuous bottleneck.")
     was_training = model.training
     all_indices: list[torch.Tensor] = []
     all_latent_masks: list[torch.Tensor] = []
@@ -535,7 +572,12 @@ def run(
                 metrics_path,
             )
             tracker.log({f"geometry/{k}": v for k, v in geometry_metrics.items()}, step=step)
-            print(f"[Geometry] step={step} used_codes={geometry_metrics['used_codes']}")
+            detail = (
+                f"used_codes={geometry_metrics['used_codes']}"
+                if "used_codes" in geometry_metrics
+                else f"mean_norm={geometry_metrics['encoder_mean_norm']:.3f}"
+            )
+            print(f"[Geometry] step={step} {detail}")
         except Exception as exc:
             if geometry_opts.get("strict", False):
                 raise
@@ -591,12 +633,13 @@ def run(
                     metrics_path,
                 )
                 tracker.log({f"train/{k}": v for k, v in train_metrics.items()}, step=global_step)
-                train_utilization_window.append(
-                    train_metrics["codebook_utilization_batch"]
-                )
-                train_assignment_count_window.append(
-                    train_metrics["codebook_assignment_count"]
-                )
+                if "codebook_utilization_batch" in train_metrics:
+                    train_utilization_window.append(
+                        train_metrics["codebook_utilization_batch"]
+                    )
+                    train_assignment_count_window.append(
+                        train_metrics["codebook_assignment_count"]
+                    )
 
                 if probe_batches is not None and geometry_snapshot_due(
                     global_step,
@@ -607,36 +650,37 @@ def run(
                     take_geometry_snapshot(global_step)
 
                 if global_step == 1 or global_step % train_cfg.eval_every == 0:
-                    train_window_metrics = {
-                        "codebook_utilization_batch_mean": (
-                            sum(train_utilization_window)
-                            / max(len(train_utilization_window), 1)
-                        ),
-                        "codebook_assignment_count_batch_mean": (
-                            sum(train_assignment_count_window)
-                            / max(len(train_assignment_count_window), 1)
-                        ),
-                        "window_batches": len(train_utilization_window),
-                    }
-                    append_jsonl(
-                        {
-                            "split": "train_window",
-                            "epoch": epoch,
-                            "step": global_step,
-                            "elapsed_sec": time.time() - start_time,
-                            **train_window_metrics,
-                        },
-                        metrics_path,
-                    )
-                    tracker.log(
-                        {
-                            f"train/{key}": value
-                            for key, value in train_window_metrics.items()
-                        },
-                        step=global_step,
-                    )
-                    train_utilization_window.clear()
-                    train_assignment_count_window.clear()
+                    if train_utilization_window:
+                        train_window_metrics = {
+                            "codebook_utilization_batch_mean": (
+                                sum(train_utilization_window)
+                                / len(train_utilization_window)
+                            ),
+                            "codebook_assignment_count_batch_mean": (
+                                sum(train_assignment_count_window)
+                                / len(train_assignment_count_window)
+                            ),
+                            "window_batches": len(train_utilization_window),
+                        }
+                        append_jsonl(
+                            {
+                                "split": "train_window",
+                                "epoch": epoch,
+                                "step": global_step,
+                                "elapsed_sec": time.time() - start_time,
+                                **train_window_metrics,
+                            },
+                            metrics_path,
+                        )
+                        tracker.log(
+                            {
+                                f"train/{key}": value
+                                for key, value in train_window_metrics.items()
+                            },
+                            step=global_step,
+                        )
+                        train_utilization_window.clear()
+                        train_assignment_count_window.clear()
 
                     last_eval, reconstruction_rows = evaluate(
                         model,
@@ -702,10 +746,15 @@ def run(
                         best_eval_loss = last_eval["loss"]
                         best_step = global_step
                         save_checkpoint(model, optimizer, global_step, epoch, run_dir, "best.pt")
+                    utilization_detail = (
+                        f" util_full={last_eval['codebook_utilization_full']:.3f}"
+                        if "codebook_utilization_full" in last_eval
+                        else ""
+                    )
                     print(
                         f"[Eval] step={global_step} loss={last_eval['loss']:.4f} "
-                        f"ppl={last_eval['token_ppl']:.2f} acc={last_eval['token_accuracy']:.3f} "
-                        f"util_full={last_eval['codebook_utilization_full']:.3f}"
+                        f"ppl={last_eval['token_ppl']:.2f} acc={last_eval['token_accuracy']:.3f}"
+                        + utilization_detail
                         + (
                             " util_frozen_c0="
                             f"{last_eval['codebook_utilization_frozen_c0']:.3f}"
@@ -755,11 +804,12 @@ def run(
             run_dir / "samples" / "recon_final.jsonl",
         )
         plot_training_curves(metrics_path, run_dir / "plots", run_name=run_name)
-        plot_codebook_usage(
-            last_eval["code_counts"],
-            run_dir / "plots",
-            run_name=run_name,
-        )
+        if "code_counts" in last_eval:
+            plot_codebook_usage(
+                last_eval["code_counts"],
+                run_dir / "plots",
+                run_name=run_name,
+            )
 
         geometry_render = {"status": "disabled", "snapshots_retained": True}
         if probe_batches is not None:

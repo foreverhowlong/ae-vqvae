@@ -157,50 +157,63 @@ def dump_geometry_snapshot(model, probe_batches, step: int, run_dir: Path) -> di
                 )
             encoder = torch.cat(z_chunks)
             pad_ratios = torch.cat(pad_chunks)
-            codebook = model.quantizer.codebook.weight.detach().float().cpu()
+            codebook = (
+                model.quantizer.codebook.weight.detach().float().cpu()
+                if model.quantizer is not None
+                else None
+            )
     finally:
         model.train(was_training)
 
-    nearest_distances = []
-    assignments = []
-    for chunk in encoder.split(512):
-        distances = torch.cdist(chunk, codebook)
-        nearest, indices = distances.min(dim=1)
-        nearest_distances.append(nearest)
-        assignments.append(indices)
-    nearest = torch.cat(nearest_distances)
-    assigned = torch.cat(assignments)
-    wins = torch.bincount(assigned, minlength=len(codebook))
     slot_indices = torch.arange(model.config.latent_slots, dtype=torch.int16).repeat(len(encoder) // model.config.latent_slots)
 
     geometry_dir = Path(run_dir) / "geometry"
     geometry_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        geometry_dir / f"step{step:06d}.npz",
-        z_e=encoder.numpy().astype(np.float16),
-        codebook=codebook.numpy().astype(np.float16),
-        assignments=assigned.numpy().astype(np.int32),
-        pad_ratios=pad_ratios.numpy().astype(np.float16),
-        slot_indices=slot_indices.numpy(),
-    )
+    snapshot = {
+        "z_e": encoder.numpy().astype(np.float16),
+        "pad_ratios": pad_ratios.numpy().astype(np.float16),
+        "slot_indices": slot_indices.numpy(),
+    }
+    if codebook is not None:
+        nearest_distances = []
+        assignments = []
+        for chunk in encoder.split(512):
+            distances = torch.cdist(chunk, codebook)
+            nearest_chunk, indices = distances.min(dim=1)
+            nearest_distances.append(nearest_chunk)
+            assignments.append(indices)
+        nearest = torch.cat(nearest_distances)
+        assigned = torch.cat(assignments)
+        wins = torch.bincount(assigned, minlength=len(codebook))
+        snapshot.update({
+            "codebook": codebook.numpy().astype(np.float16),
+            "assignments": assigned.numpy().astype(np.int32),
+        })
+    np.savez_compressed(geometry_dir / f"step{step:06d}.npz", **snapshot)
 
     norms = encoder.norm(dim=1)
     covariance = torch.cov(encoder.T) if len(encoder) > 1 else torch.zeros((encoder.shape[1], encoder.shape[1]))
     eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0)
     eig_sum = eigenvalues.sum()
     participation_ratio = float(eig_sum.square() / eigenvalues.square().sum().clamp_min(1e-12))
-    return {
+    metrics = {
         "encoder_mean_norm": float(norms.mean()),
         "encoder_norm_std": float(norms.std(unbiased=False)),
         "encoder_pairwise_mean_distance": _mean_pairwise_distance(encoder),
         "participation_ratio": participation_ratio,
-        "nearest_code_distance_p10": float(torch.quantile(nearest, 0.1)),
-        "nearest_code_distance_p50": float(torch.quantile(nearest, 0.5)),
-        "nearest_code_distance_p90": float(torch.quantile(nearest, 0.9)),
-        "used_codes": int((wins > 0).sum()),
-        "win_count_gini": _gini(wins.float()),
-        "centroid_distance": float(torch.linalg.vector_norm(encoder.mean(0) - codebook.mean(0))),
     }
+    if codebook is not None:
+        metrics.update({
+            "nearest_code_distance_p10": float(torch.quantile(nearest, 0.1)),
+            "nearest_code_distance_p50": float(torch.quantile(nearest, 0.5)),
+            "nearest_code_distance_p90": float(torch.quantile(nearest, 0.9)),
+            "used_codes": int((wins > 0).sum()),
+            "win_count_gini": _gini(wins.float()),
+            "centroid_distance": float(
+                torch.linalg.vector_norm(encoder.mean(0) - codebook.mean(0))
+            ),
+        })
+    return metrics
 
 
 def _mean_pairwise_distance(vectors: torch.Tensor) -> float:

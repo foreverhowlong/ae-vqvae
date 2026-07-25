@@ -176,10 +176,12 @@ class VectorQuantizer(nn.Module):
 
 
 class TextVQVAE(nn.Module):
-    """Compresses a byte sequence into discrete latent slots and decodes in parallel."""
+    """Compress a token sequence through VQ or continuous latent slots."""
 
     def __init__(self, config: TextVQVAEConfig, collapse_config: CollapseControlConfig | None = None):
         super().__init__()
+        if config.bottleneck_type not in ("vq", "continuous"):
+            raise ValueError(f"Unknown bottleneck_type {config.bottleneck_type!r}.")
         if not 0.0 <= config.slot_pad_ratio_threshold < 1.0:
             raise ValueError(
                 "slot_pad_ratio_threshold must be in [0, 1), got "
@@ -187,11 +189,39 @@ class TextVQVAE(nn.Module):
             )
         self.config = config
         self.collapse_config = collapse_config or CollapseControlConfig()
+        if config.bottleneck_type == "continuous":
+            active_vq_controls = any((
+                self.collapse_config.use_ema_codebook,
+                self.collapse_config.entropy_weight > 0,
+                self.collapse_config.diversity_weight > 0,
+                self.collapse_config.code_dropout > 0,
+                self.collapse_config.stochastic_code_sampling,
+                self.collapse_config.dead_code_reset_every > 0,
+                self.collapse_config.normalize_latents,
+                self.collapse_config.commitment_beta_start is not None,
+                self.collapse_config.commitment_beta_warmup_steps > 0,
+            ))
+            if config.l2_normalize_before_vq:
+                raise ValueError(
+                    "l2_normalize_before_vq requires bottleneck_type='vq'."
+                )
+            if active_vq_controls:
+                raise ValueError(
+                    "Collapse-control options require bottleneck_type='vq'."
+                )
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.encoder: TextEncoder = build_text_encoder(config)
         self.latent_proj = nn.Linear(config.d_model, config.d_model)
-        self.quantizer = VectorQuantizer(config.codebook_size, config.d_model, self.collapse_config)
+        self.quantizer = (
+            VectorQuantizer(
+                config.codebook_size,
+                config.d_model,
+                self.collapse_config,
+            )
+            if config.bottleneck_type == "vq"
+            else None
+        )
         self.decoder_impl: TextDecoder = build_text_decoder(config)
         self.output_head = nn.Linear(config.d_model, config.vocab_size)
 
@@ -218,8 +248,8 @@ class TextVQVAE(nn.Module):
             return latents, latent_mask
         return latents
 
-    def decode(self, z_q_st: torch.Tensor, seq_len: int):
-        return self.output_head(self.decoder_impl(z_q_st, seq_len))
+    def decode(self, latents: torch.Tensor, seq_len: int):
+        return self.output_head(self.decoder_impl(latents, seq_len))
 
     @property
     def encoder_pos_embedding(self):
@@ -279,14 +309,28 @@ class TextVQVAE(nn.Module):
             attention_mask=resolved_attention_mask,
             return_mask=True,
         )
+        if self.config.bottleneck_type == "continuous":
+            logits = self.decode(z_e, seq_len=input_ids.shape[1])
+            return {
+                "bottleneck_type": "continuous",
+                "logits": logits,
+                "z_e": z_e,
+                "z_latent": z_e,
+                "latent_mask": latent_mask,
+                "lengths": lengths,
+            }
+
+        assert self.quantizer is not None
         quantized = self.quantizer(z_e, valid_mask=latent_mask)
         z_q_raw = quantized["z_q_raw"]
         z_q_st = quantized["z_q_st"]
         indices = quantized["indices"]
         logits = self.decode(z_q_st, seq_len=input_ids.shape[1])
         return {
+            "bottleneck_type": "vq",
             "logits": logits,
             "z_e": z_e,
+            "z_latent": z_q_st,
             "z_q_raw": z_q_raw,
             "z_q_st": z_q_st,
             "indices": indices,
@@ -383,6 +427,12 @@ def text_vqvae_losses(
         recon_loss = F.cross_entropy(logits[valid_tokens], targets[valid_tokens])
     else:
         recon_loss = logits.sum() * 0.0
+    if outputs.get("bottleneck_type", "vq") == "continuous":
+        return {
+            "total": recon_loss,
+            "recon": recon_loss,
+        }
+
     z_e = outputs["z_e"]
     z_q_raw = outputs["z_q_raw"]
     latent_mask = outputs.get("latent_mask")

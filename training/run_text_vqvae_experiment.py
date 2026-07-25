@@ -132,29 +132,32 @@ def main():
         num_workers=train_cfg.num_workers,
         persistent_workers=True,
     )
-    codebook_probe_examples = min(len(train_dataset), len(val_dataset))
-    train_probe_dataset = Subset(
-        train_dataset,
-        range(codebook_probe_examples),
-    )
-    train_probe_loader = make_loader(
-        train_probe_dataset,
-        train_cfg.batch_size,
-        shuffle=False,
-        device=device,
-        # Keep this diagnostic loader single-process so it does not retain a
-        # second set of training-dataset workers between evaluations.
-        num_workers=0,
-    )
+    codebook_probe_examples = None
+    train_probe_loader = None
     eval_probe_loader = None
-    if codebook_probe_examples < len(val_dataset):
-        eval_probe_loader = make_loader(
-            Subset(val_dataset, range(codebook_probe_examples)),
+    if model_cfg.bottleneck_type == "vq":
+        codebook_probe_examples = min(len(train_dataset), len(val_dataset))
+        train_probe_dataset = Subset(
+            train_dataset,
+            range(codebook_probe_examples),
+        )
+        train_probe_loader = make_loader(
+            train_probe_dataset,
             train_cfg.batch_size,
             shuffle=False,
             device=device,
+            # Keep this diagnostic loader single-process so it does not retain a
+            # second set of training-dataset workers between evaluations.
             num_workers=0,
         )
+        if codebook_probe_examples < len(val_dataset):
+            eval_probe_loader = make_loader(
+                Subset(val_dataset, range(codebook_probe_examples)),
+                train_cfg.batch_size,
+                shuffle=False,
+                device=device,
+                num_workers=0,
+            )
 
     model = TextVQVAE(model_cfg, collapse_config=collapse_cfg).to(device)
 
@@ -172,7 +175,7 @@ def main():
     atomic_json_dump(config_payload, run_dir / "config.json")
 
     frozen_codebook_c0 = None
-    if train_cfg.codebook_init == "kmeans":
+    if model_cfg.bottleneck_type == "vq" and train_cfg.codebook_init == "kmeans":
         print("[Codebook init] Running encoder pass and fitting MiniBatch K-Means...")
         init_result = initialize_codebook_kmeans(model, train_loader, device, seed=train_cfg.seed)
         frozen_codebook_c0 = model.quantizer.codebook.weight.detach().clone()
@@ -218,6 +221,7 @@ def main():
     print(f"[Run] {run_name}")
     print(f"[Device] {device}")
     print(f"[Params] {param_count:,}")
+    print(f"[Bottleneck] {model_cfg.bottleneck_type}")
     print(f"[Tokenizer] {train_cfg.tokenizer} vocab={tokenizer.vocab_size} pad={tokenizer.pad_token_id}")
     print(f"[Data] train={len(train_dataset)} eval={len(val_dataset)}")
     print(f"[Output] {run_dir}")
@@ -225,7 +229,11 @@ def main():
     with wandb_run(
         run_name,
         group="text-vqvae",
-        tags=["text", "vqvae"],
+        tags=(
+            ["text", "vqvae"]
+            if model_cfg.bottleneck_type == "vq"
+            else ["text", "autoencoder", "continuous"]
+        ),
         config=config_payload,
     ) as tracker:
         run(

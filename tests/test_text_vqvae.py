@@ -39,6 +39,7 @@ from training.text_vqvae.loop import (
     evaluate,
     evaluate_codebook_usage,
     make_loader,
+    optimizer_step,
     save_checkpoint,
 )
 from training.text_vqvae.reporting import plot_training_curves
@@ -77,6 +78,32 @@ def small_config(**overrides):
 
 
 class EvaluationPipelineTest(unittest.TestCase):
+    def test_continuous_optimizer_step_omits_codebook_metrics(self):
+        config = small_config(bottleneck_type="continuous")
+        collapse_config = CollapseControlConfig()
+        model = TextVQVAE(config, collapse_config=collapse_config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        batch = {
+            "input_ids": torch.randint(0, 31, (2, 12)),
+            "attention_mask": torch.ones(2, 12, dtype=torch.long),
+        }
+
+        metrics = optimizer_step(
+            model,
+            optimizer,
+            batch,
+            config,
+            collapse_config,
+            grad_clip=1.0,
+            beta=config.commitment_beta,
+            step=1,
+        )
+
+        self.assertEqual(
+            set(metrics),
+            {"loss", "recon_nll", "token_accuracy", "grad_norm"},
+        )
+
     def test_evaluate_collects_reconstructions_in_one_pass_and_restores_mode(self):
         config = small_config()
         collapse_config = CollapseControlConfig()
@@ -134,6 +161,114 @@ class EvaluationPipelineTest(unittest.TestCase):
             metrics["codebook_utilization_frozen_c0"],
             metrics["codebook_utilization_full"],
         )
+
+    def test_continuous_evaluation_reports_only_common_metrics(self):
+        config = small_config(bottleneck_type="continuous")
+        collapse_config = CollapseControlConfig()
+        model = TextVQVAE(config, collapse_config=collapse_config)
+        batch = {
+            "input_ids": torch.randint(0, 31, (2, 12)),
+            "attention_mask": torch.ones(2, 12, dtype=torch.long),
+        }
+
+        metrics, rows = evaluate(
+            model,
+            [batch],
+            torch.device("cpu"),
+            config,
+            collapse_config,
+            beta=config.commitment_beta,
+        )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(
+            set(metrics),
+            {"examples", "loss", "recon_nll", "token_ppl", "token_accuracy"},
+        )
+        with self.assertRaisesRegex(ValueError, "not applicable"):
+            evaluate_codebook_usage(
+                model,
+                [batch],
+                torch.device("cpu"),
+                config,
+            )
+
+    def test_continuous_bottleneck_runs_through_training_pipeline(self):
+        from common.text_data import ByteTokenizer
+        from common.text_vqvae_config import DataConfig, TrainConfig
+        from training.text_vqvae.loop import run
+
+        config = small_config(bottleneck_type="continuous")
+        collapse_config = CollapseControlConfig()
+        model = TextVQVAE(config, collapse_config=collapse_config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        batch = {
+            "input_ids": torch.randint(0, 31, (2, 12)),
+            "attention_mask": torch.ones(2, 12, dtype=torch.long),
+        }
+        tracker = SimpleNamespace(
+            log=lambda *args, **kwargs: None,
+            summary={},
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            for child in ("checkpoints", "plots", "samples"):
+                (run_dir / child).mkdir()
+            payload = {
+                "diagnostics": {
+                    "initial_pca": {
+                        "status": "not_applicable",
+                        "reason": "continuous bottleneck has no codebook",
+                    },
+                    "geometry": {},
+                },
+            }
+            run(
+                model=model,
+                optimizer=optimizer,
+                train_loader=[batch],
+                val_loader=[batch],
+                train_cfg=TrainConfig(
+                    epochs=1,
+                    eval_every=1,
+                    save_every=100,
+                    tokenizer="byte",
+                    tokenizer_path=None,
+                ),
+                data_cfg=DataConfig(),
+                model_config=config,
+                collapse_config=collapse_config,
+                run_dir=run_dir,
+                run_name="continuous-smoke",
+                tokenizer=ByteTokenizer(),
+                device=torch.device("cpu"),
+                config_payload=payload,
+                tracker=tracker,
+                initial_pca_opts={
+                    "enabled": True,
+                    "max_points": 8,
+                    "fit_mode": "balanced",
+                    "strict": True,
+                },
+                geometry_snapshot_opts={
+                    "enabled": True,
+                    "dense_every": 1,
+                    "dense_until": 1,
+                    "sparse_every": 1,
+                    "probe_points": 8,
+                    "strict": True,
+                    "render_enabled": False,
+                    "render_basis": "first_last",
+                    "render_fps": 8,
+                    "keep_snapshots": True,
+                },
+            )
+
+            self.assertTrue((run_dir / "summary.json").is_file())
+            self.assertTrue((run_dir / "plots" / "training_curves.png").is_file())
+            self.assertFalse((run_dir / "plots" / "codebook_usage.png").exists())
+            self.assertTrue((run_dir / "geometry" / "step000000.npz").is_file())
 
     def test_codebook_probe_is_eval_only_and_preserves_rng_ema_and_mode(self):
         config = small_config()
@@ -338,6 +473,28 @@ class GeometrySnapshotTest(unittest.TestCase):
         self.assertIn("participation_ratio", metrics)
         self.assertIn("win_count_gini", metrics)
 
+    def test_continuous_snapshot_contains_only_latent_geometry(self):
+        model = TextVQVAE(small_config(bottleneck_type="continuous"))
+        probe = [{
+            "input_ids": torch.randint(0, 31, (2, 12)),
+            "attention_mask": torch.ones(2, 12, dtype=torch.long),
+        }]
+
+        with TemporaryDirectory() as temp_dir:
+            metrics = dump_geometry_snapshot(model, probe, 3, Path(temp_dir))
+            snapshot_path = Path(temp_dir) / "geometry" / "step000003.npz"
+            with np.load(snapshot_path) as snapshot:
+                self.assertEqual(
+                    set(snapshot.files),
+                    {"z_e", "pad_ratios", "slot_indices"},
+                )
+                self.assertEqual(snapshot["z_e"].shape, (8, 16))
+
+        self.assertIn("encoder_mean_norm", metrics)
+        self.assertIn("participation_ratio", metrics)
+        self.assertNotIn("used_codes", metrics)
+        self.assertNotIn("nearest_code_distance_p50", metrics)
+
     def test_successful_finalization_removes_raw_snapshots(self):
         with TemporaryDirectory() as temp_dir:
             run_dir = Path(temp_dir)
@@ -452,6 +609,41 @@ class GeometryAnimationTest(unittest.TestCase):
                 render_frame(step, path, pca, output, scales)
                 self.assertTrue(output.is_file())
 
+    def test_continuous_frames_use_latent_only_snapshots(self):
+        with TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            geometry_dir = run_dir / "geometry"
+            geometry_dir.mkdir()
+            snapshots = []
+            for step, offset in ((0, 0.0), (10, 1.0)):
+                path = geometry_dir / f"step{step:06d}.npz"
+                encoder = np.array(
+                    [[0.0, 0.0], [1.0, .5], [2.0, 1.0], [3.0, 1.5]],
+                    dtype=np.float32,
+                ) + offset
+                np.savez_compressed(
+                    path,
+                    z_e=encoder,
+                    pad_ratios=np.array([0.0, .25, .5, 1.0], dtype=np.float32),
+                    slot_indices=np.array([0, 1, 2, 3], dtype=np.int16),
+                )
+                snapshots.append((step, path))
+
+            pca = fit_shared_pca(snapshots, "first_last")
+            scales = compute_animation_scales(snapshots, pca)
+            output = run_dir / "continuous_frame.png"
+            render_frame(
+                snapshots[-1][0],
+                snapshots[-1][1],
+                pca,
+                output,
+                scales,
+                run_name="continuous-control",
+            )
+
+            self.assertTrue(output.is_file())
+            self.assertEqual(scales.rank_xlim, (1.0, 2.0))
+
 
 class CheckpointRetentionTest(unittest.TestCase):
     def test_keeps_best_and_two_most_recent_regular_checkpoints(self):
@@ -491,6 +683,42 @@ class CheckpointRetentionTest(unittest.TestCase):
 
 
 class TextVQVAEDecoderTest(unittest.TestCase):
+    def test_continuous_bottleneck_bypasses_quantization_and_vq_losses(self):
+        model = TextVQVAE(small_config(bottleneck_type="continuous"))
+        input_ids = torch.randint(0, 31, (2, 12))
+        attention_mask = torch.ones_like(input_ids)
+
+        outputs = model(input_ids, attention_mask)
+        losses = text_vqvae_losses(
+            outputs,
+            input_ids,
+            pad_token_id=model.config.pad_token_id,
+            beta=model.config.commitment_beta,
+            attention_mask=attention_mask,
+        )
+
+        self.assertIsNone(model.quantizer)
+        self.assertEqual(outputs["bottleneck_type"], "continuous")
+        self.assertIs(outputs["z_latent"], outputs["z_e"])
+        self.assertNotIn("indices", outputs)
+        self.assertNotIn("z_q_raw", outputs)
+        self.assertEqual(set(losses), {"total", "recon"})
+        torch.testing.assert_close(losses["total"], losses["recon"])
+        losses["total"].backward()
+        self.assertIsNotNone(model.latent_proj.weight.grad)
+        self.assertIsNotNone(model.output_head.weight.grad)
+
+    def test_continuous_bottleneck_rejects_vq_only_controls(self):
+        with self.assertRaisesRegex(ValueError, "require bottleneck_type='vq'"):
+            TextVQVAE(
+                small_config(bottleneck_type="continuous"),
+                collapse_config=CollapseControlConfig(use_ema_codebook=True),
+            )
+
+    def test_unknown_bottleneck_type_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "Unknown bottleneck_type"):
+            TextVQVAE(small_config(bottleneck_type="unknown"))
+
     def test_all_decoders_forward_and_backward(self):
         for decoder_type in DECODER_TYPES:
             with self.subTest(decoder_type=decoder_type):
@@ -1194,7 +1422,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         categorical_fields = {
             TrainConfig: ("tokenizer", "codebook_init"),
             DataConfig: ("source",),
-            TextVQVAEConfig: ("encoder_type", "decoder_type"),
+            TextVQVAEConfig: ("bottleneck_type", "encoder_type", "decoder_type"),
             DiagnosticsConfig: ("initial_pca_fit_mode", "geometry_render_basis"),
         }
         for config_class, field_names in categorical_fields.items():
@@ -1292,6 +1520,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(model.codebook_size, 3072)
         self.assertEqual(model.d_model, 448)
         self.assertEqual(model.max_seq_len, 256)
+        self.assertEqual(model.bottleneck_type, "vq")
         self.assertEqual(model.encoder_type, "rope")
         self.assertFalse(model.l2_normalize_before_vq)
         self.assertEqual(diagnostics.initial_pca_max_points, 8192)
@@ -1346,6 +1575,41 @@ class ConfigDefaultsTest(unittest.TestCase):
 
         self.assertTrue(enabled.l2_normalize_before_vq)
         self.assertFalse(disabled.l2_normalize_before_vq)
+
+    def test_continuous_bottleneck_can_be_selected_from_cli(self):
+        from training.text_vqvae.config import build_configs
+
+        tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
+        _, _, model, collapse = build_configs(
+            self._parse("--bottleneck-type", "continuous"),
+            tokenizer,
+        )
+
+        self.assertEqual(model.bottleneck_type, "continuous")
+        self.assertFalse(collapse.enabled)
+
+    def test_continuous_bottleneck_rejects_vq_only_cli_options(self):
+        from training.text_vqvae.config import build_configs
+
+        tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
+        with self.assertRaisesRegex(ValueError, "require --bottleneck-type vq"):
+            build_configs(
+                self._parse(
+                    "--bottleneck-type",
+                    "continuous",
+                    "--use-ema-codebook",
+                ),
+                tokenizer,
+            )
+        with self.assertRaisesRegex(ValueError, "requires --bottleneck-type vq"):
+            build_configs(
+                self._parse(
+                    "--bottleneck-type",
+                    "continuous",
+                    "--l2-normalize-before-vq",
+                ),
+                tokenizer,
+            )
 
     def test_vqgan_encoder_and_decoder_variants_can_be_selected_from_cli(self):
         from training.text_vqvae.config import build_configs

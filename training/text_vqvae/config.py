@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, get_args
 
 from common.text_vqvae_config import (
+    BottleneckType,
     CodebookInitialization,
     CollapsePreset,
     CollapseControlConfig,
@@ -180,6 +181,12 @@ def add_arguments(parser) -> None:
     g.add_argument("--memory-decoder-output-layers", type=int, default=None)
     g.add_argument("--ffn-mult", type=int, default=None)
     g.add_argument("--dropout", type=float, default=None)
+    g.add_argument(
+        "--bottleneck-type",
+        choices=get_args(BottleneckType),
+        default=None,
+        help="Latent bottleneck: vector quantization or a continuous identity path.",
+    )
     g.add_argument("--codebook-size", type=int, default=None)
     g.add_argument("--commitment-beta", type=float, default=None)
     g.add_argument(
@@ -434,12 +441,22 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
         "memory_decoder_output_layers": getattr(args, "memory_decoder_output_layers", None),
         "ffn_mult": getattr(args, "ffn_mult", None),
         "dropout": getattr(args, "dropout", None),
+        "bottleneck_type": getattr(args, "bottleneck_type", None),
         "codebook_size": getattr(args, "codebook_size", None),
         "commitment_beta": getattr(args, "commitment_beta", None),
         "l2_normalize_before_vq": getattr(args, "l2_normalize_before_vq", None),
     })
 
     collapse_cfg = build_collapse_config(args)
+    if model_cfg.bottleneck_type == "continuous":
+        if model_cfg.l2_normalize_before_vq:
+            raise ValueError(
+                "--l2-normalize-before-vq requires --bottleneck-type vq."
+            )
+        if collapse_cfg.enabled:
+            raise ValueError(
+                "Collapse-control options require --bottleneck-type vq."
+            )
     return train_cfg, data_cfg, model_cfg, collapse_cfg
 
 
@@ -484,17 +501,37 @@ def build_config_payload(
         "collapse_control": asdict(collapse_cfg),
         "device": str(device),
         "output_dir": str(run_dir),
-        "codebook_initialization": {
-            "method": codebook_init_method,
-            "status": "completed" if codebook_init_method == "random" else "pending",
-        },
+        "codebook_initialization": (
+            {
+                "method": codebook_init_method,
+                "status": (
+                    "completed" if codebook_init_method == "random" else "pending"
+                ),
+            }
+            if model_cfg.bottleneck_type == "vq"
+            else {
+                "method": "not_applicable",
+                "requested_method": codebook_init_method,
+                "status": "not_applicable",
+                "reason": "continuous bottleneck has no codebook",
+            }
+        ),
         "diagnostics": {
             "initial_pca": {
                 "enabled": initial_pca_enabled,
                 "max_encoder_points": initial_pca_max_points,
                 "fit_mode": initial_pca_fit_mode,
                 "strict": initial_pca_strict,
-                "status": "disabled" if not initial_pca_enabled else "pending",
+                "status": (
+                    "not_applicable"
+                    if model_cfg.bottleneck_type == "continuous"
+                    else ("disabled" if not initial_pca_enabled else "pending")
+                ),
+                **(
+                    {"reason": "continuous bottleneck has no codebook"}
+                    if model_cfg.bottleneck_type == "continuous"
+                    else {}
+                ),
             },
             "geometry": {
                 "snapshot_enabled": geometry_config.geometry_snapshot_enabled,
