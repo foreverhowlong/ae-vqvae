@@ -62,6 +62,12 @@ python -m training.run_text_vqvae_experiment --codebook-init kmeans
 python -m training.run_text_vqvae_experiment \
     --codebook-init kmeans --ae-warmup-steps 1000
 
+# stop AE warmup automatically when target-rate and 99%-variance latent
+# dimensions plateau; max-steps is a required safety cap
+python -m training.run_text_vqvae_experiment \
+    --codebook-init kmeans --ae-warmup-mode adaptive \
+    --ae-warmup-min-steps 1000 --ae-warmup-max-steps 5000
+
 # change the slot-level PAD exclusion threshold (default: 0.5)
 python -m training.run_text_vqvae_experiment --slot-pad-ratio-threshold 0.5
 

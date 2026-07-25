@@ -43,6 +43,12 @@ from training.text_vqvae.loop import (
     optimizer_step,
     save_checkpoint,
 )
+from training.text_vqvae.warmup import (
+    AdaptiveWarmupController,
+    evaluate_adaptive_warmup,
+    latent_spectrum_metrics,
+    reverse_water_filling,
+)
 from training.text_vqvae.reporting import plot_training_curves
 from training.text_vqvae.geometry import dump_geometry_snapshot, finalize_geometry_artifacts
 from visualization.text_vqvae import (
@@ -1537,6 +1543,90 @@ class TextVQVAEVisualizationTest(unittest.TestCase):
         self.assertAlmostEqual(result.encoder_pairwise_mean_distance, 4.0)
 
 
+class AdaptiveWarmupDiagnosticsTest(unittest.TestCase):
+    def test_reverse_water_filling_on_equal_spectrum(self):
+        level, active = reverse_water_filling(
+            torch.ones(4),
+            rate_bits=2.0,
+        )
+
+        self.assertAlmostEqual(level, 0.5)
+        self.assertEqual(active, 4)
+
+    def test_latent_spectrum_metrics_reports_full_pca_and_dimensions(self):
+        vectors = torch.cat([torch.eye(4), -torch.eye(4)], dim=0)
+
+        metrics = latent_spectrum_metrics(
+            vectors,
+            codebook_size=4,
+            variance_threshold=0.99,
+        )
+
+        self.assertEqual(metrics["latent_points"], 8)
+        self.assertEqual(metrics["latent_dimension"], 4)
+        self.assertEqual(len(metrics["pca_eigenvalues"]), 4)
+        self.assertEqual(metrics["latent_effective_dim"], 4)
+        self.assertEqual(metrics["water_filling_effective_dim"], 4)
+
+    def test_adaptive_probe_excludes_invalid_pad_slots(self):
+        model = TextVQVAE(small_config(codebook_size=4))
+        probe = [{
+            "input_ids": torch.tensor([
+                [1] * 12,
+                [31] * 12,
+            ]),
+            "attention_mask": torch.tensor([
+                [1] * 12,
+                [0] * 12,
+            ]),
+        }]
+
+        metrics = evaluate_adaptive_warmup(
+            model,
+            probe,
+            codebook_size=4,
+            variance_threshold=0.99,
+        )
+
+        self.assertEqual(metrics["latent_points"], 4)
+
+    def test_controller_stops_on_plateau_and_has_max_step_fallback(self):
+        controller = AdaptiveWarmupController(
+            min_steps=2,
+            max_steps=10,
+            patience=2,
+            tolerance=1,
+        )
+        decisions = [
+            controller.observe(step, {
+                "water_filling_effective_dim": water_dim,
+                "latent_effective_dim": latent_dim,
+            })
+            for step, water_dim, latent_dim in (
+                (2, 5, 7),
+                (4, 6, 8),
+                (6, 5, 7),
+            )
+        ]
+        self.assertFalse(decisions[0]["should_stop"])
+        self.assertFalse(decisions[1]["should_stop"])
+        self.assertTrue(decisions[2]["should_stop"])
+        self.assertEqual(decisions[2]["reason"], "dimension_plateau")
+
+        max_controller = AdaptiveWarmupController(
+            min_steps=2,
+            max_steps=4,
+            patience=5,
+            tolerance=0,
+        )
+        decision = max_controller.observe(4, {
+            "water_filling_effective_dim": 3,
+            "latent_effective_dim": 4,
+        })
+        self.assertTrue(decision["should_stop"])
+        self.assertEqual(decision["reason"], "max_steps")
+
+
 class TextVQVAECodebookInitializationTest(unittest.TestCase):
     def test_kmeans_initialization_updates_codebook_and_ema_state(self):
         collapse_config = CollapseControlConfig(use_ema_codebook=True)
@@ -1619,7 +1709,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         )
 
         categorical_fields = {
-            TrainConfig: ("tokenizer", "codebook_init"),
+            TrainConfig: ("tokenizer", "codebook_init", "ae_warmup_mode"),
             DataConfig: ("source",),
             TextVQVAEConfig: ("bottleneck_type", "encoder_type", "decoder_type"),
             DiagnosticsConfig: ("initial_pca_fit_mode", "geometry_render_basis"),
@@ -1711,7 +1801,10 @@ class ConfigDefaultsTest(unittest.TestCase):
 
         self.assertEqual(train.seed, 42)
         self.assertEqual(train.batch_size, 32)
+        self.assertEqual(train.ae_warmup_mode, "fixed")
         self.assertEqual(train.ae_warmup_steps, 0)
+        self.assertEqual(train.ae_warmup_min_steps, 1000)
+        self.assertIsNone(train.ae_warmup_max_steps)
         self.assertAlmostEqual(train.lr, 3e-4)
         self.assertEqual(data.max_train_samples, 50000)
         self.assertEqual(data.val_fraction, 0.02)
@@ -1832,6 +1925,39 @@ class ConfigDefaultsTest(unittest.TestCase):
                 self._parse(
                     "--codebook-init", "random",
                     "--ae-warmup-steps", "12",
+                ),
+                tokenizer,
+            )
+
+    def test_adaptive_ae_warmup_configuration(self):
+        from training.text_vqvae.config import build_configs
+
+        tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
+        train, _, _, _ = build_configs(
+            self._parse(
+                "--ae-warmup-mode", "adaptive",
+                "--ae-warmup-min-steps", "100",
+                "--ae-warmup-max-steps", "1000",
+                "--ae-warmup-check-every", "50",
+            ),
+            tokenizer,
+        )
+        self.assertEqual(train.ae_warmup_mode, "adaptive")
+        self.assertEqual(train.ae_warmup_min_steps, 100)
+        self.assertEqual(train.ae_warmup_max_steps, 1000)
+        self.assertEqual(train.ae_warmup_check_every, 50)
+
+        with self.assertRaisesRegex(ValueError, "max-steps is required"):
+            build_configs(
+                self._parse("--ae-warmup-mode", "adaptive"),
+                tokenizer,
+            )
+        with self.assertRaisesRegex(ValueError, "only valid.*fixed"):
+            build_configs(
+                self._parse(
+                    "--ae-warmup-mode", "adaptive",
+                    "--ae-warmup-steps", "500",
+                    "--ae-warmup-max-steps", "1000",
                 ),
                 tokenizer,
             )
@@ -1970,6 +2096,123 @@ class LoadRunConfigTest(unittest.TestCase):
 
 
 class TrainingLifecycleTest(unittest.TestCase):
+    def test_adaptive_ae_warmup_transitions_after_plateau(self):
+        from common.text_data import ByteTokenizer
+        from training.text_vqvae.config import DataConfig, TrainConfig
+        from training.text_vqvae.loop import run
+
+        config = small_config(codebook_size=4)
+        collapse_config = CollapseControlConfig()
+        model = TextVQVAE(config, collapse_config=collapse_config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        batches = [{
+            "input_ids": torch.randint(0, 31, (2, 12)),
+            "attention_mask": torch.ones(2, 12, dtype=torch.long),
+        } for _ in range(4)]
+        tracker = SimpleNamespace(log=lambda *args, **kwargs: None, summary={})
+        constant_spectrum = {
+            "latent_points": 8,
+            "latent_dimension": 16,
+            "variance_threshold": 0.99,
+            "latent_effective_dim": 6,
+            "participation_ratio": 5.5,
+            "rate_bits": 2.0,
+            "water_filling_level": 0.1,
+            "water_filling_effective_dim": 5,
+            "pca_eigenvalues": [1.0] * 16,
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            for child in ("checkpoints", "plots", "samples"):
+                (run_dir / child).mkdir()
+            payload = {
+                "codebook_initialization": {
+                    "method": "kmeans",
+                    "status": "deferred",
+                    "mode": "adaptive",
+                },
+                "diagnostics": {
+                    "initial_pca": {"status": "disabled"},
+                    "geometry": {},
+                },
+            }
+            with patch(
+                "training.text_vqvae.loop.evaluate_adaptive_warmup",
+                return_value=constant_spectrum,
+            ):
+                run(
+                    model=model,
+                    optimizer=optimizer,
+                    train_loader=batches,
+                    val_loader=[batches[0]],
+                    codebook_init_loader=batches,
+                    train_probe_loader=[batches[0]],
+                    train_cfg=TrainConfig(
+                        epochs=1,
+                        eval_every=100,
+                        save_every=100,
+                        ae_warmup_mode="adaptive",
+                        ae_warmup_min_steps=1,
+                        ae_warmup_max_steps=3,
+                        ae_warmup_check_every=1,
+                        ae_warmup_patience=1,
+                        ae_warmup_dim_tolerance=0,
+                        ae_warmup_probe_points=8,
+                        tokenizer="byte",
+                        tokenizer_path=None,
+                    ),
+                    data_cfg=DataConfig(),
+                    model_config=config,
+                    collapse_config=collapse_config,
+                    run_dir=run_dir,
+                    run_name="adaptive-ae-warmup-smoke",
+                    tokenizer=ByteTokenizer(),
+                    device=torch.device("cpu"),
+                    config_payload=payload,
+                    tracker=tracker,
+                    initial_pca_opts={
+                        "enabled": False,
+                        "max_points": 8,
+                        "fit_mode": "balanced",
+                        "strict": True,
+                    },
+                    geometry_snapshot_opts={
+                        "enabled": False,
+                        "strict": True,
+                        "render_enabled": False,
+                    },
+                )
+
+            rows = [
+                json.loads(line)
+                for line in (run_dir / "metrics.jsonl").read_text().splitlines()
+            ]
+            train_rows = [row for row in rows if row["split"] == "train"]
+            self.assertEqual(
+                [row["phase"] for row in train_rows],
+                ["ae_warmup", "ae_warmup", "vq", "vq"],
+            )
+            diagnostics = [
+                row for row in rows
+                if row["split"] == "ae_warmup_diagnostic"
+            ]
+            self.assertEqual([row["step"] for row in diagnostics], [1, 2])
+            transitions = [
+                row for row in rows if row["split"] == "phase_transition"
+            ]
+            self.assertEqual(transitions[0]["step"], 2)
+            self.assertEqual(
+                transitions[0]["warmup_stop_reason"],
+                "dimension_plateau",
+            )
+            summary = json.loads((run_dir / "summary.json").read_text())
+            self.assertEqual(summary["actual_ae_warmup_steps"], 2)
+            self.assertEqual(summary["best_step"], 3)
+            self.assertTrue(
+                (run_dir / "plots" / "ae_warmup_diagnostics.png").is_file()
+            )
+
     def test_ae_warmup_switches_to_kmeans_vq_before_next_step(self):
         from common.text_data import ByteTokenizer
         from training.text_vqvae.config import DataConfig, TrainConfig

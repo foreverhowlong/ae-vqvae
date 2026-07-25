@@ -31,7 +31,14 @@ def preserve_rng_state():
             torch.cuda.set_rng_state_all(cuda_states)
 
 
-def materialize_geometry_probe(val_loader, *, latent_slots: int, max_points: int, run_dir: Path):
+def materialize_geometry_probe(
+    val_loader,
+    *,
+    latent_slots: int,
+    max_points: int,
+    run_dir: Path,
+    metadata_name: str = "probe_meta.json",
+):
     """Copy a deterministic prefix of validation examples to CPU and write its metadata."""
     sample_target = max(1, (max_points + latent_slots - 1) // latent_slots)
     batches: list[dict[str, torch.Tensor]] = []
@@ -79,7 +86,7 @@ def materialize_geometry_probe(val_loader, *, latent_slots: int, max_points: int
         "pad_ratio": float(pad_ratios.mean()),
         "pad_ratios": pad_ratios.tolist(),
     }
-    with (geometry_dir / "probe_meta.json").open("w", encoding="utf-8") as handle:
+    with (geometry_dir / metadata_name).open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
     return batches
 

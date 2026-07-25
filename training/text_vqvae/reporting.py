@@ -280,6 +280,72 @@ def plot_training_curves(
     fig.savefig(plot_dir / "training_curves.png", dpi=160)
     plt.close(fig)
 
+    warmup_rows = [
+        row for row in rows if row["split"] == "ae_warmup_diagnostic"
+    ]
+    if warmup_rows:
+        steps = [row["step"] for row in warmup_rows]
+        transition_step = next(
+            (
+                row["step"]
+                for row in rows
+                if row["split"] == "phase_transition"
+            ),
+            None,
+        )
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+        axes[0].plot(
+            steps,
+            [row["water_filling_effective_dim"] for row in warmup_rows],
+            marker="o",
+            label="target-rate water-filling dimension",
+        )
+        axes[0].plot(
+            steps,
+            [row["latent_effective_dim"] for row in warmup_rows],
+            marker=".",
+            label="PCA effective dimension",
+        )
+        threshold = warmup_rows[0]["variance_threshold"]
+        axes[0].set(
+            title=f"AE warmup dimensionality (PCA threshold {threshold:.0%})",
+            xlabel="optimizer step",
+            ylabel="dimensions",
+        )
+        axes[0].legend()
+        axes[1].plot(
+            steps,
+            [row["water_filling_level"] for row in warmup_rows],
+            marker=".",
+            label="water level",
+        )
+        axes[1].plot(
+            steps,
+            [row["participation_ratio"] for row in warmup_rows],
+            marker=".",
+            label="participation ratio",
+        )
+        axes[1].set(
+            title="Target-rate water level and latent participation ratio",
+            xlabel="optimizer step",
+        )
+        axes[1].legend()
+        for axis in axes:
+            if transition_step is not None:
+                axis.axvline(
+                    transition_step,
+                    color="0.35",
+                    linestyle=":",
+                    linewidth=1,
+                    label="K-means transition",
+                )
+            axis.grid(alpha=0.2)
+            axis.legend()
+        _add_run_label(fig, run_name)
+        fig.tight_layout(rect=(0, 0, 1, 0.985))
+        fig.savefig(plot_dir / "ae_warmup_diagnostics.png", dpi=160)
+        plt.close(fig)
+
 
 def plot_codebook_usage(
     counts,

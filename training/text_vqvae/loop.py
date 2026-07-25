@@ -35,6 +35,10 @@ from training.text_vqvae.geometry import (
     materialize_geometry_probe,
     preserve_rng_state,
 )
+from training.text_vqvae.warmup import (
+    AdaptiveWarmupController,
+    evaluate_adaptive_warmup,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -572,18 +576,32 @@ def run(
     import shutil
 
     initialization_started = time.time()
-    warmup_steps = train_cfg.ae_warmup_steps
-    quantizer_active = (
-        model_config.bottleneck_type == "vq" and warmup_steps == 0
+    adaptive_warmup = train_cfg.ae_warmup_mode == "adaptive"
+    warmup_enabled = (
+        adaptive_warmup or train_cfg.ae_warmup_steps > 0
     )
-    if warmup_steps > 0:
+    warmup_limit = (
+        train_cfg.ae_warmup_max_steps
+        if adaptive_warmup
+        else train_cfg.ae_warmup_steps
+    )
+    quantizer_active = (
+        model_config.bottleneck_type == "vq" and not warmup_enabled
+    )
+    transition_step = 0 if quantizer_active else None
+    warmup_stop_reason = None
+    if warmup_enabled:
+        if model_config.bottleneck_type != "vq":
+            raise ValueError("AE warmup requires a VQ bottleneck.")
+        if train_cfg.codebook_init != "kmeans":
+            raise ValueError("AE warmup requires K-means codebook initialization.")
         if codebook_init_loader is None:
             raise ValueError("AE warmup requires a dedicated K-means initialization loader.")
         total_steps = train_cfg.epochs * len(train_loader)
-        if warmup_steps >= total_steps:
+        if warmup_limit is None or warmup_limit >= total_steps:
             raise ValueError(
                 "AE warmup must leave at least one VQ optimizer step, got "
-                f"warmup_steps={warmup_steps} and total_steps={total_steps}."
+                f"warmup_limit={warmup_limit} and total_steps={total_steps}."
             )
     else:
         try:
@@ -617,6 +635,17 @@ def run(
     start_time = time.time()
     geometry_opts = geometry_snapshot_opts or {"enabled": False}
     probe_batches = None
+    warmup_probe_batches = None
+    adaptive_controller = (
+        AdaptiveWarmupController(
+            min_steps=train_cfg.ae_warmup_min_steps,
+            max_steps=train_cfg.ae_warmup_max_steps,
+            patience=train_cfg.ae_warmup_patience,
+            tolerance=train_cfg.ae_warmup_dim_tolerance,
+        )
+        if adaptive_warmup
+        else None
+    )
 
     def current_phase() -> str:
         if model_config.bottleneck_type == "continuous":
@@ -669,6 +698,15 @@ def run(
                 raise
             print(f"[Geometry] warning at step {step}: {exc!r}; training will continue.")
 
+    if adaptive_warmup:
+        warmup_probe_batches = materialize_geometry_probe(
+            codebook_init_loader,
+            latent_slots=model_config.latent_slots,
+            max_points=train_cfg.ae_warmup_probe_points,
+            run_dir=run_dir,
+            metadata_name="ae_warmup_probe_meta.json",
+        )
+
     if geometry_opts.get("enabled", False):
         try:
             probe_batches = materialize_geometry_probe(
@@ -712,11 +750,11 @@ def run(
         )
         tracker.log({f"initial/{k}": v for k, v in initial_metrics.items()}, step=step)
 
-    if warmup_steps == 0:
+    if not warmup_enabled:
         record_initial_pca_metrics(0, "initial_codebook")
 
-    def initialize_after_warmup(epoch: int) -> None:
-        nonlocal frozen_codebook_c0, quantizer_active
+    def initialize_after_warmup(epoch: int, stop_reason: str) -> None:
+        nonlocal frozen_codebook_c0, quantizer_active, transition_step
         take_geometry_snapshot(
             global_step,
             event="pre_kmeans",
@@ -735,6 +773,7 @@ def run(
                 seed=train_cfg.seed,
             )
         frozen_codebook_c0 = model.quantizer.codebook.weight.detach().clone()
+        transition_step = global_step
         snapshot_path = run_dir / "codebook_c0_kmeans.pt"
         torch.save(
             {
@@ -749,6 +788,7 @@ def run(
         config_payload["codebook_initialization"].update({
             "status": "completed",
             "transition_step": global_step,
+            "warmup_stop_reason": stop_reason,
             **init_result,
             "c0_snapshot": {
                 "label": "C0",
@@ -766,7 +806,7 @@ def run(
                 **initial_pca_opts,
                 artifact_name="post_warmup_kmeans_pca.png",
                 title=(
-                    f"Encoder latents after {warmup_steps}-step AE warmup "
+                    f"Encoder latents after {global_step}-step AE warmup "
                     "vs. K-means codebook C0"
                 ),
             )
@@ -776,6 +816,8 @@ def run(
             "epoch": epoch,
             "step": global_step,
             "event": "kmeans_initialized",
+            "warmup_mode": train_cfg.ae_warmup_mode,
+            "warmup_stop_reason": stop_reason,
             "from_phase": "ae_warmup",
             "to_phase": "vq",
             "elapsed_sec": time.time() - start_time,
@@ -800,21 +842,73 @@ def run(
             f"{init_result['encoder_vectors']:,} encoder vectors; entering VQ phase."
         )
 
+    def check_adaptive_warmup(epoch: int) -> dict[str, object]:
+        assert adaptive_controller is not None
+        assert warmup_probe_batches is not None
+        spectrum_metrics = evaluate_adaptive_warmup(
+            model,
+            warmup_probe_batches,
+            codebook_size=model_config.codebook_size,
+            variance_threshold=train_cfg.ae_warmup_variance_threshold,
+        )
+        decision = adaptive_controller.observe(global_step, spectrum_metrics)
+        row = {
+            "split": "ae_warmup_diagnostic",
+            "epoch": epoch,
+            "step": global_step,
+            "phase": "ae_warmup",
+            "elapsed_sec": time.time() - start_time,
+            **spectrum_metrics,
+            **decision,
+        }
+        append_jsonl(row, metrics_path)
+        scalar_metrics = {
+            key: value
+            for key, value in {**spectrum_metrics, **decision}.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        tracker.log(
+            {f"ae_warmup/{key}": value for key, value in scalar_metrics.items()},
+            step=global_step,
+        )
+        config_payload["codebook_initialization"]["adaptive_latest"] = {
+            key: value
+            for key, value in row.items()
+            if key not in {"split", "epoch", "elapsed_sec", "pca_eigenvalues"}
+        }
+        atomic_json_dump(config_payload, run_dir / "config.json")
+        print(
+            f"[AE warmup] step={global_step} "
+            f"d_wf={spectrum_metrics['water_filling_effective_dim']} "
+            f"d{train_cfg.ae_warmup_variance_threshold:.0%}="
+            f"{spectrum_metrics['latent_effective_dim']} "
+            f"window={decision['window_checks']}/"
+            f"{train_cfg.ae_warmup_patience + 1}"
+            + (
+                f" stop={decision['reason']}"
+                if decision["should_stop"]
+                else ""
+            )
+        )
+        return decision
+
     try:
         for epoch in range(1, train_cfg.epochs + 1):
             model.train()
             for batch in train_loader:
-                if (
-                    warmup_steps > 0
-                    and not quantizer_active
-                    and global_step == warmup_steps
-                ):
-                    initialize_after_warmup(epoch)
+                if warmup_enabled and not quantizer_active:
+                    if (
+                        not adaptive_warmup
+                        and global_step == train_cfg.ae_warmup_steps
+                    ):
+                        warmup_stop_reason = "fixed_steps"
+                    if warmup_stop_reason is not None:
+                        initialize_after_warmup(epoch, warmup_stop_reason)
 
                 global_step += 1
                 batch = batch_to_device(batch, device)
                 vq_step = (
-                    global_step - warmup_steps
+                    global_step - transition_step
                     if model_config.bottleneck_type == "vq" and quantizer_active
                     else 0
                 )
@@ -844,10 +938,25 @@ def run(
                         train_metrics["codebook_assignment_count"]
                     )
 
+                if (
+                    adaptive_warmup
+                    and not quantizer_active
+                    and (
+                        global_step % train_cfg.ae_warmup_check_every == 0
+                        or global_step >= train_cfg.ae_warmup_max_steps
+                    )
+                ):
+                    decision = check_adaptive_warmup(epoch)
+                    if decision["should_stop"]:
+                        warmup_stop_reason = str(decision["reason"])
+
                 geometry_due = (
                     probe_batches is not None
                     and (
-                        global_step == warmup_steps + 1
+                        (
+                            transition_step is not None
+                            and global_step == transition_step + 1
+                        )
                         or geometry_snapshot_due(
                             global_step,
                             dense_every=geometry_opts["dense_every"],
@@ -856,16 +965,26 @@ def run(
                         )
                     )
                 )
-                if geometry_due and global_step != warmup_steps:
+                transition_pending = (
+                    not quantizer_active
+                    and (
+                        warmup_stop_reason is not None
+                        or (
+                            not adaptive_warmup
+                            and global_step == train_cfg.ae_warmup_steps
+                        )
+                    )
+                )
+                if geometry_due and not transition_pending:
                     take_geometry_snapshot(global_step)
 
                 eval_due = (
                     global_step == 1
                     or global_step % train_cfg.eval_every == 0
                     or (
-                        warmup_steps > 0
+                        warmup_enabled
                         and quantizer_active
-                        and global_step == warmup_steps + 1
+                        and global_step == transition_step + 1
                     )
                 )
                 if eval_due:
@@ -1018,7 +1137,7 @@ def run(
             model_config.bottleneck_type == "vq"
             and last_eval_quantizer_active is not True
         ):
-            vq_step = max(1, global_step - warmup_steps)
+            vq_step = max(1, global_step - (transition_step or 0))
             beta = (
                 scheduled_commitment_beta(model_config, collapse_config, vq_step)
                 if quantizer_active
@@ -1114,11 +1233,15 @@ def run(
             "status": "completed",
             "steps": global_step,
             "epochs": train_cfg.epochs,
-            "ae_warmup_steps": warmup_steps,
-            "final_phase": current_phase(),
-            "codebook_transition_step": (
-                warmup_steps if warmup_steps > 0 else None
+            "ae_warmup_mode": train_cfg.ae_warmup_mode,
+            "configured_ae_warmup_steps": train_cfg.ae_warmup_steps,
+            "configured_ae_warmup_max_steps": train_cfg.ae_warmup_max_steps,
+            "actual_ae_warmup_steps": transition_step if warmup_enabled else 0,
+            "ae_warmup_stop_reason": (
+                warmup_stop_reason if warmup_enabled else None
             ),
+            "final_phase": current_phase(),
+            "codebook_transition_step": transition_step if warmup_enabled else None,
             "best_eval_loss": best_eval_loss,
             "best_step": best_step,
             "final_eval": {k: v for k, v in last_eval.items() if k != "code_counts"},

@@ -133,10 +133,15 @@ def main():
         persistent_workers=True,
     )
     codebook_init_loader = None
+    ae_warmup_enabled = (
+        train_cfg.ae_warmup_steps > 0
+        if train_cfg.ae_warmup_mode == "fixed"
+        else True
+    )
     if (
         model_cfg.bottleneck_type == "vq"
         and train_cfg.codebook_init == "kmeans"
-        and train_cfg.ae_warmup_steps > 0
+        and ae_warmup_enabled
     ):
         codebook_init_loader = make_loader(
             train_dataset,
@@ -191,7 +196,7 @@ def main():
     if (
         model_cfg.bottleneck_type == "vq"
         and train_cfg.codebook_init == "kmeans"
-        and train_cfg.ae_warmup_steps == 0
+        and not ae_warmup_enabled
     ):
         print("[Codebook init] Running encoder pass and fitting MiniBatch K-Means...")
         init_result = initialize_codebook_kmeans(model, train_loader, device, seed=train_cfg.seed)
@@ -241,10 +246,16 @@ def main():
     print(f"[Device] {device}")
     print(f"[Params] {param_count:,}")
     print(f"[Bottleneck] {model_cfg.bottleneck_type}")
-    if train_cfg.ae_warmup_steps > 0:
+    if ae_warmup_enabled:
+        warmup_schedule = (
+            f"adaptive min={train_cfg.ae_warmup_min_steps} "
+            f"max={train_cfg.ae_warmup_max_steps}"
+            if train_cfg.ae_warmup_mode == "adaptive"
+            else f"fixed steps=1..{train_cfg.ae_warmup_steps}"
+        )
         print(
-            f"[AE warmup] steps=1..{train_cfg.ae_warmup_steps}; "
-            f"K-means before step {train_cfg.ae_warmup_steps + 1}"
+            f"[AE warmup] {warmup_schedule}; "
+            "K-means immediately before the first VQ step"
         )
     print(
         f"[Dimensions] embedding={model_cfg.d_model} "

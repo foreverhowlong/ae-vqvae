@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, get_args
 
 from common.text_vqvae_config import (
+    AEWarmupMode,
     BottleneckType,
     CodebookInitialization,
     CollapsePreset,
@@ -139,10 +140,28 @@ def add_arguments(parser) -> None:
         help="Codebook initialisation strategy.",
     )
     g.add_argument(
+        "--ae-warmup-mode",
+        choices=get_args(AEWarmupMode),
+        default=None,
+        help="Use a fixed AE duration or adaptively stop on latent-dimension plateau.",
+    )
+    g.add_argument(
         "--ae-warmup-steps",
         type=int,
         default=None,
-        help="Bypass VQ for N optimizer steps, then fit K-means before step N+1.",
+        help="Fixed-mode AE steps before fitting K-means.",
+    )
+    g.add_argument("--ae-warmup-min-steps", type=int, default=None)
+    g.add_argument("--ae-warmup-max-steps", type=int, default=None)
+    g.add_argument("--ae-warmup-check-every", type=int, default=None)
+    g.add_argument("--ae-warmup-patience", type=int, default=None)
+    g.add_argument("--ae-warmup-dim-tolerance", type=int, default=None)
+    g.add_argument("--ae-warmup-probe-points", type=int, default=None)
+    g.add_argument(
+        "--ae-warmup-variance-threshold",
+        type=float,
+        default=None,
+        help="Explained-variance threshold for the auxiliary PCA effective dimension.",
     )
 
     # ---- data ----
@@ -314,11 +333,48 @@ def build_train_config(args) -> TrainConfig:
         "tokenizer": getattr(args, "tokenizer", None),
         "tokenizer_path": getattr(args, "tokenizer_path", None),
         "codebook_init": getattr(args, "codebook_init", None),
+        "ae_warmup_mode": getattr(args, "ae_warmup_mode", None),
         "ae_warmup_steps": getattr(args, "ae_warmup_steps", None),
+        "ae_warmup_min_steps": getattr(args, "ae_warmup_min_steps", None),
+        "ae_warmup_max_steps": getattr(args, "ae_warmup_max_steps", None),
+        "ae_warmup_check_every": getattr(args, "ae_warmup_check_every", None),
+        "ae_warmup_patience": getattr(args, "ae_warmup_patience", None),
+        "ae_warmup_dim_tolerance": getattr(
+            args, "ae_warmup_dim_tolerance", None
+        ),
+        "ae_warmup_probe_points": getattr(args, "ae_warmup_probe_points", None),
+        "ae_warmup_variance_threshold": getattr(
+            args, "ae_warmup_variance_threshold", None
+        ),
         "ablation": getattr(args, "ablation", None),
     })
     if config.ae_warmup_steps < 0:
         raise ValueError("--ae-warmup-steps must be non-negative.")
+    if config.ae_warmup_min_steps < 0:
+        raise ValueError("--ae-warmup-min-steps must be non-negative.")
+    if config.ae_warmup_check_every < 1:
+        raise ValueError("--ae-warmup-check-every must be positive.")
+    if config.ae_warmup_patience < 1:
+        raise ValueError("--ae-warmup-patience must be positive.")
+    if config.ae_warmup_dim_tolerance < 0:
+        raise ValueError("--ae-warmup-dim-tolerance must be non-negative.")
+    if config.ae_warmup_probe_points < 2:
+        raise ValueError("--ae-warmup-probe-points must be at least 2.")
+    if not 0 < config.ae_warmup_variance_threshold < 1:
+        raise ValueError("--ae-warmup-variance-threshold must be between 0 and 1.")
+    if config.ae_warmup_mode == "adaptive":
+        if config.ae_warmup_steps != 0:
+            raise ValueError(
+                "--ae-warmup-steps is only valid with --ae-warmup-mode fixed."
+            )
+        if config.ae_warmup_max_steps is None:
+            raise ValueError(
+                "--ae-warmup-max-steps is required with --ae-warmup-mode adaptive."
+            )
+        if config.ae_warmup_max_steps <= config.ae_warmup_min_steps:
+            raise ValueError(
+                "--ae-warmup-max-steps must exceed --ae-warmup-min-steps."
+            )
     if config.tokenizer == "bpe" and not config.tokenizer_path:
         raise ValueError("--tokenizer-path is required when --tokenizer bpe is selected.")
     return config
@@ -464,7 +520,12 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
     })
 
     collapse_cfg = build_collapse_config(args)
-    if train_cfg.ae_warmup_steps > 0:
+    warmup_enabled = (
+        train_cfg.ae_warmup_steps > 0
+        if train_cfg.ae_warmup_mode == "fixed"
+        else True
+    )
+    if warmup_enabled:
         if model_cfg.bottleneck_type != "vq":
             raise ValueError("AE warmup requires --bottleneck-type vq.")
         if train_cfg.codebook_init != "kmeans":
@@ -513,6 +574,28 @@ def build_config_payload(
     geometry_config: DiagnosticsConfig | None = None,
 ) -> dict[str, Any]:
     geometry_config = geometry_config or DiagnosticsConfig()
+    warmup_enabled = (
+        train_cfg.ae_warmup_steps > 0
+        if train_cfg.ae_warmup_mode == "fixed"
+        else True
+    )
+    warmup_schedule = (
+        {
+            "mode": "adaptive",
+            "minimum_step": train_cfg.ae_warmup_min_steps,
+            "maximum_step": train_cfg.ae_warmup_max_steps,
+            "check_every": train_cfg.ae_warmup_check_every,
+            "patience": train_cfg.ae_warmup_patience,
+            "dimension_tolerance": train_cfg.ae_warmup_dim_tolerance,
+            "probe_points": train_cfg.ae_warmup_probe_points,
+            "variance_threshold": train_cfg.ae_warmup_variance_threshold,
+        }
+        if train_cfg.ae_warmup_mode == "adaptive"
+        else {
+            "mode": "fixed",
+            "scheduled_after_step": train_cfg.ae_warmup_steps,
+        }
+    )
     return {
         "config_version": 1,
         **_git_info(),
@@ -527,18 +610,14 @@ def build_config_payload(
                 "method": codebook_init_method,
                 "status": (
                     "deferred"
-                    if train_cfg.ae_warmup_steps > 0
+                    if warmup_enabled
                     else (
                         "completed"
                         if codebook_init_method == "random"
                         else "pending"
                     )
                 ),
-                **(
-                    {"scheduled_after_step": train_cfg.ae_warmup_steps}
-                    if train_cfg.ae_warmup_steps > 0
-                    else {}
-                ),
+                **(warmup_schedule if warmup_enabled else {}),
             }
             if model_cfg.bottleneck_type == "vq"
             else {
@@ -562,7 +641,7 @@ def build_config_payload(
                         if not initial_pca_enabled
                         else (
                             "deferred"
-                            if train_cfg.ae_warmup_steps > 0
+                            if warmup_enabled
                             else "pending"
                         )
                     )

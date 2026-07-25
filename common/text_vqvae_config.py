@@ -19,6 +19,7 @@ DecoderType = Literal["cross_attention", "memory_trunk", "vqgans", "vqganpa"]
 BottleneckType = Literal["vq", "continuous"]
 TokenizerType = Literal["bpe", "byte"]
 CodebookInitialization = Literal["random", "kmeans"]
+AEWarmupMode = Literal["fixed", "adaptive"]
 DataSource = Literal["huggingface", "file"]
 PCAFitMode = Literal["balanced", "all"]
 GeometryRenderBasis = Literal["t0", "first_last", "pooled"]
@@ -43,7 +44,15 @@ class TrainConfig:
     codebook_init: CodebookInitialization = "kmeans"
     # Train the VQ model as a continuous AE for this many optimizer steps,
     # then initialize the codebook with K-means before the next step.
+    ae_warmup_mode: AEWarmupMode = "fixed"
     ae_warmup_steps: int = 0
+    ae_warmup_min_steps: int = 1000
+    ae_warmup_max_steps: int | None = None
+    ae_warmup_check_every: int = 200
+    ae_warmup_patience: int = 5
+    ae_warmup_dim_tolerance: int = 1
+    ae_warmup_probe_points: int = 8192
+    ae_warmup_variance_threshold: float = 0.99
     # Free-form experiment label, not a categorical option.
     ablation: str | None = None
 
