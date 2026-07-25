@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -36,10 +37,25 @@ class AnimationScales:
 
 
 def load_snapshots(run_dir: Path):
-    paths = sorted((run_dir / "geometry").glob("step*.npz"))
+    paths = list((run_dir / "geometry").glob("step*.npz"))
     if not paths:
         raise FileNotFoundError(f"No geometry snapshots found under {run_dir / 'geometry'}")
-    return [(int(path.stem.removeprefix("step")), path) for path in paths]
+    parsed = []
+    suffix_order = {"": 0, "_pre_kmeans": 1, "_post_kmeans": 2}
+    for path in paths:
+        match = re.fullmatch(r"step(\d+)(.*)", path.stem)
+        if match is None:
+            continue
+        parsed.append((int(match.group(1)), suffix_order.get(match.group(2), 3), path))
+    return [(step, path) for step, _, path in sorted(parsed)]
+
+
+def _snapshot_label(path: Path, *, has_codebook: bool) -> str:
+    if path.stem.endswith("_pre_kmeans"):
+        return "AE warmup end (before K-means)"
+    if path.stem.endswith("_post_kmeans"):
+        return "VQ initialization (after K-means)"
+    return "VQ phase" if has_codebook else "AE warmup / continuous latent"
 
 
 def fit_shared_pca(
@@ -85,12 +101,16 @@ def render_frame(
     scales: AnimationScales,
     *,
     run_name: str | None = None,
+    latent_phase_label: str | None = None,
 ) -> None:
     with np.load(path) as data:
         encoder = data["z_e"].astype(np.float32)
         if "codebook" not in data:
             slot_indices = data["slot_indices"].astype(np.int64)
             pad_ratios = data["pad_ratios"].astype(np.float32)
+            snapshot_label = _snapshot_label(path, has_codebook=False)
+            if not path.stem.endswith("_pre_kmeans") and latent_phase_label:
+                snapshot_label = latent_phase_label
             _render_continuous_frame(
                 step,
                 encoder,
@@ -100,6 +120,7 @@ def render_frame(
                 output_path,
                 scales,
                 run_name=run_name,
+                phase_label=snapshot_label,
             )
             return
         codebook = data["codebook"].astype(np.float32)
@@ -170,7 +191,8 @@ def render_frame(
         axis.grid(alpha=.2)
         axis.set_title(axis.get_title(), pad=9)
     fig.suptitle(
-        f"Geometry step {step:,} — used codes {alive.sum():,}/{len(codebook):,}",
+        f"{_snapshot_label(path, has_codebook=True)} — step {step:,} "
+        f"— used codes {alive.sum():,}/{len(codebook):,}",
         fontsize=15,
         x=.5,
         y=.975,
@@ -196,6 +218,7 @@ def _render_continuous_frame(
     scales: AnimationScales,
     *,
     run_name: str | None = None,
+    phase_label: str = "Continuous AE",
 ) -> None:
     """Render latent-only diagnostics for a continuous autoencoder."""
     encoder_2d = pca.transform(encoder)
@@ -265,7 +288,7 @@ def _render_continuous_frame(
         axis.grid(alpha=.2)
         axis.set_title(axis.get_title(), pad=9)
     fig.suptitle(
-        f"Continuous AE latent geometry — step {step:,}",
+        f"{phase_label}: latent geometry — step {step:,}",
         fontsize=15,
         x=.5,
         y=.975,
@@ -410,6 +433,7 @@ def render_latent_centroid_trajectory(
     output_path: Path,
     *,
     run_name: str | None = None,
+    phase_name: str = "Continuous AE",
 ) -> None:
     """Render continuous-latent center and spread dynamics across snapshots."""
     steps = []
@@ -431,14 +455,14 @@ def render_latent_centroid_trajectory(
     for index in {0, len(steps) - 1}:
         axes[0].annotate(f"step {steps[index]:,}", projected[index], fontsize=8)
     axes[0].set(
-        title="Continuous latent centroid trajectory in shared PCA basis",
+        title=f"{phase_name} latent centroid trajectory in shared PCA basis",
         xlabel="PC1",
         ylabel="PC2",
     )
     axes[1].plot(steps, mean_norms, label="mean norm", color="#F58518")
     axes[1].plot(steps, norm_stds, label="norm std", color="#54A24B")
     axes[1].set(
-        title="Continuous latent norm dynamics",
+        title=f"{phase_name} latent norm dynamics",
         xlabel="step",
         ylabel="L2 norm",
     )
@@ -455,6 +479,76 @@ def render_latent_centroid_trajectory(
     plt.close(fig)
 
 
+def render_warmup_transition(
+    snapshots,
+    output_path: Path,
+    *,
+    run_name: str | None = None,
+) -> None:
+    pre = next(
+        ((step, path) for step, path in snapshots if path.stem.endswith("_pre_kmeans")),
+        None,
+    )
+    post = next(
+        ((step, path) for step, path in snapshots if path.stem.endswith("_post_kmeans")),
+        None,
+    )
+    if pre is None or post is None:
+        raise ValueError("Warmup transition snapshots are incomplete.")
+    with np.load(snapshots[0][1]) as start_data:
+        start = start_data["z_e"].astype(np.float32)
+    with np.load(pre[1]) as pre_data:
+        end = pre_data["z_e"].astype(np.float32)
+    with np.load(post[1]) as post_data:
+        codebook = post_data["codebook"].astype(np.float32)
+
+    fit_points = np.concatenate([start, end, codebook])
+    pca = PCA(n_components=2).fit(fit_points)
+    projected = [pca.transform(values) for values in (start, end, codebook)]
+    merged = np.concatenate(projected)
+    low = np.quantile(merged, .002, axis=0)
+    high = np.quantile(merged, .998, axis=0)
+    margin = np.maximum((high - low) * .06, 1e-3)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5), sharex=True, sharey=True)
+    panels = (
+        ("AE warmup start", projected[0], False),
+        ("AE warmup end, before K-means", projected[1], False),
+        ("K-means C0 on warmup latents", projected[1], True),
+    )
+    for ax, (title, latent, show_codes) in zip(axes, panels):
+        ax.scatter(latent[:, 0], latent[:, 1], s=7, alpha=.2, linewidths=0)
+        if show_codes:
+            ax.scatter(
+                projected[2][:, 0],
+                projected[2][:, 1],
+                marker="*",
+                s=55,
+                color="#E45756",
+                edgecolors="#5B1717",
+                linewidths=.4,
+                label="K-means C0",
+            )
+            ax.legend(fontsize=8)
+        ax.set(
+            title=title,
+            xlabel="PC1",
+            xlim=(low[0] - margin[0], high[0] + margin[0]),
+            ylim=(low[1] - margin[1], high[1] + margin[1]),
+        )
+        ax.grid(alpha=.2)
+    axes[0].set_ylabel("PC2")
+    fig.suptitle(f"AE warmup → K-means transition at step {pre[0]:,}", fontsize=15)
+    if run_name:
+        fig.text(
+            .995, .995, f"run: {run_name}",
+            ha="right", va="top", fontsize=7, color="0.35",
+        )
+    fig.tight_layout(rect=(0, 0, 1, .94))
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
 def render_metric_series(
     run_dir: Path,
     output_path: Path,
@@ -462,14 +556,25 @@ def render_metric_series(
     run_name: str | None = None,
 ) -> None:
     rows = []
+    transition_step = None
     with (run_dir / "metrics.jsonl").open(encoding="utf-8") as handle:
         for line in handle:
             row = json.loads(line)
             if row.get("split") == "geometry":
                 rows.append(row)
+            elif row.get("split") == "phase_transition" and transition_step is None:
+                transition_step = row["step"]
     if not rows:
         raise ValueError("metrics.jsonl contains no geometry rows")
-    keys = [key for key in rows[0] if key not in {"split", "step", "elapsed_sec"}]
+    excluded = {
+        "split", "step", "elapsed_sec", "phase", "event", "quantizer_active",
+    }
+    keys = sorted({
+        key
+        for row in rows
+        for key, value in row.items()
+        if key not in excluded and isinstance(value, (int, float))
+    })
     columns = 3
     rows_count = (len(keys) + columns - 1) // columns
     fig, axes = plt.subplots(rows_count, columns, figsize=(15, 3.5 * rows_count), squeeze=False)
@@ -477,6 +582,9 @@ def render_metric_series(
     for ax, key in zip(axes.flat, keys):
         ax.plot(steps, [row.get(key, np.nan) for row in rows], marker=".", linewidth=1.2)
         ax.set(title=key, xlabel="step")
+        if transition_step is not None:
+            ax.axvspan(0, transition_step, color="0.92", alpha=.55, zorder=-10)
+            ax.axvline(transition_step, color="0.35", linestyle=":", linewidth=1)
         ax.grid(alpha=.2)
     for ax in axes.flat[len(keys):]:
         ax.axis("off")
@@ -490,8 +598,14 @@ def render_metric_series(
     plt.close(fig)
 
 
-def assemble_animation(frame_paths, plots_dir: Path, fps: int) -> Path:
-    mp4_path = plots_dir / "geometry_animation.mp4"
+def assemble_animation(
+    frame_paths,
+    plots_dir: Path,
+    fps: int,
+    *,
+    stem: str = "geometry_animation",
+) -> Path:
+    mp4_path = plots_dir / f"{stem}.mp4"
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         try:
@@ -500,11 +614,12 @@ def assemble_animation(frame_paths, plots_dir: Path, fps: int) -> Path:
             ffmpeg = None
     if ffmpeg:
         subprocess.run([
-            ffmpeg, "-y", "-framerate", str(fps), "-i", str(plots_dir / "geometry_frames" / "frame%06d.png"),
+            ffmpeg, "-y", "-framerate", str(fps), "-i",
+            str(frame_paths[0].parent / "frame%06d.png"),
             "-c:v", "libx264", "-pix_fmt", "yuv420p", str(mp4_path),
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return mp4_path
-    gif_path = plots_dir / "geometry_animation.gif"
+    gif_path = plots_dir / f"{stem}.gif"
     images = [Image.open(path) for path in frame_paths]
     try:
         images[0].save(gif_path, save_all=True, append_images=images[1:], duration=1000 // fps, loop=0)
@@ -522,53 +637,106 @@ def render_run(
     keep_frames: bool = False,
 ) -> dict[str, Path]:
     snapshots = load_snapshots(run_dir)
-    with np.load(snapshots[0][1]) as first_snapshot:
-        has_codebook = "codebook" in first_snapshot
     pca = fit_shared_pca(snapshots, basis)
     scales = compute_animation_scales(snapshots, pca)
     plots_dir = run_dir / "plots"
     run_name = run_dir.name
-    frames_dir = plots_dir / "geometry_frames"
-    if frames_dir.exists():
-        shutil.rmtree(frames_dir)
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    frame_paths = []
-    for frame_index, (step, path) in enumerate(snapshots):
-        frame_path = frames_dir / f"frame{frame_index:06d}.png"
-        render_frame(
-            step,
-            path,
-            pca,
-            frame_path,
-            scales,
-            run_name=run_name,
-        )
-        frame_paths.append(frame_path)
-    trajectory_path = plots_dir / (
-        "geometry_code_trajectories.png"
-        if has_codebook
-        else "continuous_latent_trajectory.png"
-    )
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    def render_animation(
+        snapshot_subset,
+        frame_dir_name: str,
+        stem: str,
+        *,
+        latent_phase_label: str | None = None,
+    ) -> Path:
+        frames_dir = plots_dir / frame_dir_name
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir)
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        frame_paths = []
+        for frame_index, (step, path) in enumerate(snapshot_subset):
+            frame_path = frames_dir / f"frame{frame_index:06d}.png"
+            render_frame(
+                step,
+                path,
+                pca,
+                frame_path,
+                scales,
+                run_name=run_name,
+                latent_phase_label=latent_phase_label,
+            )
+            frame_paths.append(frame_path)
+        animation = assemble_animation(frame_paths, plots_dir, fps, stem=stem)
+        if not keep_frames:
+            shutil.rmtree(frames_dir)
+        return animation
+
+    latent_snapshots = []
+    vq_snapshots = []
+    for snapshot in snapshots:
+        with np.load(snapshot[1]) as data:
+            (vq_snapshots if "codebook" in data else latent_snapshots).append(snapshot)
+
+    outputs = {
+        "animation": render_animation(
+            snapshots,
+            "geometry_frames",
+            "geometry_animation",
+            latent_phase_label=(
+                "AE warmup" if vq_snapshots else "Continuous AE"
+            ),
+        ),
+    }
     metrics_path = plots_dir / "geometry_metrics.png"
-    if has_codebook:
-        render_code_trajectories(
-            snapshots,
-            pca,
-            trajectory_path,
-            run_name=run_name,
+    outputs["metrics"] = metrics_path
+
+    if latent_snapshots:
+        latent_trajectory = plots_dir / (
+            "ae_warmup_latent_trajectory.png"
+            if vq_snapshots
+            else "continuous_latent_trajectory.png"
         )
-    else:
         render_latent_centroid_trajectory(
-            snapshots,
+            latent_snapshots,
             pca,
-            trajectory_path,
+            latent_trajectory,
+            run_name=run_name,
+            phase_name="AE warmup" if vq_snapshots else "Continuous AE",
+        )
+        outputs["latent_trajectory"] = latent_trajectory
+    if vq_snapshots:
+        code_trajectory = plots_dir / "vq_code_trajectories.png"
+        render_code_trajectories(
+            vq_snapshots,
+            pca,
+            code_trajectory,
             run_name=run_name,
         )
+        outputs["code_trajectories"] = code_trajectory
+
+    if latent_snapshots and vq_snapshots:
+        outputs["ae_warmup_animation"] = render_animation(
+            latent_snapshots,
+            "ae_warmup_geometry_frames",
+            "ae_warmup_latent_dynamics",
+            latent_phase_label="AE warmup",
+        )
+        outputs["vq_animation"] = render_animation(
+            vq_snapshots,
+            "vq_geometry_frames",
+            "vq_codebook_dynamics",
+        )
+        transition_path = plots_dir / "ae_warmup_to_kmeans_transition.png"
+        render_warmup_transition(
+            snapshots,
+            transition_path,
+            run_name=run_name,
+        )
+        outputs["transition"] = transition_path
+
     render_metric_series(run_dir, metrics_path, run_name=run_name)
-    animation_path = assemble_animation(frame_paths, plots_dir, fps)
-    if not keep_frames:
-        shutil.rmtree(frames_dir)
-    return {"animation": animation_path, "trajectories": trajectory_path, "metrics": metrics_path}
+    return outputs
 
 
 def main() -> None:

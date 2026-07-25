@@ -138,6 +138,12 @@ def add_arguments(parser) -> None:
         "--codebook-init", choices=get_args(CodebookInitialization), default=None,
         help="Codebook initialisation strategy.",
     )
+    g.add_argument(
+        "--ae-warmup-steps",
+        type=int,
+        default=None,
+        help="Bypass VQ for N optimizer steps, then fit K-means before step N+1.",
+    )
 
     # ---- data ----
     g = parser.add_argument_group("data")
@@ -308,8 +314,11 @@ def build_train_config(args) -> TrainConfig:
         "tokenizer": getattr(args, "tokenizer", None),
         "tokenizer_path": getattr(args, "tokenizer_path", None),
         "codebook_init": getattr(args, "codebook_init", None),
+        "ae_warmup_steps": getattr(args, "ae_warmup_steps", None),
         "ablation": getattr(args, "ablation", None),
     })
+    if config.ae_warmup_steps < 0:
+        raise ValueError("--ae-warmup-steps must be non-negative.")
     if config.tokenizer == "bpe" and not config.tokenizer_path:
         raise ValueError("--tokenizer-path is required when --tokenizer bpe is selected.")
     return config
@@ -455,6 +464,11 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
     })
 
     collapse_cfg = build_collapse_config(args)
+    if train_cfg.ae_warmup_steps > 0:
+        if model_cfg.bottleneck_type != "vq":
+            raise ValueError("AE warmup requires --bottleneck-type vq.")
+        if train_cfg.codebook_init != "kmeans":
+            raise ValueError("AE warmup requires --codebook-init kmeans.")
     if model_cfg.bottleneck_type == "continuous":
         if model_cfg.l2_normalize_before_vq:
             raise ValueError(
@@ -512,7 +526,18 @@ def build_config_payload(
             {
                 "method": codebook_init_method,
                 "status": (
-                    "completed" if codebook_init_method == "random" else "pending"
+                    "deferred"
+                    if train_cfg.ae_warmup_steps > 0
+                    else (
+                        "completed"
+                        if codebook_init_method == "random"
+                        else "pending"
+                    )
+                ),
+                **(
+                    {"scheduled_after_step": train_cfg.ae_warmup_steps}
+                    if train_cfg.ae_warmup_steps > 0
+                    else {}
                 ),
             }
             if model_cfg.bottleneck_type == "vq"
@@ -532,7 +557,15 @@ def build_config_payload(
                 "status": (
                     "not_applicable"
                     if model_cfg.bottleneck_type == "continuous"
-                    else ("disabled" if not initial_pca_enabled else "pending")
+                    else (
+                        "disabled"
+                        if not initial_pca_enabled
+                        else (
+                            "deferred"
+                            if train_cfg.ae_warmup_steps > 0
+                            else "pending"
+                        )
+                    )
                 ),
                 **(
                     {"reason": "continuous bottleneck has no codebook"}

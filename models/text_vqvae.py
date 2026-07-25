@@ -311,7 +311,13 @@ class TextVQVAE(nn.Module):
                         break
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        use_quantizer: bool | None = None,
+    ):
         if attention_mask is None:
             resolved_attention_mask = input_ids != self.config.pad_token_id
         else:
@@ -324,10 +330,18 @@ class TextVQVAE(nn.Module):
             attention_mask=resolved_attention_mask,
             return_mask=True,
         )
-        if self.config.bottleneck_type == "continuous":
+        quantizer_active = (
+            self.config.bottleneck_type == "vq"
+            if use_quantizer is None
+            else use_quantizer
+        )
+        if quantizer_active and self.quantizer is None:
+            raise ValueError("Cannot enable quantization for a continuous bottleneck.")
+        if not quantizer_active:
             logits = self.decode(z_e, seq_len=input_ids.shape[1])
             return {
-                "bottleneck_type": "continuous",
+                "bottleneck_type": self.config.bottleneck_type,
+                "quantizer_active": False,
                 "logits": logits,
                 "z_e": z_e,
                 "z_latent": z_e,
@@ -343,6 +357,7 @@ class TextVQVAE(nn.Module):
         logits = self.decode(z_q_st, seq_len=input_ids.shape[1])
         return {
             "bottleneck_type": "vq",
+            "quantizer_active": True,
             "logits": logits,
             "z_e": z_e,
             "z_latent": z_q_st,
@@ -442,7 +457,10 @@ def text_vqvae_losses(
         recon_loss = F.cross_entropy(logits[valid_tokens], targets[valid_tokens])
     else:
         recon_loss = logits.sum() * 0.0
-    if outputs.get("bottleneck_type", "vq") == "continuous":
+    if not outputs.get(
+        "quantizer_active",
+        outputs.get("bottleneck_type", "vq") == "vq",
+    ):
         return {
             "total": recon_loss,
             "recon": recon_loss,

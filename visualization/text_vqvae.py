@@ -173,6 +173,7 @@ def render_pca_comparison(
     output_path: str | Path,
     *,
     run_name: str | None = None,
+    title: str = "Text VQ-VAE initialization: encoder outputs vs. codebook",
 ) -> Path:
     """Render a PCA comparison result to a PNG file."""
     output_path = Path(output_path)
@@ -235,7 +236,7 @@ def render_pca_comparison(
         explained = result.explained_variance_ratio
         ax.set_xlabel(f"PC1 ({explained[0]:.1%} explained variance)")
         ax.set_ylabel(f"PC2 ({explained[1]:.1%} explained variance)")
-        ax.set_title("Text VQ-VAE initialization: encoder outputs vs. codebook")
+        ax.set_title(title)
         ax.grid(True, alpha=0.2)
         ax.legend(frameon=True)
         if run_name:

@@ -132,6 +132,19 @@ def main():
         num_workers=train_cfg.num_workers,
         persistent_workers=True,
     )
+    codebook_init_loader = None
+    if (
+        model_cfg.bottleneck_type == "vq"
+        and train_cfg.codebook_init == "kmeans"
+        and train_cfg.ae_warmup_steps > 0
+    ):
+        codebook_init_loader = make_loader(
+            train_dataset,
+            train_cfg.batch_size,
+            shuffle=False,
+            device=device,
+            num_workers=0,
+        )
     codebook_probe_examples = None
     train_probe_loader = None
     eval_probe_loader = None
@@ -175,7 +188,11 @@ def main():
     atomic_json_dump(config_payload, run_dir / "config.json")
 
     frozen_codebook_c0 = None
-    if model_cfg.bottleneck_type == "vq" and train_cfg.codebook_init == "kmeans":
+    if (
+        model_cfg.bottleneck_type == "vq"
+        and train_cfg.codebook_init == "kmeans"
+        and train_cfg.ae_warmup_steps == 0
+    ):
         print("[Codebook init] Running encoder pass and fitting MiniBatch K-Means...")
         init_result = initialize_codebook_kmeans(model, train_loader, device, seed=train_cfg.seed)
         frozen_codebook_c0 = model.quantizer.codebook.weight.detach().clone()
@@ -224,6 +241,11 @@ def main():
     print(f"[Device] {device}")
     print(f"[Params] {param_count:,}")
     print(f"[Bottleneck] {model_cfg.bottleneck_type}")
+    if train_cfg.ae_warmup_steps > 0:
+        print(
+            f"[AE warmup] steps=1..{train_cfg.ae_warmup_steps}; "
+            f"K-means before step {train_cfg.ae_warmup_steps + 1}"
+        )
     print(
         f"[Dimensions] embedding={model_cfg.d_model} "
         f"latent={model_cfg.resolved_latent_dim}"
@@ -249,6 +271,7 @@ def main():
             val_loader=val_loader,
             train_probe_loader=train_probe_loader,
             eval_probe_loader=eval_probe_loader,
+            codebook_init_loader=codebook_init_loader,
             frozen_codebook_c0=frozen_codebook_c0,
             train_cfg=train_cfg,
             data_cfg=data_cfg,

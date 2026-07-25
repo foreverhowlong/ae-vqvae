@@ -57,6 +57,11 @@ python -m training.run_text_vqvae_experiment --decoder-type memory_trunk
 # use kmeans codebook initialization instead of random
 python -m training.run_text_vqvae_experiment --codebook-init kmeans
 
+# train as a continuous AE for 1,000 optimizer steps, then fit K-means C0
+# immediately before step 1,001 and continue as a VQ-VAE
+python -m training.run_text_vqvae_experiment \
+    --codebook-init kmeans --ae-warmup-steps 1000
+
 # change the slot-level PAD exclusion threshold (default: 0.5)
 python -m training.run_text_vqvae_experiment --slot-pad-ratio-threshold 0.5
 

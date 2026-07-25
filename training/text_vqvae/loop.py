@@ -18,6 +18,7 @@ from common.text_vqvae_config import (
     TrainConfig,
 )
 from models.text_vqvae import codebook_stats, text_vqvae_losses
+from training.text_vqvae.codebook_init import initialize_codebook_kmeans
 from training.text_vqvae.reporting import (
     append_jsonl,
     build_reconstruction_rows,
@@ -136,11 +137,26 @@ def prune_checkpoints(checkpoint_dir: Path, keep_recent: int = 2) -> None:
         stale_checkpoint.unlink()
 
 
-def save_checkpoint(model, optimizer, step: int, epoch: int, run_dir: Path, name: str) -> Path:
+def save_checkpoint(
+    model,
+    optimizer,
+    step: int,
+    epoch: int,
+    run_dir: Path,
+    name: str,
+    *,
+    phase: str | None = None,
+) -> Path:
     checkpoint_dir = run_dir / "checkpoints"
     path = checkpoint_dir / name
     torch.save(
-        {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step, "epoch": epoch},
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "epoch": epoch,
+            "phase": phase,
+        },
         path,
     )
     prune_checkpoints(checkpoint_dir)
@@ -180,9 +196,24 @@ def _nearest_code_indices(
     return distances.argmin(dim=-1)
 
 
-def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_clip: float, beta: float, step: int):
-    outputs = model(batch["input_ids"], batch["attention_mask"])
-    is_vq = outputs.get("bottleneck_type", "vq") == "vq"
+def optimizer_step(
+    model,
+    optimizer,
+    batch,
+    model_config,
+    collapse_config,
+    grad_clip: float,
+    beta: float,
+    step: int,
+    *,
+    use_quantizer: bool | None = None,
+):
+    outputs = model(
+        batch["input_ids"],
+        batch["attention_mask"],
+        use_quantizer=use_quantizer,
+    )
+    is_vq = outputs.get("quantizer_active", False)
     codebook_weight = (
         model.quantizer.codebook.weight
         if model.quantizer is not None
@@ -205,6 +236,7 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
     reset_count = 0
     if (
         collapse_config.dead_code_reset_every > 0
+        and is_vq
         and step % collapse_config.dead_code_reset_every == 0
         and model.quantizer is not None
         and hasattr(model.quantizer, "reset_dead_codes")
@@ -270,9 +302,14 @@ def evaluate(
     tokenizer=None,
     max_reconstruction_items: int = 16,
     frozen_codebook_c0: torch.Tensor | None = None,
+    use_quantizer: bool | None = None,
 ):
     was_training = model.training
-    is_vq = model_config.bottleneck_type == "vq"
+    is_vq = (
+        model_config.bottleneck_type == "vq"
+        if use_quantizer is None
+        else use_quantizer
+    )
     total_loss = 0.0
     total_recon = 0.0
     total_codebook = 0.0
@@ -296,7 +333,11 @@ def evaluate(
         model.eval()
         for batch in data_loader:
             batch = batch_to_device(batch, device)
-            outputs = model(batch["input_ids"], batch["attention_mask"])
+            outputs = model(
+                batch["input_ids"],
+                batch["attention_mask"],
+                use_quantizer=use_quantizer,
+            )
             codebook_weight = (
                 model.quantizer.codebook.weight
                 if model.quantizer is not None
@@ -524,29 +565,44 @@ def run(
     geometry_snapshot_opts: dict | None = None,
     train_probe_loader=None,
     eval_probe_loader=None,
+    codebook_init_loader=None,
     frozen_codebook_c0: torch.Tensor | None = None,
 ):
     from training.text_vqvae.reporting import atomic_json_dump
     import shutil
 
     initialization_started = time.time()
-    try:
-        run_initial_pca(
-            model, val_loader, run_dir, train_cfg, config_payload, **initial_pca_opts
-        )
-    except Exception as exc:
-        atomic_json_dump(config_payload, run_dir / "config.json")
-        atomic_json_dump(
-            {
-                "run_name": run_name,
-                "status": "failed",
-                "steps": 0,
-                "error": repr(exc),
-                "elapsed_sec": time.time() - initialization_started,
-            },
-            run_dir / "summary.json",
-        )
-        raise
+    warmup_steps = train_cfg.ae_warmup_steps
+    quantizer_active = (
+        model_config.bottleneck_type == "vq" and warmup_steps == 0
+    )
+    if warmup_steps > 0:
+        if codebook_init_loader is None:
+            raise ValueError("AE warmup requires a dedicated K-means initialization loader.")
+        total_steps = train_cfg.epochs * len(train_loader)
+        if warmup_steps >= total_steps:
+            raise ValueError(
+                "AE warmup must leave at least one VQ optimizer step, got "
+                f"warmup_steps={warmup_steps} and total_steps={total_steps}."
+            )
+    else:
+        try:
+            run_initial_pca(
+                model, val_loader, run_dir, train_cfg, config_payload, **initial_pca_opts
+            )
+        except Exception as exc:
+            atomic_json_dump(config_payload, run_dir / "config.json")
+            atomic_json_dump(
+                {
+                    "run_name": run_name,
+                    "status": "failed",
+                    "steps": 0,
+                    "error": repr(exc),
+                    "elapsed_sec": time.time() - initialization_started,
+                },
+                run_dir / "summary.json",
+            )
+            raise
     atomic_json_dump(config_payload, run_dir / "config.json")
 
     metrics_path = run_dir / "metrics.jsonl"
@@ -554,6 +610,7 @@ def run(
     best_step = 0
     global_step = 0
     last_eval = None
+    last_eval_quantizer_active: bool | None = None
     last_codebook_probe = None
     train_utilization_window: list[float] = []
     train_assignment_count_window: list[int] = []
@@ -561,14 +618,43 @@ def run(
     geometry_opts = geometry_snapshot_opts or {"enabled": False}
     probe_batches = None
 
-    def take_geometry_snapshot(step: int) -> None:
+    def current_phase() -> str:
+        if model_config.bottleneck_type == "continuous":
+            return "continuous"
+        return "vq" if quantizer_active else "ae_warmup"
+
+    def take_geometry_snapshot(
+        step: int,
+        *,
+        event: str | None = None,
+        filename_suffix: str = "",
+        include_codebook: bool | None = None,
+    ) -> None:
         if probe_batches is None:
             return
         try:
-            geometry_metrics = dump_geometry_snapshot(model, probe_batches, step, run_dir)
+            if include_codebook is None:
+                include_codebook = quantizer_active
+            geometry_metrics = dump_geometry_snapshot(
+                model,
+                probe_batches,
+                step,
+                run_dir,
+                include_codebook=include_codebook,
+                filename_suffix=filename_suffix,
+            )
+            row = {
+                "split": "geometry",
+                "step": step,
+                "phase": current_phase(),
+                "quantizer_active": int(include_codebook),
+                "elapsed_sec": time.time() - start_time,
+                **geometry_metrics,
+            }
+            if event is not None:
+                row["event"] = event
             append_jsonl(
-                {"split": "geometry", "step": step,
-                 "elapsed_sec": time.time() - start_time, **geometry_metrics},
+                row,
                 metrics_path,
             )
             tracker.log({f"geometry/{k}": v for k, v in geometry_metrics.items()}, step=step)
@@ -598,9 +684,12 @@ def run(
                 raise
             print(f"[Geometry] warning during probe setup: {exc!r}; snapshots disabled.")
 
-    if config_payload["diagnostics"]["initial_pca"].get("status") == "completed":
+    def record_initial_pca_metrics(step: int, event: str) -> None:
+        diagnostic = config_payload["diagnostics"]["initial_pca"]
+        if diagnostic.get("status") != "completed":
+            return
         initial_metrics = {
-            key: config_payload["diagnostics"]["initial_pca"]["result"][key]
+            key: diagnostic["result"][key]
             for key in (
                 "encoder_mean_norm",
                 "encoder_norm_std",
@@ -611,24 +700,138 @@ def run(
             )
         }
         append_jsonl(
-            {"split": "initialization", "step": 0, "elapsed_sec": 0.0, **initial_metrics},
+            {
+                "split": "initialization",
+                "step": step,
+                "phase": current_phase(),
+                "event": event,
+                "elapsed_sec": time.time() - start_time,
+                **initial_metrics,
+            },
             metrics_path,
         )
-        tracker.log({f"initial/{k}": v for k, v in initial_metrics.items()}, step=0)
+        tracker.log({f"initial/{k}": v for k, v in initial_metrics.items()}, step=step)
+
+    if warmup_steps == 0:
+        record_initial_pca_metrics(0, "initial_codebook")
+
+    def initialize_after_warmup(epoch: int) -> None:
+        nonlocal frozen_codebook_c0, quantizer_active
+        take_geometry_snapshot(
+            global_step,
+            event="pre_kmeans",
+            filename_suffix="_pre_kmeans",
+            include_codebook=False,
+        )
+        print(
+            f"[Phase transition] AE warmup completed at step {global_step}; "
+            "fitting MiniBatch K-Means..."
+        )
+        with preserve_rng_state():
+            init_result = initialize_codebook_kmeans(
+                model,
+                codebook_init_loader,
+                device,
+                seed=train_cfg.seed,
+            )
+        frozen_codebook_c0 = model.quantizer.codebook.weight.detach().clone()
+        snapshot_path = run_dir / "codebook_c0_kmeans.pt"
+        torch.save(
+            {
+                "label": "C0",
+                "method": "kmeans",
+                "transition_step": global_step,
+                "codebook_weight": frozen_codebook_c0.cpu(),
+            },
+            snapshot_path,
+        )
+        quantizer_active = True
+        config_payload["codebook_initialization"].update({
+            "status": "completed",
+            "transition_step": global_step,
+            **init_result,
+            "c0_snapshot": {
+                "label": "C0",
+                "path": snapshot_path.name,
+                "shape": list(frozen_codebook_c0.shape),
+            },
+        })
+        with preserve_rng_state():
+            run_initial_pca(
+                model,
+                val_loader,
+                run_dir,
+                train_cfg,
+                config_payload,
+                **initial_pca_opts,
+                artifact_name="post_warmup_kmeans_pca.png",
+                title=(
+                    f"Encoder latents after {warmup_steps}-step AE warmup "
+                    "vs. K-means codebook C0"
+                ),
+            )
+        atomic_json_dump(config_payload, run_dir / "config.json")
+        transition_metrics = {
+            "split": "phase_transition",
+            "epoch": epoch,
+            "step": global_step,
+            "event": "kmeans_initialized",
+            "from_phase": "ae_warmup",
+            "to_phase": "vq",
+            "elapsed_sec": time.time() - start_time,
+            **init_result,
+        }
+        append_jsonl(transition_metrics, metrics_path)
+        tracker.log(
+            {f"transition/{key}": value for key, value in init_result.items()},
+            step=global_step,
+        )
+        record_initial_pca_metrics(global_step, "post_warmup_kmeans")
+        take_geometry_snapshot(
+            global_step,
+            event="post_kmeans",
+            filename_suffix="_post_kmeans",
+            include_codebook=True,
+        )
+        train_utilization_window.clear()
+        train_assignment_count_window.clear()
+        print(
+            f"[Phase transition] K-means initialized C0 from "
+            f"{init_result['encoder_vectors']:,} encoder vectors; entering VQ phase."
+        )
 
     try:
         for epoch in range(1, train_cfg.epochs + 1):
             model.train()
             for batch in train_loader:
+                if (
+                    warmup_steps > 0
+                    and not quantizer_active
+                    and global_step == warmup_steps
+                ):
+                    initialize_after_warmup(epoch)
+
                 global_step += 1
                 batch = batch_to_device(batch, device)
-                beta = scheduled_commitment_beta(model_config, collapse_config, global_step)
+                vq_step = (
+                    global_step - warmup_steps
+                    if model_config.bottleneck_type == "vq" and quantizer_active
+                    else 0
+                )
+                beta = (
+                    scheduled_commitment_beta(model_config, collapse_config, vq_step)
+                    if quantizer_active
+                    else model_config.commitment_beta
+                )
                 train_metrics = optimizer_step(
                     model, optimizer, batch, model_config, collapse_config,
-                    train_cfg.grad_clip, beta, global_step,
+                    train_cfg.grad_clip, beta, vq_step or global_step,
+                    use_quantizer=quantizer_active,
                 )
                 append_jsonl(
                     {"split": "train", "epoch": epoch, "step": global_step,
+                     "vq_step": vq_step, "phase": current_phase(),
+                     "quantizer_active": int(quantizer_active),
                      "elapsed_sec": time.time() - start_time, **train_metrics},
                     metrics_path,
                 )
@@ -641,15 +844,31 @@ def run(
                         train_metrics["codebook_assignment_count"]
                     )
 
-                if probe_batches is not None and geometry_snapshot_due(
-                    global_step,
-                    dense_every=geometry_opts["dense_every"],
-                    dense_until=geometry_opts["dense_until"],
-                    sparse_every=geometry_opts["sparse_every"],
-                ):
+                geometry_due = (
+                    probe_batches is not None
+                    and (
+                        global_step == warmup_steps + 1
+                        or geometry_snapshot_due(
+                            global_step,
+                            dense_every=geometry_opts["dense_every"],
+                            dense_until=geometry_opts["dense_until"],
+                            sparse_every=geometry_opts["sparse_every"],
+                        )
+                    )
+                )
+                if geometry_due and global_step != warmup_steps:
                     take_geometry_snapshot(global_step)
 
-                if global_step == 1 or global_step % train_cfg.eval_every == 0:
+                eval_due = (
+                    global_step == 1
+                    or global_step % train_cfg.eval_every == 0
+                    or (
+                        warmup_steps > 0
+                        and quantizer_active
+                        and global_step == warmup_steps + 1
+                    )
+                )
+                if eval_due:
                     if train_utilization_window:
                         train_window_metrics = {
                             "codebook_utilization_batch_mean": (
@@ -667,6 +886,9 @@ def run(
                                 "split": "train_window",
                                 "epoch": epoch,
                                 "step": global_step,
+                                "vq_step": vq_step,
+                                "phase": current_phase(),
+                                "quantizer_active": int(quantizer_active),
                                 "elapsed_sec": time.time() - start_time,
                                 **train_window_metrics,
                             },
@@ -691,9 +913,13 @@ def run(
                         beta,
                         tokenizer=tokenizer,
                         frozen_codebook_c0=frozen_codebook_c0,
+                        use_quantizer=quantizer_active,
                     )
+                    last_eval_quantizer_active = quantizer_active
                     append_jsonl(
                         {"split": "eval", "epoch": epoch, "step": global_step,
+                         "vq_step": vq_step, "phase": current_phase(),
+                         "quantizer_active": int(quantizer_active),
                          "elapsed_sec": time.time() - start_time,
                          **{k: v for k, v in last_eval.items() if k != "code_counts"}},
                         metrics_path,
@@ -702,7 +928,7 @@ def run(
                         {f"eval/{k}": v for k, v in last_eval.items() if k != "code_counts"},
                         step=global_step,
                     )
-                    if train_probe_loader is not None:
+                    if quantizer_active and train_probe_loader is not None:
                         train_probe = evaluate_codebook_usage(
                             model,
                             train_probe_loader,
@@ -726,6 +952,9 @@ def run(
                                 "split": "codebook_probe",
                                 "epoch": epoch,
                                 "step": global_step,
+                                "vq_step": vq_step,
+                                "phase": current_phase(),
+                                "quantizer_active": 1,
                                 "elapsed_sec": time.time() - start_time,
                                 **last_codebook_probe,
                             },
@@ -742,10 +971,21 @@ def run(
                         reconstruction_rows,
                         run_dir / "samples" / f"recon_step{global_step}.jsonl",
                     )
-                    if last_eval["loss"] < best_eval_loss:
+                    if (
+                        (model_config.bottleneck_type == "continuous" or quantizer_active)
+                        and last_eval["loss"] < best_eval_loss
+                    ):
                         best_eval_loss = last_eval["loss"]
                         best_step = global_step
-                        save_checkpoint(model, optimizer, global_step, epoch, run_dir, "best.pt")
+                        save_checkpoint(
+                            model,
+                            optimizer,
+                            global_step,
+                            epoch,
+                            run_dir,
+                            "best.pt",
+                            phase=current_phase(),
+                        )
                     utilization_detail = (
                         f" util_full={last_eval['codebook_utilization_full']:.3f}"
                         if "codebook_utilization_full" in last_eval
@@ -764,10 +1004,26 @@ def run(
                     )
 
                 if global_step % train_cfg.save_every == 0:
-                    save_checkpoint(model, optimizer, global_step, epoch, run_dir, f"step{global_step}.pt")
+                    save_checkpoint(
+                        model,
+                        optimizer,
+                        global_step,
+                        epoch,
+                        run_dir,
+                        f"step{global_step}.pt",
+                        phase=current_phase(),
+                    )
 
-        if last_eval is None:
-            beta = scheduled_commitment_beta(model_config, collapse_config, global_step)
+        if last_eval is None or (
+            model_config.bottleneck_type == "vq"
+            and last_eval_quantizer_active is not True
+        ):
+            vq_step = max(1, global_step - warmup_steps)
+            beta = (
+                scheduled_commitment_beta(model_config, collapse_config, vq_step)
+                if quantizer_active
+                else model_config.commitment_beta
+            )
             last_eval, _ = evaluate(
                 model,
                 val_loader,
@@ -776,8 +1032,10 @@ def run(
                 collapse_config,
                 beta,
                 frozen_codebook_c0=frozen_codebook_c0,
+                use_quantizer=quantizer_active,
             )
-            if train_probe_loader is not None:
+            last_eval_quantizer_active = quantizer_active
+            if quantizer_active and train_probe_loader is not None:
                 train_probe = evaluate_codebook_usage(
                     model, train_probe_loader, device, model_config
                 )
@@ -791,7 +1049,15 @@ def run(
                     eval_probe,
                 )
 
-        save_checkpoint(model, optimizer, global_step, train_cfg.epochs, run_dir, "last.pt")
+        save_checkpoint(
+            model,
+            optimizer,
+            global_step,
+            train_cfg.epochs,
+            run_dir,
+            "last.pt",
+            phase=current_phase(),
+        )
         if probe_batches is not None and not geometry_snapshot_due(
             global_step,
             dense_every=geometry_opts["dense_every"],
@@ -848,6 +1114,11 @@ def run(
             "status": "completed",
             "steps": global_step,
             "epochs": train_cfg.epochs,
+            "ae_warmup_steps": warmup_steps,
+            "final_phase": current_phase(),
+            "codebook_transition_step": (
+                warmup_steps if warmup_steps > 0 else None
+            ),
             "best_eval_loss": best_eval_loss,
             "best_step": best_step,
             "final_eval": {k: v for k, v in last_eval.items() if k != "code_counts"},

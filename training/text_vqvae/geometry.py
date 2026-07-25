@@ -132,7 +132,15 @@ def finalize_geometry_artifacts(
 
 
 @torch.no_grad()
-def dump_geometry_snapshot(model, probe_batches, step: int, run_dir: Path) -> dict[str, float | int]:
+def dump_geometry_snapshot(
+    model,
+    probe_batches,
+    step: int,
+    run_dir: Path,
+    *,
+    include_codebook: bool | None = None,
+    filename_suffix: str = "",
+) -> dict[str, float | int]:
     """Dump unprojected vectors/assignments and return full-dimensional metrics."""
     device = next(model.parameters()).device
     was_training = model.training
@@ -159,7 +167,7 @@ def dump_geometry_snapshot(model, probe_batches, step: int, run_dir: Path) -> di
             pad_ratios = torch.cat(pad_chunks)
             codebook = (
                 model.quantizer.codebook.weight.detach().float().cpu()
-                if model.quantizer is not None
+                if model.quantizer is not None and include_codebook is not False
                 else None
             )
     finally:
@@ -189,7 +197,18 @@ def dump_geometry_snapshot(model, probe_batches, step: int, run_dir: Path) -> di
             "codebook": codebook.numpy().astype(np.float16),
             "assignments": assigned.numpy().astype(np.int32),
         })
-    np.savez_compressed(geometry_dir / f"step{step:06d}.npz", **snapshot)
+    if filename_suffix and (
+        not filename_suffix.startswith("_")
+        or not filename_suffix[1:].replace("_", "").isalnum()
+    ):
+        raise ValueError(
+            "filename_suffix must be empty or start with '_' and contain "
+            "only letters, digits, and underscores."
+        )
+    np.savez_compressed(
+        geometry_dir / f"step{step:06d}{filename_suffix}.npz",
+        **snapshot,
+    )
 
     norms = encoder.norm(dim=1)
     covariance = torch.cov(encoder.T) if len(encoder) > 1 else torch.zeros((encoder.shape[1], encoder.shape[1]))

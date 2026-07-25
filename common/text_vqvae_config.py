@@ -41,6 +41,9 @@ class TrainConfig:
     tokenizer_path: str | None = str(DEFAULT_BPE_TOKENIZER_PATH)
     # Research flag: "random" is the control; "kmeans" uses an encoder pre-pass.
     codebook_init: CodebookInitialization = "kmeans"
+    # Train the VQ model as a continuous AE for this many optimizer steps,
+    # then initialize the codebook with K-means before the next step.
+    ae_warmup_steps: int = 0
     # Free-form experiment label, not a categorical option.
     ablation: str | None = None
 

@@ -131,14 +131,30 @@ def plot_training_curves(
     train_window_rows = [r for r in rows if r["split"] == "train_window"]
     probe_rows = [r for r in rows if r["split"] == "codebook_probe"]
     geometry_rows = [r for r in rows if r["split"] == "geometry"]
+    transition_rows = [r for r in rows if r["split"] == "phase_transition"]
+    transition_step = transition_rows[0]["step"] if transition_rows else None
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
     if train_rows:
-        axes[0, 0].plot([r["step"] for r in train_rows], [r["loss"] for r in train_rows], label="train")
+        for phase, label in (("ae_warmup", "train total (AE)"), ("vq", "train total (VQ)")):
+            phase_rows = [r for r in train_rows if r.get("phase") == phase]
+            if phase_rows:
+                axes[0, 0].plot(
+                    [r["step"] for r in phase_rows],
+                    [r["loss"] for r in phase_rows],
+                    label=label,
+                )
+        legacy_rows = [r for r in train_rows if "phase" not in r]
+        if legacy_rows:
+            axes[0, 0].plot(
+                [r["step"] for r in legacy_rows],
+                [r["loss"] for r in legacy_rows],
+                label="train",
+            )
     if eval_rows:
         axes[0, 0].plot([r["step"] for r in eval_rows], [r["loss"] for r in eval_rows], label="eval")
-    axes[0, 0].set_title("Loss")
+    axes[0, 0].set_title("Training objective by phase")
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
 
@@ -240,10 +256,24 @@ def plot_training_curves(
             utilization_title = "Continuous bottleneck: latent norm dynamics"
         else:
             utilization_title = "Codebook metrics not applicable (continuous bottleneck)"
+    if transition_step is not None and has_codebook_curves:
+        utilization_title += f" (VQ phase after step {transition_step})"
     axes[1, 1].set_title(utilization_title)
     if axes[1, 1].lines:
         axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
+
+    if transition_step is not None:
+        for ax in axes.flat:
+            ax.axvspan(0, transition_step, color="0.92", alpha=0.55, zorder=-10)
+            ax.axvline(
+                transition_step,
+                color="0.35",
+                linestyle=":",
+                linewidth=1,
+                label="K-means init" if ax is axes[0, 0] else None,
+            )
+        axes[0, 0].legend()
 
     _add_run_label(fig, run_name)
     fig.tight_layout(rect=(0, 0, 1, 0.985))
@@ -296,6 +326,8 @@ def run_initial_pca(
     max_points: int,
     fit_mode: PCAFitMode,
     strict: bool,
+    artifact_name: str = "initial_latent_codebook_pca.png",
+    title: str = "Text VQ-VAE initialization: encoder outputs vs. codebook",
 ) -> None:
     if not enabled:
         return
@@ -307,7 +339,7 @@ def run_initial_pca(
         print("[Initial PCA] skipped: continuous bottleneck has no codebook.")
         return
 
-    pca_path = run_dir / "plots" / "initial_latent_codebook_pca.png"
+    pca_path = run_dir / "plots" / artifact_name
     try:
         encoder_vectors = collect_encoder_vectors(model, val_loader, max_points=max_points)
         pca_result = compare_vector_distributions_pca(
@@ -321,6 +353,7 @@ def run_initial_pca(
             pca_result,
             pca_path,
             run_name=train_cfg.run_name,
+            title=title,
         )
         save_pca_metadata(pca_result, pca_path.with_suffix(".json"))
         pca_metadata = pca_result.metadata()

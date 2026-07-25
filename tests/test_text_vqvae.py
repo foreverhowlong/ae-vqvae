@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from dataclasses import asdict
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -53,7 +54,9 @@ from visualization.text_vqvae import (
 from visualization.render_geometry_animation import (
     compute_animation_scales,
     fit_shared_pca,
+    load_snapshots,
     render_frame,
+    render_run,
 )
 
 
@@ -103,6 +106,37 @@ class EvaluationPipelineTest(unittest.TestCase):
             set(metrics),
             {"loss", "recon_nll", "token_accuracy", "grad_norm"},
         )
+
+    def test_vq_bypass_behaves_as_ae_without_updating_codebook(self):
+        config = small_config()
+        collapse_config = CollapseControlConfig(use_ema_codebook=True)
+        model = TextVQVAE(config, collapse_config=collapse_config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.1)
+        batch = {
+            "input_ids": torch.randint(0, 31, (2, 12)),
+            "attention_mask": torch.ones(2, 12, dtype=torch.long),
+        }
+        codebook_before = model.quantizer.codebook.weight.detach().clone()
+        cluster_before = model.quantizer.ema_cluster_size.detach().clone()
+
+        metrics = optimizer_step(
+            model,
+            optimizer,
+            batch,
+            config,
+            collapse_config,
+            grad_clip=1.0,
+            beta=config.commitment_beta,
+            step=1,
+            use_quantizer=False,
+        )
+
+        self.assertEqual(
+            set(metrics),
+            {"loss", "recon_nll", "token_accuracy", "grad_norm"},
+        )
+        torch.testing.assert_close(model.quantizer.codebook.weight, codebook_before)
+        torch.testing.assert_close(model.quantizer.ema_cluster_size, cluster_before)
 
     def test_evaluate_collects_reconstructions_in_one_pass_and_restores_mode(self):
         config = small_config()
@@ -495,6 +529,31 @@ class GeometrySnapshotTest(unittest.TestCase):
         self.assertNotIn("used_codes", metrics)
         self.assertNotIn("nearest_code_distance_p50", metrics)
 
+    def test_vq_snapshot_can_omit_codebook_and_use_transition_suffix(self):
+        model = TextVQVAE(small_config())
+        probe = [{
+            "input_ids": torch.randint(0, 31, (2, 12)),
+            "attention_mask": torch.ones(2, 12, dtype=torch.long),
+        }]
+
+        with TemporaryDirectory() as temp_dir:
+            metrics = dump_geometry_snapshot(
+                model,
+                probe,
+                5,
+                Path(temp_dir),
+                include_codebook=False,
+                filename_suffix="_pre_kmeans",
+            )
+            snapshot_path = (
+                Path(temp_dir) / "geometry" / "step000005_pre_kmeans.npz"
+            )
+            with np.load(snapshot_path) as snapshot:
+                self.assertNotIn("codebook", snapshot.files)
+                self.assertNotIn("assignments", snapshot.files)
+
+        self.assertNotIn("used_codes", metrics)
+
     def test_successful_finalization_removes_raw_snapshots(self):
         with TemporaryDirectory() as temp_dir:
             run_dir = Path(temp_dir)
@@ -562,6 +621,101 @@ class GeometrySnapshotTest(unittest.TestCase):
 
 
 class GeometryAnimationTest(unittest.TestCase):
+    def test_mixed_warmup_and_vq_snapshots_render_phase_artifacts(self):
+        with TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            geometry_dir = run_dir / "geometry"
+            plots_dir = run_dir / "plots"
+            geometry_dir.mkdir()
+            plots_dir.mkdir()
+            latent = np.array(
+                [[0.0, 0.0], [1.0, .5], [2.0, 1.0], [3.0, 1.5]],
+                dtype=np.float32,
+            )
+            common = {
+                "pad_ratios": np.array([0.0, .25, .5, 1.0], dtype=np.float32),
+                "slot_indices": np.array([0, 1, 2, 3], dtype=np.int16),
+            }
+            np.savez_compressed(
+                geometry_dir / "step000000.npz",
+                z_e=latent,
+                **common,
+            )
+            np.savez_compressed(
+                geometry_dir / "step000002_pre_kmeans.npz",
+                z_e=latent + 1,
+                **common,
+            )
+            codebook = latent + 1
+            for name, offset in (
+                ("step000002_post_kmeans.npz", 1.0),
+                ("step000003.npz", 1.25),
+            ):
+                encoder = latent + offset
+                np.savez_compressed(
+                    geometry_dir / name,
+                    z_e=encoder,
+                    codebook=codebook,
+                    assignments=np.arange(4, dtype=np.int32),
+                    **common,
+                )
+            (run_dir / "metrics.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "split": "geometry", "step": 0,
+                        "encoder_mean_norm": 1.0,
+                    }),
+                    json.dumps({
+                        "split": "geometry", "step": 2,
+                        "event": "pre_kmeans", "encoder_mean_norm": 2.0,
+                    }),
+                    json.dumps({
+                        "split": "phase_transition", "step": 2,
+                    }),
+                    json.dumps({
+                        "split": "geometry", "step": 2,
+                        "event": "post_kmeans", "encoder_mean_norm": 2.0,
+                        "used_codes": 4,
+                    }),
+                    json.dumps({
+                        "split": "geometry", "step": 3,
+                        "encoder_mean_norm": 2.5, "used_codes": 4,
+                    }),
+                ]) + "\n"
+            )
+
+            def fake_assemble(frame_paths, received_plots_dir, fps, *, stem):
+                path = received_plots_dir / f"{stem}.mp4"
+                path.write_bytes(b"video")
+                return path
+
+            with patch(
+                "visualization.render_geometry_animation.assemble_animation",
+                side_effect=fake_assemble,
+            ):
+                outputs = render_run(run_dir, keep_frames=False)
+
+            ordered = [path.name for _, path in load_snapshots(run_dir)]
+            self.assertEqual(
+                ordered,
+                [
+                    "step000000.npz",
+                    "step000002_pre_kmeans.npz",
+                    "step000002_post_kmeans.npz",
+                    "step000003.npz",
+                ],
+            )
+            for key in (
+                "animation",
+                "ae_warmup_animation",
+                "vq_animation",
+                "latent_trajectory",
+                "code_trajectories",
+                "transition",
+                "metrics",
+            ):
+                self.assertTrue(outputs[key].is_file(), key)
+
     def test_frames_use_global_scales_without_pad_coloring(self):
         with TemporaryDirectory() as temp_dir:
             run_dir = Path(temp_dir)
@@ -1557,6 +1711,7 @@ class ConfigDefaultsTest(unittest.TestCase):
 
         self.assertEqual(train.seed, 42)
         self.assertEqual(train.batch_size, 32)
+        self.assertEqual(train.ae_warmup_steps, 0)
         self.assertAlmostEqual(train.lr, 3e-4)
         self.assertEqual(data.max_train_samples, 50000)
         self.assertEqual(data.val_fraction, 0.02)
@@ -1652,6 +1807,34 @@ class ConfigDefaultsTest(unittest.TestCase):
 
         self.assertEqual(model.bottleneck_type, "continuous")
         self.assertFalse(collapse.enabled)
+
+    def test_ae_warmup_requires_vq_and_kmeans(self):
+        from training.text_vqvae.config import build_configs
+
+        tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
+        train, _, model, _ = build_configs(
+            self._parse("--ae-warmup-steps", "12"),
+            tokenizer,
+        )
+        self.assertEqual(train.ae_warmup_steps, 12)
+        self.assertEqual(model.bottleneck_type, "vq")
+
+        with self.assertRaisesRegex(ValueError, "requires --bottleneck-type vq"):
+            build_configs(
+                self._parse(
+                    "--bottleneck-type", "continuous",
+                    "--ae-warmup-steps", "12",
+                ),
+                tokenizer,
+            )
+        with self.assertRaisesRegex(ValueError, "requires --codebook-init kmeans"):
+            build_configs(
+                self._parse(
+                    "--codebook-init", "random",
+                    "--ae-warmup-steps", "12",
+                ),
+                tokenizer,
+            )
 
     def test_continuous_bottleneck_rejects_vq_only_cli_options(self):
         from training.text_vqvae.config import build_configs
@@ -1787,6 +1970,110 @@ class LoadRunConfigTest(unittest.TestCase):
 
 
 class TrainingLifecycleTest(unittest.TestCase):
+    def test_ae_warmup_switches_to_kmeans_vq_before_next_step(self):
+        from common.text_data import ByteTokenizer
+        from training.text_vqvae.config import DataConfig, TrainConfig
+        from training.text_vqvae.loop import run
+
+        config = small_config(codebook_size=4)
+        collapse_config = CollapseControlConfig()
+        model = TextVQVAE(config, collapse_config=collapse_config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        batches = [{
+            "input_ids": torch.randint(0, 31, (2, 12)),
+            "attention_mask": torch.ones(2, 12, dtype=torch.long),
+        } for _ in range(3)]
+        tracker = SimpleNamespace(log=lambda *args, **kwargs: None, summary={})
+
+        with TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            for child in ("checkpoints", "plots", "samples"):
+                (run_dir / child).mkdir()
+            payload = {
+                "codebook_initialization": {
+                    "method": "kmeans",
+                    "status": "deferred",
+                    "scheduled_after_step": 2,
+                },
+                "diagnostics": {
+                    "initial_pca": {"status": "disabled"},
+                    "geometry": {},
+                },
+            }
+            run(
+                model=model,
+                optimizer=optimizer,
+                train_loader=batches,
+                val_loader=[batches[0]],
+                codebook_init_loader=batches,
+                train_probe_loader=[batches[0]],
+                train_cfg=TrainConfig(
+                    epochs=1,
+                    eval_every=100,
+                    save_every=100,
+                    ae_warmup_steps=2,
+                    tokenizer="byte",
+                    tokenizer_path=None,
+                ),
+                data_cfg=DataConfig(),
+                model_config=config,
+                collapse_config=collapse_config,
+                run_dir=run_dir,
+                run_name="ae-warmup-smoke",
+                tokenizer=ByteTokenizer(),
+                device=torch.device("cpu"),
+                config_payload=payload,
+                tracker=tracker,
+                initial_pca_opts={
+                    "enabled": False,
+                    "max_points": 8,
+                    "fit_mode": "balanced",
+                    "strict": True,
+                },
+                geometry_snapshot_opts={
+                    "enabled": True,
+                    "dense_every": 1,
+                    "dense_until": 3,
+                    "sparse_every": 1,
+                    "probe_points": 8,
+                    "strict": True,
+                    "render_enabled": False,
+                    "render_basis": "first_last",
+                    "render_fps": 8,
+                    "keep_snapshots": True,
+                },
+            )
+
+            rows = [
+                json.loads(line)
+                for line in (run_dir / "metrics.jsonl").read_text().splitlines()
+            ]
+            train_rows = [row for row in rows if row["split"] == "train"]
+            self.assertEqual(
+                [row["phase"] for row in train_rows],
+                ["ae_warmup", "ae_warmup", "vq"],
+            )
+            self.assertNotIn("codebook_utilization_batch", train_rows[0])
+            self.assertNotIn("codebook_utilization_batch", train_rows[1])
+            self.assertIn("codebook_utilization_batch", train_rows[2])
+            transitions = [
+                row for row in rows if row["split"] == "phase_transition"
+            ]
+            self.assertEqual(len(transitions), 1)
+            self.assertEqual(transitions[0]["step"], 2)
+            probe_rows = [row for row in rows if row["split"] == "codebook_probe"]
+            self.assertEqual([row["step"] for row in probe_rows], [3])
+            self.assertTrue((run_dir / "codebook_c0_kmeans.pt").is_file())
+            self.assertTrue(
+                (run_dir / "geometry" / "step000002_pre_kmeans.npz").is_file()
+            )
+            self.assertTrue(
+                (run_dir / "geometry" / "step000002_post_kmeans.npz").is_file()
+            )
+            summary = json.loads((run_dir / "summary.json").read_text())
+            self.assertEqual(summary["best_step"], 3)
+            self.assertEqual(summary["final_phase"], "vq")
+
     def test_strict_initial_pca_failure_writes_failed_summary(self):
         import json
         from training.text_vqvae.config import DataConfig, TrainConfig
