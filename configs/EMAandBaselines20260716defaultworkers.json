@@ -1,0 +1,28 @@
+{
+  "module": "training.run_text_vqvae_experiment",
+  "experiments": [
+    {
+          	"use-ema-codebook":true,
+          	"latent-slots":128,
+          	"decoder-type":"memory_trunk",
+          	"codebook-init":"kmeans",
+            "num-workers":4
+        },
+  	{
+        	"use-ema-codebook":true,
+        	"latent-slots":256,
+        	"decoder-type":"memory_trunk",
+        	"codebook-init":"kmeans",
+          "num-workers":4
+      },
+    {
+      	
+      	"latent-slots":256,
+      	"decoder-type":"memory_trunk",
+      	"codebook-init":"kmeans",
+        "num-workers":4
+    }
+    
+  ]
+}
+
