@@ -1,0 +1,29 @@
+{
+  "module": "training.run_text_vqvae_experiment",
+  "experiments": [
+    {
+      "encoder-type": "rope",
+      "use-ema-codebook":true,
+      "d_model": 32
+    },
+    {
+      "encoder-type": "rope",
+      "bottleneck_type": "continuous",
+      "use-ema-codebook":true,
+      "d_model": 32
+    },
+    {
+      "encoder-type": "vqganpa",
+      "decoder-type": "vqganpa",
+      "use-ema-codebook":true,
+      "d_model": 32
+    },
+    {
+      "encoder-type": "vqgans",
+      "decoder-type": "vqgans",
+      "use-ema-codebook":true,
+      "d_model": 32
+    }
+  ],
+  "_comments": "修复投影，看看能不能立刻提高util。同时，加入了AE对比实验"
+}
