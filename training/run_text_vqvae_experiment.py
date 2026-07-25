@@ -8,6 +8,7 @@ import time
 from dataclasses import asdict
 
 import torch
+from torch.utils.data import Subset
 
 from common import ROOT, enable_tf32, get_device
 from common.text_data import BPETokenizer, ByteTokenizer, build_text_dataset
@@ -131,6 +132,29 @@ def main():
         num_workers=train_cfg.num_workers,
         persistent_workers=True,
     )
+    codebook_probe_examples = min(len(train_dataset), len(val_dataset))
+    train_probe_dataset = Subset(
+        train_dataset,
+        range(codebook_probe_examples),
+    )
+    train_probe_loader = make_loader(
+        train_probe_dataset,
+        train_cfg.batch_size,
+        shuffle=False,
+        device=device,
+        # Keep this diagnostic loader single-process so it does not retain a
+        # second set of training-dataset workers between evaluations.
+        num_workers=0,
+    )
+    eval_probe_loader = None
+    if codebook_probe_examples < len(val_dataset):
+        eval_probe_loader = make_loader(
+            Subset(val_dataset, range(codebook_probe_examples)),
+            train_cfg.batch_size,
+            shuffle=False,
+            device=device,
+            num_workers=0,
+        )
 
     model = TextVQVAE(model_cfg, collapse_config=collapse_cfg).to(device)
 
@@ -147,12 +171,35 @@ def main():
     )
     atomic_json_dump(config_payload, run_dir / "config.json")
 
+    frozen_codebook_c0 = None
     if train_cfg.codebook_init == "kmeans":
         print("[Codebook init] Running encoder pass and fitting MiniBatch K-Means...")
         init_result = initialize_codebook_kmeans(model, train_loader, device, seed=train_cfg.seed)
-        config_payload["codebook_initialization"].update({"status": "completed", **init_result})
+        frozen_codebook_c0 = model.quantizer.codebook.weight.detach().clone()
+        snapshot_path = run_dir / "codebook_c0_kmeans.pt"
+        torch.save(
+            {
+                "label": "C0",
+                "method": "kmeans",
+                "codebook_weight": frozen_codebook_c0.cpu(),
+            },
+            snapshot_path,
+        )
+        config_payload["codebook_initialization"].update({
+            "status": "completed",
+            **init_result,
+            "c0_snapshot": {
+                "label": "C0",
+                "path": snapshot_path.name,
+                "shape": list(frozen_codebook_c0.shape),
+            },
+        })
         atomic_json_dump(config_payload, run_dir / "config.json")
-        print(f"[Codebook init] K-means completed from {init_result['encoder_vectors']:,} encoder vectors")
+        print(
+            "[Codebook init] K-means completed from "
+            f"{init_result['encoder_vectors']:,} encoder vectors; "
+            f"saved frozen C0 to {snapshot_path.name}"
+        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
 
@@ -165,6 +212,7 @@ def main():
     }
     config_payload["data"]["train_examples"] = len(train_dataset)
     config_payload["data"]["eval_examples"] = len(val_dataset)
+    config_payload["data"]["codebook_probe_examples"] = codebook_probe_examples
     atomic_json_dump(config_payload, run_dir / "config.json")
 
     print(f"[Run] {run_name}")
@@ -185,6 +233,9 @@ def main():
             optimizer=optimizer,
             train_loader=train_loader,
             val_loader=val_loader,
+            train_probe_loader=train_probe_loader,
+            eval_probe_loader=eval_probe_loader,
+            frozen_codebook_c0=frozen_codebook_c0,
             train_cfg=train_cfg,
             data_cfg=data_cfg,
             model_config=model_cfg,

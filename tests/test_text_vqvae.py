@@ -37,9 +37,11 @@ from training.text_vqvae.loop import (
     compute_accuracy,
     compute_bits_per_token,
     evaluate,
+    evaluate_codebook_usage,
     make_loader,
     save_checkpoint,
 )
+from training.text_vqvae.reporting import plot_training_curves
 from training.text_vqvae.geometry import dump_geometry_snapshot, finalize_geometry_artifacts
 from visualization.text_vqvae import (
     collect_encoder_vectors,
@@ -102,6 +104,7 @@ class EvaluationPipelineTest(unittest.TestCase):
         tokenizer = SimpleNamespace(
             decode=lambda ids: " ".join(str(token_id) for token_id in ids)
         )
+        frozen_codebook_c0 = model.quantizer.codebook.weight.detach().clone()
 
         metrics, rows = evaluate(
             model,
@@ -111,6 +114,7 @@ class EvaluationPipelineTest(unittest.TestCase):
             collapse_config,
             beta=config.commitment_beta,
             tokenizer=tokenizer,
+            frozen_codebook_c0=frozen_codebook_c0,
         )
 
         self.assertEqual(loader.iterations, 1)
@@ -120,6 +124,153 @@ class EvaluationPipelineTest(unittest.TestCase):
         self.assertEqual(len(rows[0]["reconstruction"].split()), 6)
         self.assertIn("loss", metrics)
         self.assertEqual(len(metrics["code_counts"]), config.codebook_size)
+        self.assertEqual(
+            metrics["codebook_utilization"],
+            metrics["codebook_utilization_full"],
+        )
+        self.assertIn("codebook_utilization_batch_mean", metrics)
+        self.assertGreater(metrics["codebook_assignment_count"], 0)
+        self.assertEqual(
+            metrics["codebook_utilization_frozen_c0"],
+            metrics["codebook_utilization_full"],
+        )
+
+    def test_codebook_probe_is_eval_only_and_preserves_rng_ema_and_mode(self):
+        config = small_config()
+        collapse_config = CollapseControlConfig(use_ema_codebook=True)
+        model = TextVQVAE(config, collapse_config=collapse_config)
+        model.train()
+        loader = [{
+            "input_ids": torch.tensor([
+                [1, 2, 3, 4, 5, 6, 31, 31, 31, 31, 31, 31],
+                [7, 8, 9, 10, 11, 12, 13, 14, 31, 31, 31, 31],
+            ]),
+            "attention_mask": torch.tensor([
+                [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+            ]),
+        }]
+        codebook_before = model.quantizer.codebook.weight.detach().clone()
+        cluster_size_before = model.quantizer.ema_cluster_size.detach().clone()
+        rng_before = torch.random.get_rng_state().clone()
+
+        metrics = evaluate_codebook_usage(
+            model,
+            loader,
+            torch.device("cpu"),
+            config,
+        )
+
+        self.assertTrue(model.training)
+        self.assertTrue(torch.equal(torch.random.get_rng_state(), rng_before))
+        self.assertTrue(torch.equal(
+            model.quantizer.codebook.weight,
+            codebook_before,
+        ))
+        self.assertTrue(torch.equal(
+            model.quantizer.ema_cluster_size,
+            cluster_size_before,
+        ))
+        self.assertEqual(metrics["examples"], 2)
+        self.assertGreater(metrics["codebook_assignment_count"], 0)
+
+    def test_eval_batch_mean_excludes_the_partial_final_batch(self):
+        config = small_config()
+        collapse_config = CollapseControlConfig()
+        model = TextVQVAE(config, collapse_config=collapse_config)
+        samples = [
+            {
+                "input_ids": torch.tensor(
+                    [1, 2, 3, 4, 5, 6, 31, 31, 31, 31, 31, 31]
+                ),
+                "attention_mask": torch.tensor(
+                    [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]
+                ),
+            }
+            for _ in range(3)
+        ]
+        loader = make_loader(
+            samples,
+            batch_size=2,
+            shuffle=False,
+            device=torch.device("cpu"),
+            num_workers=0,
+        )
+
+        metrics, _ = evaluate(
+            model,
+            loader,
+            torch.device("cpu"),
+            config,
+            collapse_config,
+            beta=config.commitment_beta,
+            max_reconstruction_items=0,
+        )
+
+        self.assertEqual(metrics["examples"], 3)
+        self.assertEqual(metrics["codebook_batch_size"], 2)
+        self.assertEqual(metrics["codebook_batch_count"], 1)
+
+    def test_training_plot_prefers_matched_probes_and_adds_compact_run_label(self):
+        import json
+
+        with TemporaryDirectory() as temp_dir:
+            plot_dir = Path(temp_dir)
+            metrics_path = plot_dir / "metrics.jsonl"
+            rows = [
+                {
+                    "split": "train",
+                    "step": 1,
+                    "loss": 1.0,
+                    "token_accuracy": 0.5,
+                    "codebook_utilization": 0.25,
+                },
+                {
+                    "split": "train_window",
+                    "step": 1,
+                    "codebook_utilization_batch_mean": 0.25,
+                },
+                {
+                    "split": "eval",
+                    "step": 1,
+                    "loss": 1.1,
+                    "token_ppl": 3.0,
+                    "token_accuracy": 0.4,
+                    "codebook_utilization": 0.5,
+                    "codebook_utilization_batch_mean": 0.3,
+                    "codebook_utilization_frozen_c0": 0.2,
+                },
+                {
+                    "split": "codebook_probe",
+                    "step": 1,
+                    "train_utilization": 0.4,
+                    "eval_utilization": 0.5,
+                },
+            ]
+            metrics_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            with (
+                patch("matplotlib.figure.Figure.text") as figure_text,
+                patch("matplotlib.axes.Axes.set_title") as set_title,
+            ):
+                plot_training_curves(
+                    metrics_path,
+                    plot_dir,
+                    run_name="compact-run-name",
+                )
+
+            self.assertTrue((plot_dir / "training_curves.png").is_file())
+            self.assertEqual(
+                figure_text.call_args.args[2],
+                "run: compact-run-name",
+            )
+            self.assertIn(
+                "Codebook utilization: current codebook vs frozen K-means C0",
+                [call.args[0] for call in set_title.call_args_list],
+            )
 
     def test_persistent_workers_are_opt_in_and_require_workers(self):
         device = torch.device("cpu")

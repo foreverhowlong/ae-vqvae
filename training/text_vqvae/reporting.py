@@ -100,7 +100,25 @@ def write_reconstruction_samples(model, data_loader, device, model_config, token
 # Plots
 # ---------------------------------------------------------------------------
 
-def plot_training_curves(metrics_path: Path, plot_dir: Path) -> None:
+def _add_run_label(fig, run_name: str | None) -> None:
+    if run_name:
+        fig.text(
+            0.995,
+            0.995,
+            f"run: {run_name}",
+            ha="right",
+            va="top",
+            fontsize=7,
+            color="0.35",
+        )
+
+
+def plot_training_curves(
+    metrics_path: Path,
+    plot_dir: Path,
+    *,
+    run_name: str | None = None,
+) -> None:
     rows = []
     with metrics_path.open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -110,6 +128,8 @@ def plot_training_curves(metrics_path: Path, plot_dir: Path) -> None:
 
     train_rows = [r for r in rows if r["split"] == "train"]
     eval_rows = [r for r in rows if r["split"] == "eval"]
+    train_window_rows = [r for r in rows if r["split"] == "train_window"]
+    probe_rows = [r for r in rows if r["split"] == "codebook_probe"]
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
@@ -134,20 +154,83 @@ def plot_training_curves(metrics_path: Path, plot_dir: Path) -> None:
     axes[1, 0].legend()
     axes[1, 0].grid(True, alpha=0.3)
 
-    if train_rows:
-        axes[1, 1].plot([r["step"] for r in train_rows], [r["codebook_utilization"] for r in train_rows], label="train util")
-    if eval_rows:
-        axes[1, 1].plot([r["step"] for r in eval_rows], [r["codebook_utilization"] for r in eval_rows], label="eval util")
-    axes[1, 1].set_title("Codebook utilization")
+    if probe_rows:
+        axes[1, 1].plot(
+            [r["step"] for r in probe_rows],
+            [r["train_utilization"] for r in probe_rows],
+            label="train probe, current codebook (eval mode)",
+        )
+        axes[1, 1].plot(
+            [r["step"] for r in probe_rows],
+            [r["eval_utilization"] for r in probe_rows],
+            label="eval probe, current codebook (matched N)",
+        )
+    else:
+        # Compatibility fallback for metrics written before matched probes.
+        if train_rows:
+            axes[1, 1].plot(
+                [r["step"] for r in train_rows],
+                [r["codebook_utilization"] for r in train_rows],
+                label="train batch, current codebook",
+            )
+        if eval_rows:
+            axes[1, 1].plot(
+                [r["step"] for r in eval_rows],
+                [r["codebook_utilization"] for r in eval_rows],
+                label="eval full-set, current codebook",
+            )
+
+    eval_batch_rows = [
+        r for r in eval_rows if "codebook_utilization_batch_mean" in r
+    ]
+    frozen_c0_rows = [
+        r for r in eval_rows if "codebook_utilization_frozen_c0" in r
+    ]
+    if train_window_rows:
+        axes[1, 1].plot(
+            [r["step"] for r in train_window_rows],
+            [r["codebook_utilization_batch_mean"] for r in train_window_rows],
+            linestyle="--",
+            alpha=0.7,
+            label="train batch mean, current codebook",
+        )
+    if eval_batch_rows:
+        axes[1, 1].plot(
+            [r["step"] for r in eval_batch_rows],
+            [r["codebook_utilization_batch_mean"] for r in eval_batch_rows],
+            linestyle="--",
+            alpha=0.7,
+            label="eval batch mean, current codebook",
+        )
+    if frozen_c0_rows:
+        axes[1, 1].plot(
+            [r["step"] for r in frozen_c0_rows],
+            [r["codebook_utilization_frozen_c0"] for r in frozen_c0_rows],
+            linestyle=":",
+            linewidth=2,
+            label="eval full-set, frozen K-means C0",
+        )
+        utilization_title = (
+            "Codebook utilization: current codebook vs frozen K-means C0"
+        )
+    else:
+        utilization_title = "Codebook utilization: current codebook"
+    axes[1, 1].set_title(utilization_title)
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
 
-    fig.tight_layout()
+    _add_run_label(fig, run_name)
+    fig.tight_layout(rect=(0, 0, 1, 0.985))
     fig.savefig(plot_dir / "training_curves.png", dpi=160)
     plt.close(fig)
 
 
-def plot_codebook_usage(counts, plot_dir: Path) -> None:
+def plot_codebook_usage(
+    counts,
+    plot_dir: Path,
+    *,
+    run_name: str | None = None,
+) -> None:
     counts_tensor = torch.tensor(counts, dtype=torch.float)
     sorted_counts = torch.sort(counts_tensor, descending=True).values.numpy()
     nonzero = counts_tensor[counts_tensor > 0].numpy()
@@ -166,7 +249,8 @@ def plot_codebook_usage(counts, plot_dir: Path) -> None:
     axes[1].set_ylabel("Codes")
     axes[1].grid(True, alpha=0.3)
 
-    fig.tight_layout()
+    _add_run_label(fig, run_name)
+    fig.tight_layout(rect=(0, 0, 1, 0.985))
     fig.savefig(plot_dir / "codebook_usage.png", dpi=160)
     plt.close(fig)
 
@@ -200,7 +284,11 @@ def run_initial_pca(
             fit_mode=fit_mode,
             random_state=train_cfg.seed,
         )
-        render_pca_comparison(pca_result, pca_path)
+        render_pca_comparison(
+            pca_result,
+            pca_path,
+            run_name=train_cfg.run_name,
+        )
         save_pca_metadata(pca_result, pca_path.with_suffix(".json"))
         pca_metadata = pca_result.metadata()
         config_payload["diagnostics"]["initial_pca"].update(

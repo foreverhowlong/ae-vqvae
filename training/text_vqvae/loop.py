@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
 from common.text_vqvae_config import (
@@ -31,6 +32,7 @@ from training.text_vqvae.geometry import (
     finalize_geometry_artifacts,
     geometry_snapshot_due,
     materialize_geometry_probe,
+    preserve_rng_state,
 )
 
 
@@ -149,6 +151,35 @@ def save_checkpoint(model, optimizer, step: int, epoch: int, run_dir: Path, name
 # Train / eval steps
 # ---------------------------------------------------------------------------
 
+def _nearest_code_indices(
+    z_e: torch.Tensor,
+    valid_mask: torch.Tensor,
+    codebook_weight: torch.Tensor,
+    *,
+    normalize_latents: bool,
+) -> torch.Tensor:
+    """Assign valid encoder vectors to a supplied, read-only codebook."""
+    vectors = z_e[valid_mask.to(device=z_e.device, dtype=torch.bool)]
+    if vectors.numel() == 0:
+        return torch.empty(0, dtype=torch.long, device=z_e.device)
+
+    weights = codebook_weight.to(device=z_e.device, dtype=z_e.dtype)
+    if weights.ndim != 2 or weights.shape[1] != z_e.shape[-1]:
+        raise ValueError(
+            "Frozen codebook must have shape [codes, latent_dim], got "
+            f"{tuple(weights.shape)} for latent_dim={z_e.shape[-1]}."
+        )
+    if normalize_latents:
+        vectors = F.normalize(vectors, dim=-1)
+        weights = F.normalize(weights, dim=-1)
+    distances = (
+        vectors.pow(2).sum(dim=1, keepdim=True)
+        - 2 * vectors @ weights.t()
+        + weights.pow(2).sum(dim=1).unsqueeze(0)
+    )
+    return distances.argmin(dim=-1)
+
+
 def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_clip: float, beta: float, step: int):
     outputs = model(batch["input_ids"], batch["attention_mask"])
     losses = text_vqvae_losses(
@@ -184,6 +215,7 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
         attention_mask=batch["attention_mask"],
     )
     stats = codebook_stats(outputs["indices"], model_config.codebook_size, valid_mask=outputs["latent_mask"])
+    assignment_count = int(stats["counts"].sum().item())
     return {
         "loss": losses["total"].item(),
         "recon_nll": losses["recon"].item(),
@@ -195,11 +227,14 @@ def optimizer_step(model, optimizer, batch, model_config, collapse_config, grad_
         "commitment_beta": beta,
         "token_accuracy": correct / max(total, 1),
         "grad_norm": float(grad_norm),
+        # Compatibility field: this is the utilization of one training batch.
         "codebook_utilization": stats["utilization"],
+        "codebook_utilization_batch": stats["utilization"],
+        "codebook_assignment_count": assignment_count,
         "codebook_perplexity": stats["codebook_perplexity"],
         "bits_per_token": compute_bits_per_token(
             stats["codebook_perplexity"],
-            int(stats["counts"].sum().item()),
+            assignment_count,
             total,
         ),
         "dead_code_resets": reset_count,
@@ -217,6 +252,7 @@ def evaluate(
     *,
     tokenizer=None,
     max_reconstruction_items: int = 16,
+    frozen_codebook_c0: torch.Tensor | None = None,
 ):
     was_training = model.training
     total_loss = 0.0
@@ -230,8 +266,13 @@ def evaluate(
     total_tokens = 0
     all_indices: list[torch.Tensor] = []
     all_latent_masks: list[torch.Tensor] = []
+    frozen_c0_indices: list[torch.Tensor] = []
+    batch_utilizations: list[float] = []
+    batch_assignment_counts: list[int] = []
+    batch_example_counts: list[int] = []
     reconstruction_rows: list[dict[str, str]] = []
     batches = 0
+    total_examples = 0
 
     try:
         model.eval()
@@ -265,7 +306,27 @@ def evaluate(
             total_tokens += tokens
             all_indices.append(outputs["indices"].detach().cpu())
             all_latent_masks.append(outputs["latent_mask"].detach().cpu())
+            if frozen_codebook_c0 is not None:
+                frozen_c0_indices.append(
+                    _nearest_code_indices(
+                        outputs["z_e"],
+                        outputs["latent_mask"],
+                        frozen_codebook_c0,
+                        normalize_latents=collapse_config.normalize_latents,
+                    ).cpu()
+                )
+            batch_stats = codebook_stats(
+                outputs["indices"],
+                model_config.codebook_size,
+                valid_mask=outputs["latent_mask"],
+            )
+            batch_utilizations.append(batch_stats["utilization"])
+            batch_assignment_counts.append(
+                int(batch_stats["counts"].sum().item())
+            )
+            batch_example_counts.append(int(batch["input_ids"].shape[0]))
             batches += 1
+            total_examples += int(batch["input_ids"].shape[0])
 
             remaining = max_reconstruction_items - len(reconstruction_rows)
             if tokenizer is not None and remaining > 0:
@@ -283,8 +344,16 @@ def evaluate(
     merged_indices = torch.cat(all_indices, dim=0)
     merged_latent_masks = torch.cat(all_latent_masks, dim=0)
     stats = codebook_stats(merged_indices, model_config.codebook_size, valid_mask=merged_latent_masks)
+    assignment_count = int(stats["counts"].sum().item())
+    comparison_batch_size = max(batch_example_counts, default=0)
+    comparison_batch_indices = [
+        index
+        for index, example_count in enumerate(batch_example_counts)
+        if example_count == comparison_batch_size
+    ]
     avg_recon = total_recon / max(batches, 1)
     metrics = {
+        "examples": total_examples,
         "loss": total_loss / max(batches, 1),
         "recon_nll": avg_recon,
         "token_ppl": math.exp(min(avg_recon, 20.0)),
@@ -295,18 +364,104 @@ def evaluate(
         "diversity_loss": total_diversity / max(batches, 1),
         "commitment_beta": beta,
         "token_accuracy": total_correct / max(total_tokens, 1),
+        # Compatibility field: evaluation utilization is aggregated over the
+        # full validation loader.
         "codebook_utilization": stats["utilization"],
+        "codebook_utilization_full": stats["utilization"],
+        "codebook_utilization_batch_mean": (
+            sum(batch_utilizations[index] for index in comparison_batch_indices)
+            / max(len(comparison_batch_indices), 1)
+        ),
+        "codebook_assignment_count": assignment_count,
+        "codebook_assignment_count_batch_mean": (
+            sum(
+                batch_assignment_counts[index]
+                for index in comparison_batch_indices
+            )
+            / max(len(comparison_batch_indices), 1)
+        ),
+        "codebook_batch_size": comparison_batch_size,
+        "codebook_batch_count": len(comparison_batch_indices),
         "codebook_perplexity": stats["codebook_perplexity"],
         "bits_per_token": compute_bits_per_token(
             stats["codebook_perplexity"],
-            int(stats["counts"].sum().item()),
+            assignment_count,
             total_tokens,
         ),
         "used_codes": stats["used_codes"],
         "dead_codes": stats["dead_codes"],
         "code_counts": stats["counts"].tolist(),
     }
+    if frozen_codebook_c0 is not None:
+        frozen_c0_stats = codebook_stats(
+            torch.cat(frozen_c0_indices, dim=0),
+            model_config.codebook_size,
+        )
+        metrics["codebook_utilization_frozen_c0"] = frozen_c0_stats["utilization"]
     return metrics, reconstruction_rows
+
+
+@torch.no_grad()
+def evaluate_codebook_usage(model, data_loader, device, model_config):
+    """Measure codebook usage in eval mode without running the decoder."""
+    was_training = model.training
+    all_indices: list[torch.Tensor] = []
+    all_latent_masks: list[torch.Tensor] = []
+    examples = 0
+
+    try:
+        with preserve_rng_state():
+            model.eval()
+            for batch in data_loader:
+                batch = batch_to_device(batch, device)
+                z_e, latent_mask = model.encode(
+                    batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    return_mask=True,
+                )
+                quantized = model.quantizer(z_e, valid_mask=latent_mask)
+                all_indices.append(quantized["indices"].detach().cpu())
+                all_latent_masks.append(latent_mask.detach().cpu())
+                examples += int(batch["input_ids"].shape[0])
+    finally:
+        model.train(was_training)
+
+    if not all_indices:
+        raise ValueError("Cannot evaluate codebook usage from an empty data loader.")
+
+    stats = codebook_stats(
+        torch.cat(all_indices, dim=0),
+        model_config.codebook_size,
+        valid_mask=torch.cat(all_latent_masks, dim=0),
+    )
+    return {
+        "examples": examples,
+        "codebook_utilization": stats["utilization"],
+        "codebook_perplexity": stats["codebook_perplexity"],
+        "codebook_assignment_count": int(stats["counts"].sum().item()),
+        "used_codes": stats["used_codes"],
+        "dead_codes": stats["dead_codes"],
+    }
+
+
+def _matched_codebook_probe_metrics(train_probe, eval_probe):
+    if train_probe["examples"] != eval_probe["examples"]:
+        raise ValueError(
+            "Codebook probes must use equal example counts, got "
+            f"{train_probe['examples']} train and {eval_probe['examples']} eval."
+        )
+    return {
+        "examples_per_split": train_probe["examples"],
+        "train_utilization": train_probe["codebook_utilization"],
+        "eval_utilization": eval_probe.get(
+            "codebook_utilization_full",
+            eval_probe["codebook_utilization"],
+        ),
+        "train_perplexity": train_probe["codebook_perplexity"],
+        "eval_perplexity": eval_probe["codebook_perplexity"],
+        "train_assignment_count": train_probe["codebook_assignment_count"],
+        "eval_assignment_count": eval_probe["codebook_assignment_count"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +485,9 @@ def run(
     tracker,
     initial_pca_opts: dict,
     geometry_snapshot_opts: dict | None = None,
+    train_probe_loader=None,
+    eval_probe_loader=None,
+    frozen_codebook_c0: torch.Tensor | None = None,
 ):
     from training.text_vqvae.reporting import atomic_json_dump
     import shutil
@@ -359,6 +517,9 @@ def run(
     best_step = 0
     global_step = 0
     last_eval = None
+    last_codebook_probe = None
+    train_utilization_window: list[float] = []
+    train_assignment_count_window: list[int] = []
     start_time = time.time()
     geometry_opts = geometry_snapshot_opts or {"enabled": False}
     probe_batches = None
@@ -430,6 +591,12 @@ def run(
                     metrics_path,
                 )
                 tracker.log({f"train/{k}": v for k, v in train_metrics.items()}, step=global_step)
+                train_utilization_window.append(
+                    train_metrics["codebook_utilization_batch"]
+                )
+                train_assignment_count_window.append(
+                    train_metrics["codebook_assignment_count"]
+                )
 
                 if probe_batches is not None and geometry_snapshot_due(
                     global_step,
@@ -440,6 +607,37 @@ def run(
                     take_geometry_snapshot(global_step)
 
                 if global_step == 1 or global_step % train_cfg.eval_every == 0:
+                    train_window_metrics = {
+                        "codebook_utilization_batch_mean": (
+                            sum(train_utilization_window)
+                            / max(len(train_utilization_window), 1)
+                        ),
+                        "codebook_assignment_count_batch_mean": (
+                            sum(train_assignment_count_window)
+                            / max(len(train_assignment_count_window), 1)
+                        ),
+                        "window_batches": len(train_utilization_window),
+                    }
+                    append_jsonl(
+                        {
+                            "split": "train_window",
+                            "epoch": epoch,
+                            "step": global_step,
+                            "elapsed_sec": time.time() - start_time,
+                            **train_window_metrics,
+                        },
+                        metrics_path,
+                    )
+                    tracker.log(
+                        {
+                            f"train/{key}": value
+                            for key, value in train_window_metrics.items()
+                        },
+                        step=global_step,
+                    )
+                    train_utilization_window.clear()
+                    train_assignment_count_window.clear()
+
                     last_eval, reconstruction_rows = evaluate(
                         model,
                         val_loader,
@@ -448,6 +646,7 @@ def run(
                         collapse_config,
                         beta,
                         tokenizer=tokenizer,
+                        frozen_codebook_c0=frozen_codebook_c0,
                     )
                     append_jsonl(
                         {"split": "eval", "epoch": epoch, "step": global_step,
@@ -459,6 +658,42 @@ def run(
                         {f"eval/{k}": v for k, v in last_eval.items() if k != "code_counts"},
                         step=global_step,
                     )
+                    if train_probe_loader is not None:
+                        train_probe = evaluate_codebook_usage(
+                            model,
+                            train_probe_loader,
+                            device,
+                            model_config,
+                        )
+                        eval_probe = last_eval
+                        if eval_probe_loader is not None:
+                            eval_probe = evaluate_codebook_usage(
+                                model,
+                                eval_probe_loader,
+                                device,
+                                model_config,
+                            )
+                        last_codebook_probe = _matched_codebook_probe_metrics(
+                            train_probe,
+                            eval_probe,
+                        )
+                        append_jsonl(
+                            {
+                                "split": "codebook_probe",
+                                "epoch": epoch,
+                                "step": global_step,
+                                "elapsed_sec": time.time() - start_time,
+                                **last_codebook_probe,
+                            },
+                            metrics_path,
+                        )
+                        tracker.log(
+                            {
+                                f"probe/{key}": value
+                                for key, value in last_codebook_probe.items()
+                            },
+                            step=global_step,
+                        )
                     write_reconstruction_rows(
                         reconstruction_rows,
                         run_dir / "samples" / f"recon_step{global_step}.jsonl",
@@ -470,7 +705,13 @@ def run(
                     print(
                         f"[Eval] step={global_step} loss={last_eval['loss']:.4f} "
                         f"ppl={last_eval['token_ppl']:.2f} acc={last_eval['token_accuracy']:.3f} "
-                        f"util={last_eval['codebook_utilization']:.3f}"
+                        f"util_full={last_eval['codebook_utilization_full']:.3f}"
+                        + (
+                            " util_frozen_c0="
+                            f"{last_eval['codebook_utilization_frozen_c0']:.3f}"
+                            if "codebook_utilization_frozen_c0" in last_eval
+                            else ""
+                        )
                     )
 
                 if global_step % train_cfg.save_every == 0:
@@ -479,8 +720,27 @@ def run(
         if last_eval is None:
             beta = scheduled_commitment_beta(model_config, collapse_config, global_step)
             last_eval, _ = evaluate(
-                model, val_loader, device, model_config, collapse_config, beta
+                model,
+                val_loader,
+                device,
+                model_config,
+                collapse_config,
+                beta,
+                frozen_codebook_c0=frozen_codebook_c0,
             )
+            if train_probe_loader is not None:
+                train_probe = evaluate_codebook_usage(
+                    model, train_probe_loader, device, model_config
+                )
+                eval_probe = last_eval
+                if eval_probe_loader is not None:
+                    eval_probe = evaluate_codebook_usage(
+                        model, eval_probe_loader, device, model_config
+                    )
+                last_codebook_probe = _matched_codebook_probe_metrics(
+                    train_probe,
+                    eval_probe,
+                )
 
         save_checkpoint(model, optimizer, global_step, train_cfg.epochs, run_dir, "last.pt")
         if probe_batches is not None and not geometry_snapshot_due(
@@ -494,8 +754,12 @@ def run(
             model, val_loader, device, model_config, tokenizer,
             run_dir / "samples" / "recon_final.jsonl",
         )
-        plot_training_curves(metrics_path, run_dir / "plots")
-        plot_codebook_usage(last_eval["code_counts"], run_dir / "plots")
+        plot_training_curves(metrics_path, run_dir / "plots", run_name=run_name)
+        plot_codebook_usage(
+            last_eval["code_counts"],
+            run_dir / "plots",
+            run_name=run_name,
+        )
 
         geometry_render = {"status": "disabled", "snapshots_retained": True}
         if probe_batches is not None:
@@ -537,6 +801,7 @@ def run(
             "best_eval_loss": best_eval_loss,
             "best_step": best_step,
             "final_eval": {k: v for k, v in last_eval.items() if k != "code_counts"},
+            "final_codebook_probe": last_codebook_probe,
             "parameter_count": config_payload.get("parameter_count"),
             "geometry_render": geometry_render,
             "elapsed_sec": time.time() - start_time,
