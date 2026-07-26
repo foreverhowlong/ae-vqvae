@@ -36,6 +36,57 @@ class AnimationScales:
     rank_ylim: tuple[float, float]
 
 
+@dataclass(frozen=True)
+class SnapshotEncoderView:
+    """PAD-free arrays aligned to the encoder rows in one snapshot."""
+
+    encoder: np.ndarray
+    pad_ratios: np.ndarray | None
+    slot_indices: np.ndarray | None
+    assignments: np.ndarray | None
+    nearest_distances: np.ndarray | None
+
+
+def _snapshot_encoder_view(data) -> SnapshotEncoderView:
+    """Load aligned PAD-free arrays from current and legacy snapshots.
+
+    Format v2 snapshots are already filtered with the model's exact
+    ``latent_mask``. Older snapshots stored every slot, so compatibility
+    rendering uses ``pad_ratio <= 0.5`` as the explicitly approximate fallback.
+    Legacy snapshots without PAD ratios remain readable and keep every row.
+    """
+    encoder = data["z_e"].astype(np.float32)
+    original_count = len(encoder)
+    format_version = (
+        int(np.asarray(data["geometry_format_version"]).item())
+        if "geometry_format_version" in data
+        else 1
+    )
+    keep = np.ones(original_count, dtype=bool)
+    if (
+        format_version < 2
+        and "pad_ratios" in data
+        and len(data["pad_ratios"]) == original_count
+    ):
+        keep = data["pad_ratios"].astype(np.float32) <= 0.5
+    if not keep.any():
+        raise ValueError("Geometry snapshot contains no valid latent points.")
+
+    def aligned(name: str, dtype):
+        if name not in data:
+            return None
+        values = data[name].astype(dtype)
+        return values[keep] if len(values) == original_count else values
+
+    return SnapshotEncoderView(
+        encoder=encoder[keep],
+        pad_ratios=aligned("pad_ratios", np.float32),
+        slot_indices=aligned("slot_indices", np.int64),
+        assignments=aligned("assignments", np.int64),
+        nearest_distances=aligned("nearest_distances", np.float32),
+    )
+
+
 def load_snapshots(run_dir: Path):
     paths = list((run_dir / "geometry").glob("step*.npz"))
     if not paths:
@@ -76,7 +127,7 @@ def fit_shared_pca(
     encoders, codebooks = [], []
     for _, path in selected:
         with np.load(path) as data:
-            encoders.append(data["z_e"].astype(np.float32))
+            encoders.append(_snapshot_encoder_view(data).encoder)
             if "codebook" in data:
                 codebooks.append(data["codebook"].astype(np.float32))
     encoder = np.concatenate(encoders)
@@ -104,18 +155,21 @@ def render_frame(
     latent_phase_label: str | None = None,
 ) -> None:
     with np.load(path) as data:
-        encoder = data["z_e"].astype(np.float32)
+        view = _snapshot_encoder_view(data)
+        encoder = view.encoder
         if "codebook" not in data:
-            slot_indices = data["slot_indices"].astype(np.int64)
-            pad_ratios = data["pad_ratios"].astype(np.float32)
+            if view.slot_indices is None or view.pad_ratios is None:
+                raise ValueError(
+                    "Continuous geometry snapshots require slot_indices and pad_ratios."
+                )
             snapshot_label = _snapshot_label(path, has_codebook=False)
             if not path.stem.endswith("_pre_kmeans") and latent_phase_label:
                 snapshot_label = latent_phase_label
             _render_continuous_frame(
                 step,
                 encoder,
-                slot_indices,
-                pad_ratios,
+                view.slot_indices,
+                view.pad_ratios,
                 pca,
                 output_path,
                 scales,
@@ -124,12 +178,18 @@ def render_frame(
             )
             return
         codebook = data["codebook"].astype(np.float32)
-        assignments = data["assignments"].astype(np.int64)
+        assignments = view.assignments
+        nearest = view.nearest_distances
+    if assignments is None:
+        raise ValueError("VQ geometry snapshots require assignments.")
     wins = np.bincount(assignments, minlength=len(codebook))
     alive = wins > 0
     encoder_2d = pca.transform(encoder)
     codebook_2d = pca.transform(codebook)
-    nearest = np.linalg.norm(encoder - codebook[assignments], axis=1)
+    if nearest is None:
+        # Compatibility fallback for pre-v2 snapshots that did not persist the
+        # quantizer's own distance metric.
+        nearest = np.linalg.norm(encoder - codebook[assignments], axis=1)
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 10))
     ax = axes[0, 0]
@@ -192,7 +252,7 @@ def render_frame(
         axis.set_title(axis.get_title(), pad=9)
     fig.suptitle(
         f"{_snapshot_label(path, has_codebook=True)} — step {step:,} "
-        f"— used codes {alive.sum():,}/{len(codebook):,}",
+        f"— valid probe points {len(encoder):,}",
         fontsize=15,
         x=.5,
         y=.975,
@@ -308,7 +368,7 @@ def projection_limits(snapshots, pca: PCA):
     points = []
     for _, path in snapshots:
         with np.load(path) as data:
-            points.append(pca.transform(data["z_e"].astype(np.float32)))
+            points.append(pca.transform(_snapshot_encoder_view(data).encoder))
             if "codebook" in data:
                 points.append(pca.transform(data["codebook"].astype(np.float32)))
     merged = np.concatenate(points)
@@ -328,15 +388,22 @@ def compute_animation_scales(snapshots, pca: PCA) -> AnimationScales:
     codebook_size = 0
     for _, path in snapshots:
         with np.load(path) as data:
-            encoder = data["z_e"].astype(np.float32)
+            view = _snapshot_encoder_view(data)
+            encoder = view.encoder
             encoder_norm_frames.append(np.linalg.norm(encoder, axis=1))
             if "codebook" in data:
                 codebook = data["codebook"].astype(np.float32)
-                assignments = data["assignments"].astype(np.int64)
+                assignments = view.assignments
+                if assignments is None:
+                    raise ValueError("VQ geometry snapshots require assignments.")
                 codebook_norm_frames.append(np.linalg.norm(codebook, axis=1))
-                nearest_distance_frames.append(
-                    np.linalg.norm(encoder - codebook[assignments], axis=1)
-                )
+                nearest = view.nearest_distances
+                if nearest is None:
+                    nearest = np.linalg.norm(
+                        encoder - codebook[assignments],
+                        axis=1,
+                    )
+                nearest_distance_frames.append(nearest)
                 wins = np.bincount(assignments, minlength=len(codebook))
                 maximum_win_count = max(
                     maximum_win_count, int(wins.max(initial=0))
@@ -393,7 +460,13 @@ def render_code_trajectories(
     run_name: str | None = None,
 ) -> None:
     with np.load(snapshots[-1][1]) as final:
-        wins = np.bincount(final["assignments"].astype(np.int64), minlength=len(final["codebook"]))
+        final_view = _snapshot_encoder_view(final)
+        if final_view.assignments is None:
+            raise ValueError("VQ geometry snapshots require assignments.")
+        wins = np.bincount(
+            final_view.assignments,
+            minlength=len(final["codebook"]),
+        )
     top = np.argsort(wins)[-min(16, len(wins)):][::-1]
     dead = np.setdiff1d(np.flatnonzero(wins == 0), top, assume_unique=False)
     rng = np.random.default_rng(random_state)
@@ -442,7 +515,7 @@ def render_latent_centroid_trajectory(
     norm_stds = []
     for step, path in snapshots:
         with np.load(path) as data:
-            encoder = data["z_e"].astype(np.float32)
+            encoder = _snapshot_encoder_view(data).encoder
         steps.append(step)
         centroids.append(encoder.mean(axis=0))
         norms = np.linalg.norm(encoder, axis=1)
@@ -496,9 +569,9 @@ def render_warmup_transition(
     if pre is None or post is None:
         raise ValueError("Warmup transition snapshots are incomplete.")
     with np.load(snapshots[0][1]) as start_data:
-        start = start_data["z_e"].astype(np.float32)
+        start = _snapshot_encoder_view(start_data).encoder
     with np.load(pre[1]) as pre_data:
-        end = pre_data["z_e"].astype(np.float32)
+        end = _snapshot_encoder_view(pre_data).encoder
     with np.load(post[1]) as post_data:
         codebook = post_data["codebook"].astype(np.float32)
 
@@ -568,6 +641,9 @@ def render_metric_series(
         raise ValueError("metrics.jsonl contains no geometry rows")
     excluded = {
         "split", "step", "elapsed_sec", "phase", "event", "quantizer_active",
+        # Legacy geometry rows may contain this noncanonical count. Keep the
+        # files readable, but never revive it as a current metric plot.
+        "used_codes",
     }
     keys = sorted({
         key

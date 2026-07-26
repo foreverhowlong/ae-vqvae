@@ -148,11 +148,16 @@ def dump_geometry_snapshot(
     include_codebook: bool | None = None,
     filename_suffix: str = "",
 ) -> dict[str, float | int]:
-    """Dump unprojected vectors/assignments and return full-dimensional metrics."""
+    """Dump valid, unprojected vectors and return full-dimensional metrics.
+
+    Geometry is deliberately not a source of canonical codebook usage metrics.
+    Canonical used/dead-code counts come from the matched codebook probe.
+    """
     device = next(model.parameters()).device
     was_training = model.training
     z_chunks = []
     pad_chunks = []
+    slot_chunks = []
     try:
         with preserve_rng_state():
             model.eval()
@@ -161,17 +166,33 @@ def dump_geometry_snapshot(
                 attention_mask = batch.get("attention_mask")
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(device)
-                z_e = model.encode(input_ids, attention_mask=attention_mask)
-                z_chunks.append(z_e.reshape(-1, z_e.shape[-1]).float().cpu())
+                z_e, latent_mask = model.encode(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    return_mask=True,
+                )
                 if attention_mask is None:
                     pad_mask = input_ids.eq(model.config.pad_token_id).float()
                 else:
                     pad_mask = (attention_mask == 0).float()
-                pad_chunks.append(
-                    F.adaptive_avg_pool1d(pad_mask.unsqueeze(1), z_e.shape[1]).squeeze(1).reshape(-1).cpu()
+                pad_ratios = F.adaptive_avg_pool1d(
+                    pad_mask.unsqueeze(1),
+                    z_e.shape[1],
+                ).squeeze(1)
+                slot_indices = torch.arange(
+                    z_e.shape[1],
+                    device=z_e.device,
+                    dtype=torch.int16,
+                ).unsqueeze(0).expand(z_e.shape[0], -1)
+                valid_flat = latent_mask.reshape(-1).to(dtype=torch.bool)
+                z_chunks.append(
+                    z_e.reshape(-1, z_e.shape[-1])[valid_flat].float().cpu()
                 )
+                pad_chunks.append(pad_ratios.reshape(-1)[valid_flat].cpu())
+                slot_chunks.append(slot_indices.reshape(-1)[valid_flat].cpu())
             encoder = torch.cat(z_chunks)
             pad_ratios = torch.cat(pad_chunks)
+            slot_indices = torch.cat(slot_chunks)
             codebook = (
                 model.quantizer.codebook.weight.detach().float().cpu()
                 if model.quantizer is not None and include_codebook is not False
@@ -180,29 +201,48 @@ def dump_geometry_snapshot(
     finally:
         model.train(was_training)
 
-    slot_indices = torch.arange(model.config.latent_slots, dtype=torch.int16).repeat(len(encoder) // model.config.latent_slots)
+    if encoder.numel() == 0:
+        raise ValueError("Geometry probe contains no valid latent slots.")
 
     geometry_dir = Path(run_dir) / "geometry"
     geometry_dir.mkdir(parents=True, exist_ok=True)
     snapshot = {
+        "geometry_format_version": np.asarray(2, dtype=np.int16),
         "z_e": encoder.numpy().astype(np.float16),
         "pad_ratios": pad_ratios.numpy().astype(np.float16),
-        "slot_indices": slot_indices.numpy(),
+        "slot_indices": slot_indices.numpy().astype(np.int16),
     }
     if codebook is not None:
         nearest_distances = []
         assignments = []
-        for chunk in encoder.split(512):
-            distances = torch.cdist(chunk, codebook)
-            nearest_chunk, indices = distances.min(dim=1)
-            nearest_distances.append(nearest_chunk)
-            assignments.append(indices)
+        try:
+            with preserve_rng_state():
+                model.eval()
+                for chunk in encoder.split(512):
+                    chunk_device = chunk.to(device)
+                    quantized = model.quantizer(chunk_device.unsqueeze(0))
+                    indices = quantized["indices"].reshape(-1)
+                    distances = quantized["distances"].reshape(
+                        len(chunk),
+                        model.quantizer.codebook_size,
+                    )
+                    nearest_distances.append(
+                        distances.gather(1, indices.unsqueeze(1))
+                        .squeeze(1)
+                        .clamp_min(0)
+                        .sqrt()
+                        .cpu()
+                    )
+                    assignments.append(indices.cpu())
+        finally:
+            model.train(was_training)
         nearest = torch.cat(nearest_distances)
         assigned = torch.cat(assignments)
         wins = torch.bincount(assigned, minlength=len(codebook))
         snapshot.update({
             "codebook": codebook.numpy().astype(np.float16),
             "assignments": assigned.numpy().astype(np.int32),
+            "nearest_distances": nearest.numpy().astype(np.float32),
         })
     if filename_suffix and (
         not filename_suffix.startswith("_")
@@ -223,6 +263,7 @@ def dump_geometry_snapshot(
     eig_sum = eigenvalues.sum()
     participation_ratio = float(eig_sum.square() / eigenvalues.square().sum().clamp_min(1e-12))
     metrics = {
+        "valid_probe_points": len(encoder),
         "encoder_mean_norm": float(norms.mean()),
         "encoder_norm_std": float(norms.std(unbiased=False)),
         "encoder_pairwise_mean_distance": _mean_pairwise_distance(encoder),
@@ -233,7 +274,6 @@ def dump_geometry_snapshot(
             "nearest_code_distance_p10": float(torch.quantile(nearest, 0.1)),
             "nearest_code_distance_p50": float(torch.quantile(nearest, 0.5)),
             "nearest_code_distance_p90": float(torch.quantile(nearest, 0.9)),
-            "used_codes": int((wins > 0).sum()),
             "win_count_gini": _gini(wins.float()),
             "centroid_distance": float(
                 torch.linalg.vector_norm(encoder.mean(0) - codebook.mean(0))

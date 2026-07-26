@@ -62,6 +62,7 @@ from visualization.text_vqvae import (
     save_pca_metadata,
 )
 from visualization.render_geometry_animation import (
+    _snapshot_encoder_view,
     compute_animation_scales,
     fit_shared_pca,
     load_snapshots,
@@ -389,6 +390,10 @@ class EvaluationPipelineTest(unittest.TestCase):
         self.assertEqual(metrics["examples"], 3)
         self.assertEqual(metrics["codebook_batch_size"], 2)
         self.assertEqual(metrics["codebook_batch_count"], 1)
+        self.assertNotIn("used_codes", metrics)
+        self.assertNotIn("dead_codes", metrics)
+        self.assertIn("compat_full_eval_used_codes", metrics)
+        self.assertIn("compat_full_eval_dead_codes", metrics)
 
     def test_training_plot_prefers_matched_probes_and_adds_compact_run_label(self):
         import json
@@ -480,7 +485,10 @@ class EvaluationPipelineTest(unittest.TestCase):
 
 class GeometrySnapshotTest(unittest.TestCase):
     def test_snapshot_fields_shapes_mode_and_rng(self):
-        model = TextVQVAE(small_config())
+        model = TextVQVAE(
+            small_config(),
+            collapse_config=CollapseControlConfig(use_ema_codebook=True),
+        )
         model.train()
         probe = [{
             "input_ids": torch.tensor([
@@ -492,6 +500,8 @@ class GeometrySnapshotTest(unittest.TestCase):
                 [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
             ]),
         }]
+        codebook_before = model.quantizer.codebook.weight.detach().clone()
+        cluster_size_before = model.quantizer.ema_cluster_size.detach().clone()
         rng_before = torch.random.get_rng_state().clone()
 
         with TemporaryDirectory() as temp_dir:
@@ -499,26 +509,44 @@ class GeometrySnapshotTest(unittest.TestCase):
             with np.load(Path(temp_dir) / "geometry" / "step000007.npz") as snapshot:
                 self.assertEqual(
                     set(snapshot.files),
-                    {"z_e", "codebook", "assignments", "pad_ratios", "slot_indices"},
+                    {
+                        "geometry_format_version",
+                        "z_e",
+                        "codebook",
+                        "assignments",
+                        "nearest_distances",
+                        "pad_ratios",
+                        "slot_indices",
+                    },
                 )
-                self.assertEqual(snapshot["z_e"].shape, (8, 16))
+                self.assertEqual(int(snapshot["geometry_format_version"]), 2)
+                self.assertEqual(snapshot["z_e"].shape, (6, 16))
                 self.assertEqual(snapshot["z_e"].dtype, np.float16)
                 self.assertEqual(snapshot["codebook"].shape, (8, 16))
                 self.assertEqual(snapshot["codebook"].dtype, np.float16)
-                self.assertEqual(snapshot["assignments"].shape, (8,))
+                self.assertEqual(snapshot["assignments"].shape, (6,))
                 self.assertEqual(snapshot["assignments"].dtype, np.int32)
-                self.assertEqual(snapshot["pad_ratios"].shape, (8,))
-                self.assertEqual(snapshot["slot_indices"].tolist(), [0, 1, 2, 3, 0, 1, 2, 3])
+                self.assertEqual(snapshot["nearest_distances"].shape, (6,))
+                self.assertEqual(snapshot["pad_ratios"].shape, (6,))
+                self.assertEqual(
+                    snapshot["slot_indices"].tolist(),
+                    [0, 1, 2, 0, 1, 2],
+                )
 
         self.assertTrue(model.training)
         torch.testing.assert_close(torch.random.get_rng_state(), rng_before)
-        self.assertGreaterEqual(metrics["used_codes"], 1)
-        self.assertLessEqual(metrics["used_codes"], 8)
+        torch.testing.assert_close(model.quantizer.codebook.weight, codebook_before)
+        torch.testing.assert_close(model.quantizer.ema_cluster_size, cluster_size_before)
+        self.assertEqual(metrics["valid_probe_points"], 6)
+        self.assertNotIn("used_codes", metrics)
         self.assertIn("participation_ratio", metrics)
         self.assertIn("win_count_gini", metrics)
 
     def test_continuous_snapshot_contains_only_latent_geometry(self):
-        model = TextVQVAE(small_config(bottleneck_type="continuous"))
+        model = TextVQVAE(
+            small_config(bottleneck_type="continuous"),
+            collapse_config=CollapseControlConfig(use_ema_codebook=False),
+        )
         probe = [{
             "input_ids": torch.randint(0, 31, (2, 12)),
             "attention_mask": torch.ones(2, 12, dtype=torch.long),
@@ -530,7 +558,12 @@ class GeometrySnapshotTest(unittest.TestCase):
             with np.load(snapshot_path) as snapshot:
                 self.assertEqual(
                     set(snapshot.files),
-                    {"z_e", "pad_ratios", "slot_indices"},
+                    {
+                        "geometry_format_version",
+                        "z_e",
+                        "pad_ratios",
+                        "slot_indices",
+                    },
                 )
                 self.assertEqual(snapshot["z_e"].shape, (8, 16))
 
@@ -538,6 +571,24 @@ class GeometrySnapshotTest(unittest.TestCase):
         self.assertIn("participation_ratio", metrics)
         self.assertNotIn("used_codes", metrics)
         self.assertNotIn("nearest_code_distance_p50", metrics)
+
+    def test_legacy_snapshot_rendering_filters_pad_rows_explicitly(self):
+        with TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "legacy.npz"
+            np.savez_compressed(
+                snapshot_path,
+                z_e=np.arange(8, dtype=np.float32).reshape(4, 2),
+                pad_ratios=np.array([0.0, 0.5, 0.75, 1.0], dtype=np.float32),
+                slot_indices=np.arange(4, dtype=np.int16),
+                assignments=np.arange(4, dtype=np.int32),
+            )
+            with np.load(snapshot_path) as snapshot:
+                view = _snapshot_encoder_view(snapshot)
+
+        self.assertEqual(view.encoder.shape, (2, 2))
+        self.assertEqual(view.pad_ratios.tolist(), [0.0, 0.5])
+        self.assertEqual(view.slot_indices.tolist(), [0, 1])
+        self.assertEqual(view.assignments.tolist(), [0, 1])
 
     def test_vq_snapshot_can_omit_codebook_and_use_transition_suffix(self):
         model = TextVQVAE(small_config())
@@ -1793,7 +1844,8 @@ class TextVQVAEVisualizationTest(unittest.TestCase):
             self.assertIn("encoder_pairwise_mean_distance", metadata)
             self.assertEqual(len(result.encoder_pad_ratios), 7)
             torch.testing.assert_close(
-                encoder_vectors.pad_ratios[:4], torch.tensor([0.0, 0.0, 1.0, 1.0])
+                encoder_vectors.pad_ratios,
+                torch.zeros(7),
             )
             self.assertEqual(len(metadata["explained_variance_ratio"]), 2)
             self.assertTrue(model.training)
@@ -2591,6 +2643,11 @@ class TrainingLifecycleTest(unittest.TestCase):
             self.assertEqual(transitions[0]["step"], 2)
             probe_rows = [row for row in rows if row["split"] == "codebook_probe"]
             self.assertEqual([row["step"] for row in probe_rows], [3])
+            self.assertIn("train_used_codes", probe_rows[0])
+            self.assertIn("eval_used_codes", probe_rows[0])
+            eval_rows = [row for row in rows if row["split"] == "eval"]
+            self.assertNotIn("used_codes", eval_rows[-1])
+            self.assertIn("compat_full_eval_used_codes", eval_rows[-1])
             self.assertTrue((run_dir / "codebook_c0_kmeans.pt").is_file())
             self.assertTrue(
                 (run_dir / "geometry" / "step000002_pre_kmeans.npz").is_file()
@@ -2601,6 +2658,10 @@ class TrainingLifecycleTest(unittest.TestCase):
             summary = json.loads((run_dir / "summary.json").read_text())
             self.assertEqual(summary["best_step"], 3)
             self.assertEqual(summary["final_phase"], "vq")
+            self.assertEqual(
+                summary["final_codebook_probe"]["eval_used_codes"],
+                probe_rows[-1]["eval_used_codes"],
+            )
 
     def test_strict_initial_pca_failure_writes_failed_summary(self):
         import json

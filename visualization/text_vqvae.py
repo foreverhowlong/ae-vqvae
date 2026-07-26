@@ -70,7 +70,7 @@ class PCAComparisonResult:
 def collect_encoder_vectors(
     model, data_loader, *, max_points: int = 8192
 ) -> EncoderVectorCollection:
-    """Collect flattened encoder outputs on CPU without changing model state."""
+    """Collect valid encoder outputs on CPU without changing model state."""
     if max_points < 1:
         raise ValueError("max_points must be positive.")
 
@@ -86,24 +86,37 @@ def collect_encoder_vectors(
             attention_mask = batch.get("attention_mask")
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
-            z_e = model.encode(input_ids, attention_mask=attention_mask)
-            flat = z_e.reshape(-1, z_e.shape[-1]).detach().float().cpu()
-            remaining = max_points - collected
-            chunks.append(flat[:remaining])
+            z_e, latent_mask = model.encode(
+                input_ids,
+                attention_mask=attention_mask,
+                return_mask=True,
+            )
             if attention_mask is None:
                 pad_mask = input_ids.eq(model.config.pad_token_id).float()
             else:
                 pad_mask = (attention_mask == 0).float()
             slot_pad_ratios = _slot_pad_ratios(pad_mask, z_e.shape[1])
-            pad_ratio_chunks.append(slot_pad_ratios.reshape(-1)[:remaining].cpu())
-            collected += min(flat.shape[0], remaining)
+            valid_flat = latent_mask.reshape(-1).to(dtype=torch.bool)
+            flat = (
+                z_e.reshape(-1, z_e.shape[-1])[valid_flat]
+                .detach()
+                .float()
+                .cpu()
+            )
+            valid_pad_ratios = slot_pad_ratios.reshape(-1)[valid_flat].cpu()
+            remaining = max_points - collected
+            chunks.append(flat[:remaining])
+            pad_ratio_chunks.append(valid_pad_ratios[:remaining])
+            collected += min(len(flat), remaining)
             if collected >= max_points:
                 break
     finally:
         model.train(was_training)
 
-    if not chunks:
-        raise ValueError("Cannot collect encoder vectors from an empty data loader.")
+    if not chunks or not any(len(chunk) for chunk in chunks):
+        raise ValueError(
+            "Cannot collect valid encoder vectors from the supplied data loader."
+        )
     return EncoderVectorCollection(
         vectors=torch.cat(chunks, dim=0),
         pad_ratios=torch.cat(pad_ratio_chunks, dim=0),

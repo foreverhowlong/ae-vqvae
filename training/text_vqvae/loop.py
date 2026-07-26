@@ -468,8 +468,10 @@ def evaluate(
             assignment_count,
             total_tokens,
         ),
-        "used_codes": stats["used_codes"],
-        "dead_codes": stats["dead_codes"],
+        # Compatibility-only full-validation counts. The matched codebook probe
+        # is the sole canonical public path for used/dead-code metrics.
+        "compat_full_eval_used_codes": stats["used_codes"],
+        "compat_full_eval_dead_codes": stats["dead_codes"],
         "code_counts": stats["counts"].tolist(),
     })
     if frozen_codebook_c0 is not None:
@@ -543,6 +545,10 @@ def _matched_codebook_probe_metrics(train_probe, eval_probe):
         "eval_perplexity": eval_probe["codebook_perplexity"],
         "train_assignment_count": train_probe["codebook_assignment_count"],
         "eval_assignment_count": eval_probe["codebook_assignment_count"],
+        "train_used_codes": train_probe["used_codes"],
+        "eval_used_codes": eval_probe["used_codes"],
+        "train_dead_codes": train_probe["dead_codes"],
+        "eval_dead_codes": eval_probe["dead_codes"],
     }
 
 
@@ -688,9 +694,8 @@ def run(
             )
             tracker.log({f"geometry/{k}": v for k, v in geometry_metrics.items()}, step=step)
             detail = (
-                f"used_codes={geometry_metrics['used_codes']}"
-                if "used_codes" in geometry_metrics
-                else f"mean_norm={geometry_metrics['encoder_mean_norm']:.3f}"
+                f"valid_points={geometry_metrics['valid_probe_points']} "
+                f"mean_norm={geometry_metrics['encoder_mean_norm']:.3f}"
             )
             print(f"[Geometry] step={step} {detail}")
         except Exception as exc:
@@ -1054,14 +1059,16 @@ def run(
                             device,
                             model_config,
                         )
-                        eval_probe = last_eval
-                        if eval_probe_loader is not None:
-                            eval_probe = evaluate_codebook_usage(
-                                model,
-                                eval_probe_loader,
-                                device,
-                                model_config,
-                            )
+                        eval_probe = evaluate_codebook_usage(
+                            model,
+                            (
+                                eval_probe_loader
+                                if eval_probe_loader is not None
+                                else val_loader
+                            ),
+                            device,
+                            model_config,
+                        )
                         last_codebook_probe = _matched_codebook_probe_metrics(
                             train_probe,
                             eval_probe,
@@ -1158,11 +1165,16 @@ def run(
                 train_probe = evaluate_codebook_usage(
                     model, train_probe_loader, device, model_config
                 )
-                eval_probe = last_eval
-                if eval_probe_loader is not None:
-                    eval_probe = evaluate_codebook_usage(
-                        model, eval_probe_loader, device, model_config
-                    )
+                eval_probe = evaluate_codebook_usage(
+                    model,
+                    (
+                        eval_probe_loader
+                        if eval_probe_loader is not None
+                        else val_loader
+                    ),
+                    device,
+                    model_config,
+                )
                 last_codebook_probe = _matched_codebook_probe_metrics(
                     train_probe,
                     eval_probe,
