@@ -210,6 +210,7 @@ def add_arguments(parser) -> None:
     )
     g.add_argument("--memory-decoder-latent-layers", type=int, default=None)
     g.add_argument("--memory-decoder-output-layers", type=int, default=None)
+    g.add_argument("--vqganr-num-res-blocks", type=int, default=None)
     g.add_argument("--ffn-mult", type=int, default=None)
     g.add_argument("--dropout", type=float, default=None)
     g.add_argument(
@@ -511,6 +512,7 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
         "decoder_type": getattr(args, "decoder_type", None),
         "memory_decoder_latent_layers": getattr(args, "memory_decoder_latent_layers", None),
         "memory_decoder_output_layers": getattr(args, "memory_decoder_output_layers", None),
+        "vqganr_num_res_blocks": getattr(args, "vqganr_num_res_blocks", None),
         "ffn_mult": getattr(args, "ffn_mult", None),
         "dropout": getattr(args, "dropout", None),
         "bottleneck_type": getattr(args, "bottleneck_type", None),

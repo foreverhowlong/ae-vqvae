@@ -22,10 +22,14 @@ from models.text_vqvae import (
     RotarySelfAttention,
     RotaryTextEncoder,
     SubPixelSequenceUpsampler,
+    TextAttnBlock,
+    TextResBlock,
     TextVQVAE,
     TextVQVAEConfig,
     VQGANPreAttentionTextDecoder,
     VQGANPreAttentionTextEncoder,
+    VQGANRTextDecoder,
+    VQGANRTextEncoder,
     VQGANTextDecoder,
     VQGANTextEncoder,
     VectorQuantizer,
@@ -927,7 +931,10 @@ class TextVQVAEDecoderTest(unittest.TestCase):
     def test_all_decoders_forward_and_backward(self):
         for decoder_type in DECODER_TYPES:
             with self.subTest(decoder_type=decoder_type):
-                model = TextVQVAE(small_config(decoder_type=decoder_type))
+                overrides = {"decoder_type": decoder_type}
+                if decoder_type == "vqganr":
+                    overrides["max_seq_len"] = 16
+                model = TextVQVAE(small_config(**overrides))
                 memory = torch.randn(2, 4, 16, requires_grad=True)
                 logits = model.decode(memory, seq_len=9)
                 self.assertEqual(logits.shape, (2, 9, 32))
@@ -937,6 +944,76 @@ class TextVQVAEDecoderTest(unittest.TestCase):
                 outputs = model(torch.randint(0, 31, (2, 12)))
                 self.assertEqual(outputs["logits"].shape, (2, 12, 32))
                 outputs["logits"].sum().backward()
+
+    def test_all_decoders_ignore_masked_latent_values_and_zero_masked_outputs(self):
+        latent_mask = torch.tensor(
+            [[True, True, False, False], [True, False, True, False]]
+        )
+        output_mask = torch.tensor(
+            [
+                [True, True, True, True, True, False, False, False, False],
+                [True, True, True, True, True, True, True, False, False],
+            ]
+        )
+        first_memory = torch.randn(2, 4, 16)
+        second_memory = first_memory.clone()
+        second_memory[~latent_mask] = torch.randn_like(second_memory[~latent_mask])
+
+        for decoder_type in DECODER_TYPES:
+            with self.subTest(decoder_type=decoder_type):
+                overrides = {"decoder_type": decoder_type}
+                if decoder_type == "vqganr":
+                    overrides["max_seq_len"] = 16
+                model = TextVQVAE(small_config(**overrides))
+                model.eval()
+                with torch.no_grad():
+                    first = model.decode(
+                        first_memory,
+                        seq_len=9,
+                        latent_mask=latent_mask,
+                        output_mask=output_mask,
+                    )
+                    second = model.decode(
+                        second_memory,
+                        seq_len=9,
+                        latent_mask=latent_mask,
+                        output_mask=output_mask,
+                    )
+                    decoder_hidden = model.decoder_impl(
+                        model.decoder_input_proj(first_memory),
+                        seq_len=9,
+                        latent_mask=latent_mask,
+                        output_mask=output_mask,
+                    )
+
+                torch.testing.assert_close(first, second)
+                torch.testing.assert_close(
+                    decoder_hidden[~output_mask],
+                    torch.zeros_like(decoder_hidden[~output_mask]),
+                )
+
+    def test_all_decoders_keep_fully_masked_samples_finite(self):
+        memory = torch.randn(2, 4, 16)
+        latent_mask = torch.zeros(2, 4, dtype=torch.bool)
+        output_mask = torch.zeros(2, 9, dtype=torch.bool)
+
+        for decoder_type in DECODER_TYPES:
+            with self.subTest(decoder_type=decoder_type):
+                overrides = {"decoder_type": decoder_type}
+                if decoder_type == "vqganr":
+                    overrides["max_seq_len"] = 16
+                model = TextVQVAE(small_config(**overrides))
+                model.eval()
+                with torch.no_grad():
+                    hidden = model.decoder_impl(
+                        model.decoder_input_proj(memory),
+                        seq_len=9,
+                        latent_mask=latent_mask,
+                        output_mask=output_mask,
+                    )
+
+                self.assertTrue(torch.isfinite(hidden).all())
+                torch.testing.assert_close(hidden, torch.zeros_like(hidden))
 
     def test_memory_trunk_is_default(self):
         model = TextVQVAE(small_config())
@@ -1006,7 +1083,10 @@ class TextVQVAEDecoderTest(unittest.TestCase):
     def test_decode_rejects_length_above_configured_maximum(self):
         for decoder_type in DECODER_TYPES:
             with self.subTest(decoder_type=decoder_type):
-                model = TextVQVAE(small_config(decoder_type=decoder_type))
+                overrides = {"decoder_type": decoder_type}
+                if decoder_type == "vqganr":
+                    overrides["max_seq_len"] = 8
+                model = TextVQVAE(small_config(**overrides))
                 with self.assertRaisesRegex(ValueError, "seq_len"):
                     model.decode(torch.randn(2, 4, 16), seq_len=13)
 
@@ -1061,7 +1141,10 @@ class TextVQVAEEncoderTest(unittest.TestCase):
     def test_all_encoders_forward_and_backward(self):
         for encoder_type in ENCODER_TYPES:
             with self.subTest(encoder_type=encoder_type):
-                model = TextVQVAE(small_config(encoder_type=encoder_type))
+                overrides = {"encoder_type": encoder_type}
+                if encoder_type == "vqganr":
+                    overrides["max_seq_len"] = 16
+                model = TextVQVAE(small_config(**overrides))
                 outputs = model(torch.randint(0, 31, (2, 12)))
 
                 self.assertEqual(outputs["logits"].shape, (2, 12, 32))
@@ -1079,6 +1162,11 @@ class TextVQVAEEncoderTest(unittest.TestCase):
                         small_config(
                             encoder_type=encoder_type,
                             decoder_type=decoder_type,
+                            max_seq_len=(
+                                16
+                                if "vqganr" in (encoder_type, decoder_type)
+                                else 12
+                            ),
                         )
                     )
                     outputs = model(torch.randint(0, 31, (2, 12)))
@@ -1224,6 +1312,147 @@ class TextVQVAEEncoderTest(unittest.TestCase):
         self.assertEqual(outputs["logits"].shape, (2, 12, 32))
         outputs["logits"].sum().backward()
 
+    def test_vqganr_builds_one_residual_attention_stage_per_compression_level(self):
+        model = TextVQVAE(
+            small_config(
+                max_seq_len=16,
+                latent_slots=4,
+                latent_dim=7,
+                encoder_type="vqganr",
+                decoder_type="vqganr",
+                vqganr_num_res_blocks=1,
+            )
+        )
+
+        self.assertIsInstance(model.encoder, VQGANRTextEncoder)
+        self.assertIsInstance(model.decoder_impl, VQGANRTextDecoder)
+        self.assertEqual(model.encoder.num_levels, 2)
+        self.assertEqual(model.decoder_impl.num_levels, 2)
+        self.assertEqual(model.encoder.conv_out.out_channels, 7)
+        self.assertEqual(model.decoder_impl.conv_in.in_channels, 7)
+        self.assertIsInstance(model.latent_proj, nn.Identity)
+        self.assertIsInstance(model.decoder_input_proj, nn.Identity)
+        self.assertTrue(
+            all(
+                len(level.res_blocks) == 1
+                and isinstance(level.res_blocks[0], TextResBlock)
+                and isinstance(level.attention, TextAttnBlock)
+                and isinstance(level.attention.attention, RotarySelfAttention)
+                and not hasattr(level.attention, "ffn")
+                and level.downsample.kernel_size == (4,)
+                and level.downsample.stride == (2,)
+                and level.downsample.padding == (1,)
+                for level in model.encoder.levels
+            )
+        )
+        self.assertTrue(
+            all(
+                len(level.res_blocks) == 2
+                and all(
+                    isinstance(block, TextResBlock)
+                    for block in level.res_blocks
+                )
+                and isinstance(level.attention.attention, RotarySelfAttention)
+                and level.upsample.kernel_size == (2,)
+                and level.upsample.stride == (2,)
+                for level in model.decoder_impl.levels
+            )
+        )
+
+        outputs = model(torch.randint(0, 31, (2, 13)))
+        self.assertEqual(outputs["z_e"].shape, (2, 4, 7))
+        self.assertEqual(outputs["logits"].shape, (2, 13, 32))
+        outputs["logits"].sum().backward()
+        self.assertIsNotNone(model.encoder.conv_out.weight.grad)
+        self.assertIsNotNone(model.decoder_impl.conv_in.weight.grad)
+
+    def test_vqganr_preserves_independent_latent_dim_in_mixed_architectures(self):
+        encoder_native = TextVQVAE(
+            small_config(
+                max_seq_len=16,
+                latent_dim=7,
+                encoder_type="vqganr",
+                decoder_type="memory_trunk",
+            )
+        )
+        decoder_native = TextVQVAE(
+            small_config(
+                max_seq_len=16,
+                latent_dim=7,
+                encoder_type="rope",
+                decoder_type="vqganr",
+            )
+        )
+
+        self.assertIsInstance(encoder_native.latent_proj, nn.Identity)
+        self.assertIsInstance(encoder_native.decoder_input_proj, nn.Linear)
+        self.assertEqual(
+            encoder_native(torch.randint(0, 31, (2, 12)))["z_e"].shape,
+            (2, 4, 7),
+        )
+        self.assertIsInstance(decoder_native.latent_proj, nn.Linear)
+        self.assertIsInstance(decoder_native.decoder_input_proj, nn.Identity)
+        self.assertEqual(
+            decoder_native(torch.randint(0, 31, (2, 12)))["logits"].shape,
+            (2, 12, 32),
+        )
+
+    def test_vqganr_parameter_budgets_across_compression_levels(self):
+        cases = (
+            (128, 3, 9_253_440, 9_857_792),
+            (64, 1, 9_655_296, 11_065_152),
+            (32, 1, 12_470_976, 14_686_336),
+            (16, 1, 15_286_656, 18_307_520),
+        )
+        for latent_slots, num_res_blocks, expected_encoder, expected_decoder in cases:
+            with self.subTest(
+                latent_slots=latent_slots,
+                num_res_blocks=num_res_blocks,
+            ):
+                config = TextVQVAEConfig(
+                    max_seq_len=256,
+                    latent_slots=latent_slots,
+                    d_model=448,
+                    n_heads=8,
+                    vqganr_num_res_blocks=num_res_blocks,
+                )
+                encoder = VQGANRTextEncoder(config)
+                decoder = VQGANRTextDecoder(config)
+                self.assertEqual(
+                    sum(parameter.numel() for parameter in encoder.parameters()),
+                    expected_encoder,
+                )
+                self.assertEqual(
+                    sum(parameter.numel() for parameter in decoder.parameters()),
+                    expected_decoder,
+                )
+
+    def test_vqganr_downsamples_mask_at_every_level(self):
+        encoder = VQGANRTextEncoder(
+            small_config(
+                max_seq_len=16,
+                latent_slots=4,
+                vqganr_num_res_blocks=1,
+            )
+        )
+        valid_mask = torch.zeros(1, 16, dtype=torch.bool)
+        valid_mask[:, :9] = True
+        hidden = torch.randn(1, 16, 16)
+        hidden = encoder.conv_in(hidden.transpose(1, 2)).transpose(1, 2)
+
+        hidden, valid_mask = encoder.levels[0](hidden, valid_mask)
+        self.assertEqual(valid_mask.tolist(), [[True] * 5 + [False] * 3])
+        torch.testing.assert_close(
+            hidden[:, 5:],
+            torch.zeros_like(hidden[:, 5:]),
+        )
+        hidden, valid_mask = encoder.levels[1](hidden, valid_mask)
+        self.assertEqual(valid_mask.tolist(), [[True, True, True, False]])
+        torch.testing.assert_close(
+            hidden[:, 3:],
+            torch.zeros_like(hidden[:, 3:]),
+        )
+
     def test_vqgans_stride_tracks_compression_ratio(self):
         model = TextVQVAE(
             small_config(
@@ -1253,10 +1482,54 @@ class TextVQVAEEncoderTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "integer multiple"):
                         TextVQVAE(small_config(**overrides))
 
+    def test_vqganr_requires_power_of_two_compression_ratio(self):
+        for field in ("encoder_type", "decoder_type"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "integer multiple"):
+                    TextVQVAE(
+                        small_config(
+                            **{
+                                field: "vqganr",
+                                "max_seq_len": 10,
+                                "latent_slots": 4,
+                            }
+                        )
+                    )
+                with self.assertRaisesRegex(ValueError, "power of two"):
+                    TextVQVAE(
+                        small_config(
+                            **{
+                                field: "vqganr",
+                                "max_seq_len": 12,
+                                "latent_slots": 4,
+                            }
+                        )
+                    )
+
+    def test_vqganr_requires_positive_residual_block_count(self):
+        for field in ("encoder_type", "decoder_type"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "vqganr_num_res_blocks must be positive",
+                ):
+                    TextVQVAE(
+                        small_config(
+                            **{
+                                field: "vqganr",
+                                "max_seq_len": 16,
+                                "vqganr_num_res_blocks": 0,
+                            }
+                        )
+                    )
+
     def test_vqgan_encoders_mask_padding_before_strided_conv(self):
-        for encoder_type in ("vqgans", "vqganpa"):
+        for encoder_type in ("vqgans", "vqganpa", "vqganr"):
             with self.subTest(encoder_type=encoder_type):
-                model = TextVQVAE(small_config(encoder_type=encoder_type))
+                overrides = {"encoder_type": encoder_type}
+                if encoder_type == "vqganr":
+                    overrides["max_seq_len"] = 16
+                model = TextVQVAE(small_config(**overrides))
                 model.eval()
                 attention_mask = torch.tensor(
                     [[1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]]
@@ -1817,6 +2090,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(model.max_seq_len, 256)
         self.assertEqual(model.bottleneck_type, "vq")
         self.assertEqual(model.encoder_type, "rope")
+        self.assertEqual(model.vqganr_num_res_blocks, 1)
         self.assertFalse(model.l2_normalize_before_vq)
         self.assertEqual(diagnostics.initial_pca_max_points, 8192)
         self.assertEqual(diagnostics.initial_pca_fit_mode, "balanced")
@@ -1989,7 +2263,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         from training.text_vqvae.config import build_configs
 
         tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
-        for architecture_type in ("vqgans", "vqganpa"):
+        for architecture_type in ("vqgans", "vqganpa", "vqganr"):
             with self.subTest(architecture_type=architecture_type):
                 _, _, model, _ = build_configs(
                     self._parse(
@@ -2003,6 +2277,17 @@ class ConfigDefaultsTest(unittest.TestCase):
 
                 self.assertEqual(model.encoder_type, architecture_type)
                 self.assertEqual(model.decoder_type, architecture_type)
+
+    def test_vqganr_residual_block_count_can_be_selected_from_cli(self):
+        from training.text_vqvae.config import build_configs
+
+        tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
+        _, _, model, _ = build_configs(
+            self._parse("--vqganr-num-res-blocks", "3"),
+            tokenizer,
+        )
+
+        self.assertEqual(model.vqganr_num_res_blocks, 3)
 
     def test_geometry_snapshots_can_be_retained_after_rendering(self):
         from training.text_vqvae.config import build_diagnostics_config

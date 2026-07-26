@@ -9,13 +9,20 @@ import torch.nn.functional as F
 from common.text_vqvae_config import EncoderType, TextVQVAEConfig
 from models.text_layers import (
     RotaryResidualBlock,
+    TextAttnBlock,
+    TextResBlock,
     VQGANAttentionBlock,
+    vqganr_num_levels,
     vqgans_compression_factor,
+    zero_padded_positions,
 )
 
 
 class TextEncoder(nn.Module):
     """Convert token embeddings into fixed-size latent slots and a validity mask."""
+
+    emits_latent_vectors = False
+    output_dim: int
 
     def forward(
         self,
@@ -30,6 +37,7 @@ class PoolingTextEncoder(TextEncoder):
 
     def __init__(self, config: TextVQVAEConfig):
         super().__init__()
+        self.output_dim = config.d_model
         self.latent_slots = config.latent_slots
         self.slot_pad_ratio_threshold = config.slot_pad_ratio_threshold
         self.norm = nn.LayerNorm(config.d_model)
@@ -118,6 +126,7 @@ class VQGANTextEncoder(TextEncoder):
 
     def __init__(self, config: TextVQVAEConfig):
         super().__init__()
+        self.output_dim = config.d_model
         self.max_seq_len = config.max_seq_len
         self.latent_slots = config.latent_slots
         self.slot_pad_ratio_threshold = config.slot_pad_ratio_threshold
@@ -201,11 +210,131 @@ class VQGANPreAttentionTextEncoder(VQGANTextEncoder):
         return self.pre_attention(hidden, padding_mask=padding_mask)
 
 
+class VQGANRDownsampleLevel(nn.Module):
+    """One full-resolution refinement stage followed by stride-2 compression."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__()
+        self.res_blocks = nn.ModuleList(
+            TextResBlock(config) for _ in range(config.vqganr_num_res_blocks)
+        )
+        self.attention = TextAttnBlock(config)
+        self.downsample = nn.Conv1d(
+            config.d_model,
+            config.d_model,
+            kernel_size=4,
+            stride=2,
+            padding=1,
+        )
+        self.slot_pad_ratio_threshold = config.slot_pad_ratio_threshold
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        padding_mask = ~valid_mask
+        for block in self.res_blocks:
+            hidden = block(hidden, padding_mask=padding_mask)
+        hidden = self.attention(hidden, padding_mask=padding_mask)
+        hidden = self.downsample(hidden.transpose(1, 2)).transpose(1, 2)
+        valid_fraction = F.avg_pool1d(
+            valid_mask.to(hidden.dtype).unsqueeze(1),
+            kernel_size=2,
+            stride=2,
+        ).squeeze(1)
+        valid_mask = (
+            1.0 - valid_fraction
+        ) <= self.slot_pad_ratio_threshold
+        hidden = zero_padded_positions(hidden, ~valid_mask)
+        return hidden, valid_mask
+
+
+class VQGANRTextEncoder(TextEncoder):
+    """Hierarchical stride-2 encoder with residual and rotary attention blocks."""
+
+    emits_latent_vectors = True
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__()
+        if config.vqganr_num_res_blocks < 1:
+            raise ValueError(
+                "vqganr_num_res_blocks must be positive, got "
+                f"{config.vqganr_num_res_blocks}."
+            )
+        self.max_seq_len = config.max_seq_len
+        self.latent_slots = config.latent_slots
+        self.output_dim = config.resolved_latent_dim
+        self.num_levels = vqganr_num_levels(config)
+        self.conv_in = nn.Conv1d(
+            config.d_model,
+            config.d_model,
+            kernel_size=3,
+            padding=1,
+        )
+        self.levels = nn.ModuleList(
+            VQGANRDownsampleLevel(config) for _ in range(self.num_levels)
+        )
+        self.mid_res1 = TextResBlock(config)
+        self.mid_attention = TextAttnBlock(config)
+        self.mid_res2 = TextResBlock(config)
+        self.norm = nn.LayerNorm(config.d_model)
+        self.conv_out = nn.Conv1d(
+            config.d_model,
+            config.resolved_latent_dim,
+            kernel_size=1,
+        )
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = hidden.shape
+        if not 0 < seq_len <= self.max_seq_len:
+            raise ValueError(
+                f"encoder sequence length must be in [1, {self.max_seq_len}], got {seq_len}."
+            )
+        attention_mask = _validate_attention_mask(hidden, attention_mask)
+        if seq_len < self.max_seq_len:
+            pad_length = self.max_seq_len - seq_len
+            hidden = F.pad(hidden, (0, 0, 0, pad_length))
+            attention_mask = F.pad(attention_mask, (0, pad_length), value=False)
+
+        padding_mask = ~attention_mask
+        hidden = zero_padded_positions(hidden, padding_mask)
+        hidden = self.conv_in(hidden.transpose(1, 2)).transpose(1, 2)
+        hidden = zero_padded_positions(hidden, padding_mask)
+        valid_mask = attention_mask
+        for level in self.levels:
+            hidden, valid_mask = level(hidden, valid_mask)
+
+        padding_mask = ~valid_mask
+        hidden = self.mid_res1(hidden, padding_mask=padding_mask)
+        hidden = self.mid_attention(hidden, padding_mask=padding_mask)
+        hidden = self.mid_res2(hidden, padding_mask=padding_mask)
+        hidden = F.silu(self.norm(hidden))
+        hidden = self.conv_out(hidden.transpose(1, 2)).transpose(1, 2)
+        hidden = zero_padded_positions(hidden, padding_mask)
+        expected_shape = (
+            batch_size,
+            self.latent_slots,
+            self.output_dim,
+        )
+        if hidden.shape != expected_shape:
+            raise RuntimeError(
+                "vqganr encoder produced an unexpected shape: "
+                f"{hidden.shape}, expected {expected_shape}."
+            )
+        return hidden, valid_mask
+
+
 ENCODER_REGISTRY: dict[str, type[TextEncoder]] = {
     "absolute": AbsoluteTextEncoder,
     "rope": RotaryTextEncoder,
     "vqgans": VQGANTextEncoder,
     "vqganpa": VQGANPreAttentionTextEncoder,
+    "vqganr": VQGANRTextEncoder,
 }
 ENCODER_TYPES = get_args(EncoderType)
 

@@ -14,8 +14,8 @@ from common.text_data import (
 )
 
 
-EncoderType = Literal["absolute", "rope", "vqgans", "vqganpa"]
-DecoderType = Literal["cross_attention", "memory_trunk", "vqgans", "vqganpa"]
+EncoderType = Literal["absolute", "rope", "vqgans", "vqganpa", "vqganr"]
+DecoderType = Literal["cross_attention", "memory_trunk", "vqgans", "vqganpa", "vqganr"]
 BottleneckType = Literal["vq", "continuous"]
 TokenizerType = Literal["bpe", "byte"]
 CodebookInitialization = Literal["random", "kmeans"]
@@ -85,6 +85,7 @@ class TextVQVAEConfig:
     decoder_type: DecoderType = "memory_trunk"
     memory_decoder_latent_layers: int = 4
     memory_decoder_output_layers: int = 2
+    vqganr_num_res_blocks: int = 1
     ffn_mult: int = 4
     dropout: float = 0.1
     bottleneck_type: BottleneckType = "vq"

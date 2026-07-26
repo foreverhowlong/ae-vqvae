@@ -200,6 +200,85 @@ class VQGANAttentionBlock(nn.Module):
         )
 
 
+def zero_padded_positions(
+    hidden: torch.Tensor,
+    padding_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Set padded sequence positions to zero without changing valid activations."""
+    if padding_mask is None:
+        return hidden
+    if padding_mask.shape != hidden.shape[:2]:
+        raise ValueError(
+            f"padding_mask must have shape {hidden.shape[:2]}, got {padding_mask.shape}."
+        )
+    return hidden.masked_fill(
+        padding_mask.to(device=hidden.device, dtype=torch.bool).unsqueeze(-1),
+        0,
+    )
+
+
+class TextResBlock(nn.Module):
+    """Taming-style 1D residual block with channel-only normalization."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(config.d_model)
+        self.conv1 = nn.Conv1d(
+            config.d_model,
+            config.d_model,
+            kernel_size=3,
+            padding=1,
+        )
+        self.norm2 = nn.LayerNorm(config.d_model)
+        self.dropout = nn.Dropout(config.dropout)
+        self.conv2 = nn.Conv1d(
+            config.d_model,
+            config.d_model,
+            kernel_size=3,
+            padding=1,
+        )
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        residual = hidden
+        hidden = self.conv1(
+            F.silu(self.norm1(hidden)).transpose(1, 2)
+        ).transpose(1, 2)
+        hidden = zero_padded_positions(hidden, padding_mask)
+        hidden = self.conv2(
+            self.dropout(F.silu(self.norm2(hidden))).transpose(1, 2)
+        ).transpose(1, 2)
+        hidden = zero_padded_positions(hidden, padding_mask)
+        return zero_padded_positions(residual + hidden, padding_mask)
+
+
+class TextAttnBlock(nn.Module):
+    """Taming-style residual attention block using rotary self-attention."""
+
+    def __init__(self, config: TextVQVAEConfig):
+        super().__init__()
+        self.norm = nn.LayerNorm(config.d_model)
+        self.attention = RotarySelfAttention(
+            config.d_model,
+            config.n_heads,
+            config.dropout,
+        )
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden = hidden + self.attention(
+            self.norm(hidden),
+            padding_mask=padding_mask,
+        )
+        return zero_padded_positions(hidden, padding_mask)
+
+
 def vqgans_compression_factor(config: TextVQVAEConfig) -> int:
     if config.latent_slots < 1:
         raise ValueError(f"latent_slots must be positive, got {config.latent_slots}.")
@@ -209,3 +288,21 @@ def vqgans_compression_factor(config: TextVQVAEConfig) -> int:
             f"got {config.max_seq_len} and {config.latent_slots}."
         )
     return config.max_seq_len // config.latent_slots
+
+
+def vqganr_num_levels(config: TextVQVAEConfig) -> int:
+    """Return the number of stride-2 levels for a power-of-two compression."""
+    if config.latent_slots < 1:
+        raise ValueError(f"latent_slots must be positive, got {config.latent_slots}.")
+    if config.max_seq_len % config.latent_slots != 0:
+        raise ValueError(
+            "vqganr requires max_seq_len to be an integer multiple of latent_slots, "
+            f"got {config.max_seq_len} and {config.latent_slots}."
+        )
+    compression_factor = config.max_seq_len // config.latent_slots
+    if compression_factor < 1 or compression_factor & (compression_factor - 1):
+        raise ValueError(
+            "vqganr requires max_seq_len / latent_slots to be a power of two, "
+            f"got compression factor {compression_factor}."
+        )
+    return compression_factor.bit_length() - 1

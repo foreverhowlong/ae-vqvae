@@ -12,6 +12,7 @@ from models.text_decoders import (
     SubPixelSequenceUpsampler,
     TextDecoder,
     VQGANPreAttentionTextDecoder,
+    VQGANRTextDecoder,
     VQGANTextDecoder,
     build_text_decoder,
 )
@@ -21,6 +22,7 @@ from models.text_encoders import (
     RotaryTextEncoder,
     TextEncoder,
     VQGANPreAttentionTextEncoder,
+    VQGANRTextEncoder,
     VQGANTextEncoder,
     build_text_encoder,
     pad_aware_adaptive_pool1d,
@@ -30,6 +32,8 @@ from models.text_layers import (
     PlainSelfAttention,
     RotaryResidualBlock,
     RotarySelfAttention,
+    TextAttnBlock,
+    TextResBlock,
 )
 
 
@@ -217,7 +221,11 @@ class TextVQVAE(nn.Module):
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.encoder: TextEncoder = build_text_encoder(config)
-        self.latent_proj = nn.Linear(config.d_model, self.latent_dim)
+        self.latent_proj = (
+            nn.Identity()
+            if self.encoder.emits_latent_vectors
+            else nn.Linear(self.encoder.output_dim, self.latent_dim)
+        )
         self.quantizer = (
             VectorQuantizer(
                 config.codebook_size,
@@ -227,12 +235,16 @@ class TextVQVAE(nn.Module):
             if config.bottleneck_type == "vq"
             else None
         )
+        decoder_impl = build_text_decoder(config)
         self.decoder_input_proj = (
             nn.Identity()
-            if self.latent_dim == config.d_model
-            else nn.Linear(self.latent_dim, config.d_model)
+            if (
+                decoder_impl.accepts_latent_vectors
+                or self.latent_dim == decoder_impl.input_dim
+            )
+            else nn.Linear(self.latent_dim, decoder_impl.input_dim)
         )
-        self.decoder_impl: TextDecoder = build_text_decoder(config)
+        self.decoder_impl: TextDecoder = decoder_impl
         self.output_head = nn.Linear(config.d_model, config.vocab_size)
 
     def encode(
@@ -258,13 +270,27 @@ class TextVQVAE(nn.Module):
             return latents, latent_mask
         return latents
 
-    def decode(self, latents: torch.Tensor, seq_len: int):
+    def decode(
+        self,
+        latents: torch.Tensor,
+        seq_len: int,
+        *,
+        latent_mask: torch.Tensor | None = None,
+        output_mask: torch.Tensor | None = None,
+    ):
         if latents.shape[-1] != self.latent_dim:
             raise ValueError(
                 f"Expected latent dimension {self.latent_dim}, got {latents.shape[-1]}."
             )
         hidden = self.decoder_input_proj(latents)
-        return self.output_head(self.decoder_impl(hidden, seq_len))
+        return self.output_head(
+            self.decoder_impl(
+                hidden,
+                seq_len,
+                latent_mask=latent_mask,
+                output_mask=output_mask,
+            )
+        )
 
     @property
     def encoder_pos_embedding(self):
@@ -338,7 +364,12 @@ class TextVQVAE(nn.Module):
         if quantizer_active and self.quantizer is None:
             raise ValueError("Cannot enable quantization for a continuous bottleneck.")
         if not quantizer_active:
-            logits = self.decode(z_e, seq_len=input_ids.shape[1])
+            logits = self.decode(
+                z_e,
+                seq_len=input_ids.shape[1],
+                latent_mask=latent_mask,
+                output_mask=resolved_attention_mask,
+            )
             return {
                 "bottleneck_type": self.config.bottleneck_type,
                 "quantizer_active": False,
@@ -354,7 +385,12 @@ class TextVQVAE(nn.Module):
         z_q_raw = quantized["z_q_raw"]
         z_q_st = quantized["z_q_st"]
         indices = quantized["indices"]
-        logits = self.decode(z_q_st, seq_len=input_ids.shape[1])
+        logits = self.decode(
+            z_q_st,
+            seq_len=input_ids.shape[1],
+            latent_mask=latent_mask,
+            output_mask=resolved_attention_mask,
+        )
         return {
             "bottleneck_type": "vq",
             "quantizer_active": True,
