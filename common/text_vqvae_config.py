@@ -107,7 +107,7 @@ class CollapseControlConfig:
     """Engineering controls commonly used to reduce codebook collapse."""
 
     enabled: bool = False
-    use_ema_codebook: bool = False
+    use_ema_codebook: bool = True
     ema_decay: float = 0.99
     ema_eps: float = 1e-5
     entropy_weight: float = 0.0

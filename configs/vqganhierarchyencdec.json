@@ -1,0 +1,23 @@
+{
+  "module": "training.run_text_vqvae_experiment",
+  "experiments": [
+    { "encoder-type": "vqganr", "decoder-type": "vqganr",
+      "latent-slots": 128, "vqganr-num-res-blocks": 3,
+      "latent-dim": 32,
+      "l2-normalize-before-vq": true, "normalize-latents": true },
+
+    { "encoder-type": "rope",
+      "latent-dim": 32,
+      "l2-normalize-before-vq": true, "normalize-latents": true },
+
+    { "encoder-type": "vqganr", "decoder-type": "vqganr",
+      "latent-slots": 64, "vqganr-num-res-blocks": 2,
+      "latent-dim": 32,
+      "l2-normalize-before-vq": true, "normalize-latents": true },
+
+    { "encoder-type": "rope",
+      "latent-slots": 64,
+      "latent-dim": 32,
+      "l2-normalize-before-vq": true, "normalize-latents": true }
+  ]
+}
