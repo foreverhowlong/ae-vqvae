@@ -630,7 +630,8 @@ def run(
     atomic_json_dump(config_payload, run_dir / "config.json")
 
     metrics_path = run_dir / "metrics.jsonl"
-    best_eval_loss = float("inf")
+    best_eval_nll = float("inf")
+    best_eval_loss_at_best_nll = float("inf")
     best_step = 0
     global_step = 0
     last_eval = None
@@ -1099,9 +1100,10 @@ def run(
                     )
                     if (
                         (model_config.bottleneck_type == "continuous" or quantizer_active)
-                        and last_eval["loss"] < best_eval_loss
+                        and last_eval["recon_nll"] < best_eval_nll
                     ):
-                        best_eval_loss = last_eval["loss"]
+                        best_eval_nll = last_eval["recon_nll"]
+                        best_eval_loss_at_best_nll = last_eval["loss"]
                         best_step = global_step
                         save_checkpoint(
                             model,
@@ -1254,7 +1256,11 @@ def run(
             ),
             "final_phase": current_phase(),
             "codebook_transition_step": transition_step if warmup_enabled else None,
-            "best_eval_loss": best_eval_loss,
+            "best_selection_metric": "recon_nll",
+            "best_eval_nll": best_eval_nll,
+            # Compatibility diagnostic only: total loss at the NLL-selected
+            # checkpoint. It is not the selection criterion or minimum loss.
+            "compat_best_eval_loss_at_best_nll": best_eval_loss_at_best_nll,
             "best_step": best_step,
             "final_eval": {k: v for k, v in last_eval.items() if k != "code_counts"},
             "final_codebook_probe": last_codebook_probe,
@@ -1265,7 +1271,9 @@ def run(
         atomic_json_dump(summary, run_dir / "summary.json")
         shutil.copy2(run_dir / "summary.json", run_dir / "latest_summary.json")
         tracker.summary.update({
-            "best_eval_loss": best_eval_loss,
+            "best_selection_metric": "recon_nll",
+            "best_eval_nll": best_eval_nll,
+            "compat_best_eval_loss_at_best_nll": best_eval_loss_at_best_nll,
             "best_step": best_step,
             "steps": global_step,
         })

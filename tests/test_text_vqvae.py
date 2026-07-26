@@ -2433,6 +2433,107 @@ class LoadRunConfigTest(unittest.TestCase):
 
 
 class TrainingLifecycleTest(unittest.TestCase):
+    def test_best_checkpoint_prefers_reconstruction_nll_over_total_loss(self):
+        from common.text_data import ByteTokenizer
+        from training.text_vqvae.config import DataConfig, TrainConfig
+        from training.text_vqvae.loop import run
+
+        config = small_config()
+        collapse_config = CollapseControlConfig()
+        model = TextVQVAE(config, collapse_config=collapse_config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        batches = [{
+            "input_ids": torch.randint(0, 31, (2, 12)),
+            "attention_mask": torch.ones(2, 12, dtype=torch.long),
+        } for _ in range(2)]
+        tracker = SimpleNamespace(log=lambda *args, **kwargs: None, summary={})
+        eval_results = [
+            (
+                {
+                    "loss": 1.0,
+                    "recon_nll": 2.0,
+                    "token_ppl": 2.0,
+                    "token_accuracy": 0.8,
+                },
+                [],
+            ),
+            (
+                {
+                    "loss": 2.0,
+                    "recon_nll": 1.0,
+                    "token_ppl": 2.0,
+                    "token_accuracy": 0.7,
+                },
+                [],
+            ),
+        ]
+
+        with TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            for child in ("checkpoints", "plots", "samples"):
+                (run_dir / child).mkdir()
+            payload = {
+                "diagnostics": {
+                    "initial_pca": {"status": "disabled"},
+                    "geometry": {},
+                },
+            }
+            with (
+                patch(
+                    "training.text_vqvae.loop.evaluate",
+                    side_effect=eval_results,
+                ),
+                patch("training.text_vqvae.loop.write_reconstruction_samples"),
+            ):
+                run(
+                    model=model,
+                    optimizer=optimizer,
+                    train_loader=batches,
+                    val_loader=[batches[0]],
+                    train_cfg=TrainConfig(
+                        epochs=1,
+                        eval_every=1,
+                        save_every=100,
+                        tokenizer="byte",
+                        tokenizer_path=None,
+                    ),
+                    data_cfg=DataConfig(),
+                    model_config=config,
+                    collapse_config=collapse_config,
+                    run_dir=run_dir,
+                    run_name="best-by-nll",
+                    tokenizer=ByteTokenizer(),
+                    device=torch.device("cpu"),
+                    config_payload=payload,
+                    tracker=tracker,
+                    initial_pca_opts={
+                        "enabled": False,
+                        "max_points": 8,
+                        "fit_mode": "balanced",
+                        "strict": True,
+                    },
+                    geometry_snapshot_opts={
+                        "enabled": False,
+                        "strict": True,
+                        "render_enabled": False,
+                    },
+                )
+
+            summary = json.loads((run_dir / "summary.json").read_text())
+            checkpoint = torch.load(
+                run_dir / "checkpoints" / "best.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+            self.assertEqual(summary["best_selection_metric"], "recon_nll")
+            self.assertEqual(summary["best_eval_nll"], 1.0)
+            self.assertEqual(
+                summary["compat_best_eval_loss_at_best_nll"],
+                2.0,
+            )
+            self.assertEqual(summary["best_step"], 2)
+            self.assertEqual(checkpoint["step"], 2)
+
     def test_adaptive_ae_warmup_transitions_after_plateau(self):
         from common.text_data import ByteTokenizer
         from training.text_vqvae.config import DataConfig, TrainConfig
