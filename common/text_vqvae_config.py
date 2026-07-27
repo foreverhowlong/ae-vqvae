@@ -106,7 +106,6 @@ class TextVQVAEConfig:
 class CollapseControlConfig:
     """Engineering controls commonly used to reduce codebook collapse."""
 
-    enabled: bool = False
     use_ema_codebook: bool = True
     ema_decay: float = 0.99
     ema_eps: float = 1e-5
@@ -122,6 +121,21 @@ class CollapseControlConfig:
     normalize_latents: bool = False
     commitment_beta_start: float | None = None
     commitment_beta_warmup_steps: int = 0
+
+    @property
+    def is_active(self) -> bool:
+        """Whether any collapse-control behavior is effectively enabled."""
+        return any((
+            self.use_ema_codebook,
+            self.entropy_weight > 0,
+            self.diversity_weight > 0,
+            self.code_dropout > 0,
+            self.stochastic_code_sampling,
+            self.dead_code_reset_every > 0,
+            self.normalize_latents,
+            self.commitment_beta_start is not None,
+        ))
+
 
 @dataclass
 class DiagnosticsConfig:

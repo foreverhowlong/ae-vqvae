@@ -197,24 +197,19 @@ class TextVQVAE(nn.Module):
             )
         self.config = config
         self.latent_dim = config.resolved_latent_dim
-        self.collapse_config = collapse_config or CollapseControlConfig()
+        self.collapse_config = (
+            CollapseControlConfig(
+                use_ema_codebook=config.bottleneck_type == "vq"
+            )
+            if collapse_config is None
+            else collapse_config
+        )
         if config.bottleneck_type == "continuous":
-            active_vq_controls = any((
-                self.collapse_config.use_ema_codebook,
-                self.collapse_config.entropy_weight > 0,
-                self.collapse_config.diversity_weight > 0,
-                self.collapse_config.code_dropout > 0,
-                self.collapse_config.stochastic_code_sampling,
-                self.collapse_config.dead_code_reset_every > 0,
-                self.collapse_config.normalize_latents,
-                self.collapse_config.commitment_beta_start is not None,
-                self.collapse_config.commitment_beta_warmup_steps > 0,
-            ))
             if config.l2_normalize_before_vq:
                 raise ValueError(
                     "l2_normalize_before_vq requires bottleneck_type='vq'."
                 )
-            if active_vq_controls:
+            if self.collapse_config.is_active:
                 raise ValueError(
                     "Collapse-control options require bottleneck_type='vq'."
                 )

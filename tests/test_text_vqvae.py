@@ -94,7 +94,7 @@ def small_config(**overrides):
 class EvaluationPipelineTest(unittest.TestCase):
     def test_continuous_optimizer_step_omits_codebook_metrics(self):
         config = small_config(bottleneck_type="continuous")
-        collapse_config = CollapseControlConfig()
+        collapse_config = CollapseControlConfig(use_ema_codebook=False)
         model = TextVQVAE(config, collapse_config=collapse_config)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         batch = {
@@ -209,7 +209,7 @@ class EvaluationPipelineTest(unittest.TestCase):
 
     def test_continuous_evaluation_reports_only_common_metrics(self):
         config = small_config(bottleneck_type="continuous")
-        collapse_config = CollapseControlConfig()
+        collapse_config = CollapseControlConfig(use_ema_codebook=False)
         model = TextVQVAE(config, collapse_config=collapse_config)
         batch = {
             "input_ids": torch.randint(0, 31, (2, 12)),
@@ -244,7 +244,7 @@ class EvaluationPipelineTest(unittest.TestCase):
         from training.text_vqvae.loop import run
 
         config = small_config(bottleneck_type="continuous")
-        collapse_config = CollapseControlConfig()
+        collapse_config = CollapseControlConfig(use_ema_codebook=False)
         model = TextVQVAE(config, collapse_config=collapse_config)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         batch = {
@@ -1702,6 +1702,7 @@ class TextVQVAEPaddingTest(unittest.TestCase):
             targets,
             pad_token_id=3,
             beta=0.25,
+            collapse_config=CollapseControlConfig(use_ema_codebook=False),
         )
         correct, total = compute_accuracy(logits, targets, pad_token_id=3)
         stats = codebook_stats(
@@ -2113,6 +2114,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(payload["train"]["batch_size"], 17)
         self.assertEqual(payload["train"]["run_name"], run_name)
         self.assertTrue(payload["collapse_control"]["use_ema_codebook"])
+        self.assertTrue(payload["collapse_control"]["enabled"])
         self.assertEqual(payload["model"]["vocab_size"], 258)
         self.assertFalse(run_dir.exists())
 
@@ -2220,12 +2222,16 @@ class ConfigDefaultsTest(unittest.TestCase):
 
         tokenizer = SimpleNamespace(vocab_size=123, pad_token_id=0)
         _, _, model, collapse = build_configs(
-            self._parse("--bottleneck-type", "continuous"),
+            self._parse(
+                "--bottleneck-type",
+                "continuous",
+                "--no-ema-codebook",
+            ),
             tokenizer,
         )
 
         self.assertEqual(model.bottleneck_type, "continuous")
-        self.assertFalse(collapse.enabled)
+        self.assertFalse(collapse.is_active)
 
     def test_ae_warmup_requires_vq_and_kmeans(self):
         from training.text_vqvae.config import build_configs
@@ -2371,9 +2377,18 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(asdict(data_cfg), asdict(DataConfig()))
         self.assertEqual(asdict(model_cfg), asdict(expected_model))
         self.assertEqual(asdict(collapse_cfg), asdict(CollapseControlConfig()))
+        self.assertNotIn("enabled", asdict(collapse_cfg))
+        self.assertTrue(collapse_cfg.is_active)
         self.assertEqual(
             asdict(build_diagnostics_config(args)), asdict(DiagnosticsConfig())
         )
+
+    def test_collapse_activity_is_derived_from_behavioral_fields(self):
+        inactive = CollapseControlConfig(use_ema_codebook=False)
+        self.assertFalse(inactive.is_active)
+
+        inactive.dead_code_reset_every = 500
+        self.assertTrue(inactive.is_active)
 
     def test_default_tokenizer_is_resolved_from_train_config(self):
         from training.run_text_vqvae_experiment import _resolve_tokenizer
@@ -2428,6 +2443,30 @@ class LoadRunConfigTest(unittest.TestCase):
             messages = "\n".join(str(item.message) for item in caught)
             self.assertIn("TextVQVAEConfig", messages)
             self.assertIn("CollapseControlConfig", messages)
+        finally:
+            os.unlink(path)
+
+    def test_stale_legacy_enabled_value_is_ignored(self):
+        import json, os, tempfile
+
+        from training.text_vqvae.config import load_run_config
+
+        payload = {
+            "train": {},
+            "model": {},
+            "data": {},
+            "collapse_control": {
+                "enabled": False,
+                "use_ema_codebook": True,
+            },
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(payload, f)
+            path = f.name
+        try:
+            with self.assertWarnsRegex(UserWarning, "ignoring stale derived enabled=False"):
+                _, _, _, collapse_cfg = load_run_config(path)
+            self.assertTrue(collapse_cfg.is_active)
         finally:
             os.unlink(path)
 

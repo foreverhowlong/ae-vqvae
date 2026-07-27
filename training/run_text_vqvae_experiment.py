@@ -22,6 +22,7 @@ from training.text_vqvae.config import (
     build_configs,
     build_diagnostics_config,
     build_train_config,
+    collapse_config_payload,
 )
 
 
@@ -60,7 +61,7 @@ def _resolved_config_dict(train_cfg, data_cfg, model_cfg, collapse_cfg, diagnost
         "train": asdict(train_cfg),
         "data": asdict(data_cfg),
         "model": asdict(model_cfg),
-        "collapse_control": asdict(collapse_cfg),
+        "collapse_control": collapse_config_payload(collapse_cfg),
         "diagnostics": asdict(diagnostics_cfg),
     }
 

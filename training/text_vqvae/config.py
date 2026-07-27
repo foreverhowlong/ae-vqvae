@@ -415,7 +415,6 @@ def build_diagnostics_config(args) -> DiagnosticsConfig:
 def build_collapse_config(args) -> CollapseControlConfig:
     if getattr(args, "collapse_preset", None) == "anti":
         config = CollapseControlConfig(
-            enabled=True,
             use_ema_codebook=True,
             ema_decay=0.99,
             ema_eps=1e-5,
@@ -453,16 +452,6 @@ def build_collapse_config(args) -> CollapseControlConfig:
         "commitment_beta_warmup_steps": getattr(args, "commitment_beta_warmup_steps", None),
     })
 
-    config.enabled = any([
-        config.use_ema_codebook,
-        config.entropy_weight > 0,
-        config.diversity_weight > 0,
-        config.code_dropout > 0,
-        config.stochastic_code_sampling,
-        config.dead_code_reset_every > 0,
-        config.normalize_latents,
-        config.commitment_beta_start is not None,
-    ])
     return config
 
 
@@ -537,7 +526,7 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
             raise ValueError(
                 "--l2-normalize-before-vq requires --bottleneck-type vq."
             )
-        if collapse_cfg.enabled:
+        if collapse_cfg.is_active:
             raise ValueError(
                 "Collapse-control options require --bottleneck-type vq."
             )
@@ -547,6 +536,15 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
 # ---------------------------------------------------------------------------
 # Config payload helpers
 # ---------------------------------------------------------------------------
+
+def collapse_config_payload(config: CollapseControlConfig) -> dict[str, Any]:
+    """Serialize collapse controls with a compatibility-only activity summary."""
+    payload = asdict(config)
+    # Existing config.json consumers expect this key. It is derived and is
+    # never loaded back as a source of behavior.
+    payload["enabled"] = config.is_active
+    return payload
+
 
 def _git_info() -> dict[str, Any]:
     try:
@@ -604,7 +602,7 @@ def build_config_payload(
         "train": asdict(train_cfg),
         "data": asdict(data_cfg),
         "model": asdict(model_cfg),
-        "collapse_control": asdict(collapse_cfg),
+        "collapse_control": collapse_config_payload(collapse_cfg),
         "device": str(device),
         "output_dir": str(run_dir),
         "codebook_initialization": (
@@ -709,8 +707,22 @@ def load_run_config(path: str | Path) -> tuple[TrainConfig, DataConfig, TextVQVA
     train_cfg = _fill(TrainConfig(), payload.get("train", {}), "TrainConfig")
     data_cfg = _fill(DataConfig(), payload.get("data", {}), "DataConfig")
     model_cfg = _fill(TextVQVAEConfig(), payload.get("model", {}), "TextVQVAEConfig")
+    saved_collapse = payload.get("collapse_control", {})
+    derived_activity = {}
+    if isinstance(saved_collapse, dict):
+        saved_collapse = dict(saved_collapse)
+        for key in ("enabled", "is_active"):
+            if key in saved_collapse:
+                derived_activity[key] = saved_collapse.pop(key)
     collapse_cfg = _fill(
-        CollapseControlConfig(), payload.get("collapse_control", {}), "CollapseControlConfig"
+        CollapseControlConfig(), saved_collapse, "CollapseControlConfig"
     )
+    for key, saved_value in derived_activity.items():
+        if saved_value != collapse_cfg.is_active:
+            warnings.warn(
+                f"[load_run_config] CollapseControlConfig: ignoring stale derived "
+                f"{key}={saved_value!r}; effective value is {collapse_cfg.is_active!r}",
+                stacklevel=2,
+            )
 
     return train_cfg, data_cfg, model_cfg, collapse_cfg
