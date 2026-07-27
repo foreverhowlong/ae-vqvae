@@ -76,17 +76,20 @@ def parameter_to_cli(name: str, value: Any) -> list[str]:
     return [option, str(value)]
 
 
-def _filename_value(value: Any) -> str:
+def _filename_value(value: Any, *, max_length: int = 40) -> str:
     if isinstance(value, bool):
         text = "true" if value else "false"
     else:
         text = str(value)
     text = _UNSAFE_FILENAME_CHARS.sub("-", text).strip("-._") or "empty"
-    return text[:40]
+    return text[:max_length]
 
 
 def make_run_name(parameters: dict[str, Any], date: str) -> str:
-    """Include every explicitly configured parameter and the launch date."""
+    """Use the ablation label when present; otherwise describe all parameters."""
+    if "ablation" in parameters:
+        return f"{_filename_value(parameters['ablation'], max_length=200)}__{date}"
+
     parts = [
         f"{name.replace('_', '-')}-{_filename_value(value)}"
         for name, value in sorted(parameters.items())
