@@ -1,0 +1,88 @@
+{
+  "module": "training.run_text_vqvae_experiment",
+  "experiments": [
+    {
+      "ablation": "sequence-length-128-ratio-2",
+      "max-seq-len": 128,
+      "latent-slots": 64,
+      "latent-dim": 32,
+      "use-ema-codebook": true
+    },
+    {
+      "ablation": "sequence-length-64-ratio-2",
+      "max-seq-len": 64,
+      "latent-slots": 32,
+      "latent-dim": 32,
+      "use-ema-codebook": true
+    },
+    {
+      "ablation": "l2-before-and-after-vq",
+      "latent-dim": 32,
+      "use-ema-codebook": true,
+      "l2-normalize-before-vq": true,
+      "normalize-latents": true
+    },
+    {
+      "ablation": "dead-code-reset-500-only",
+      "latent-dim": 32,
+      "use-ema-codebook": true,
+      "dead-code-reset-every": 500,
+      "dead-code-reset-usage-threshold": 1.0
+    },
+    {
+      "ablation": "compression-ratio-4",
+      "latent-slots": 64,
+      "latent-dim": 32,
+      "use-ema-codebook": true
+    },
+    {
+      "ablation": "compression-ratio-2-rope-memory-trunk-double-l2",
+      "latent-slots": 128,
+      "latent-dim": 32,
+      "encoder-type": "rope",
+      "decoder-type": "memory_trunk",
+      "use-ema-codebook": true,
+      "l2-normalize-before-vq": true,
+      "normalize-latents": true
+    },
+    {
+      "ablation": "compression-ratio-2-vqganr-double-l2-param-matched",
+      "latent-slots": 128,
+      "latent-dim": 32,
+      "encoder-type": "vqganr",
+      "decoder-type": "vqganr",
+      "vqganr-num-res-blocks": 5,
+      "use-ema-codebook": true,
+      "l2-normalize-before-vq": true,
+      "normalize-latents": true
+    },
+    {
+      "ablation": "compression-ratio-8-rope-memory-trunk-double-l2",
+      "latent-slots": 32,
+      "latent-dim": 32,
+      "encoder-type": "rope",
+      "decoder-type": "memory_trunk",
+      "use-ema-codebook": true,
+      "l2-normalize-before-vq": true,
+      "normalize-latents": true
+    },
+    {
+      "ablation": "compression-ratio-8-vqganr-double-l2",
+      "latent-slots": 32,
+      "latent-dim": 32,
+      "encoder-type": "vqganr",
+      "decoder-type": "vqganr",
+      "vqganr-num-res-blocks": 1,
+      "use-ema-codebook": true,
+      "l2-normalize-before-vq": true,
+      "normalize-latents": true
+    }
+  ],
+  "_comments": {
+    "reference_run": "encoder-type-rope__latent-dim-32__use-ema-codebook-true__20260725",
+    "reused_architecture_control": "decoder-type-vqgans__encoder-type-vqgans__latent-dim-32__use-ema-codebook-true__20260725",
+    "existing_symmetric_architecture_result": "decoder-type-vqganpa__encoder-type-vqganpa__latent-dim-32__use-ema-codebook-true__20260725",
+    "locked_defaults": "seed=42, max_seq_len=256, latent_slots=128, encoder=rope, decoder=memory_trunk, codebook_init=kmeans, l2_normalize_before_vq=false, normalize_latents=false, dead_code_reset_every=0 unless explicitly overridden.",
+    "design": "Only missing seed-42 cells are scheduled. Sequence-length runs preserve the baseline 2x compression ratio. Encoder L2 normalization and dead-code reset are isolated from quantizer-vector normalization and other anti-collapse controls. The ratio-2 and ratio-8 pairs compare rope+memory_trunk against vqganr+vqganr with both encoder and codebook L2 normalization. At ratio 2, rope+memory_trunk has 31.92M parameters and vqganr+vqganr with five ResBlocks per level has 30.54M parameters (about -4.3%). At ratio 8, rope+memory_trunk has 33.13M parameters and vqganr+vqganr with one ResBlock per level has 33.76M parameters (about +1.9%). Defaults are intentionally not duplicated except where architecture and normalization settings define a comparison cell."
+  }
+}
