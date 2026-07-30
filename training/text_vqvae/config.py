@@ -182,6 +182,18 @@ def add_arguments(parser) -> None:
     g.add_argument("--max-train-samples", type=int, default=None)
     g.add_argument("--max-eval-samples", type=int, default=None)
     g.add_argument("--val-fraction", type=float, default=None)
+    g.add_argument(
+        "--continuous-truncation",
+        dest="continuous_truncation",
+        action="store_true",
+        default=None,
+        help="Split every tokenized text into consecutive max-seq-len samples.",
+    )
+    g.add_argument(
+        "--no-continuous-truncation",
+        dest="continuous_truncation",
+        action="store_false",
+    )
 
     # ---- model ----
     g = parser.add_argument_group("model")
@@ -483,6 +495,7 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
         "max_train_samples": getattr(args, "max_train_samples", None),
         "max_eval_samples": getattr(args, "max_eval_samples", None),
         "val_fraction": getattr(args, "val_fraction", None),
+        "continuous_truncation": getattr(args, "continuous_truncation", None),
     })
 
     model_cfg = TextVQVAEConfig()

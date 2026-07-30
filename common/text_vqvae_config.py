@@ -70,6 +70,7 @@ class DataConfig:
     max_train_samples: int | None = 50000
     max_eval_samples: int = 2048
     val_fraction: float = 0.02
+    continuous_truncation: bool = False
 
 
 @dataclass

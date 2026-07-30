@@ -46,7 +46,60 @@ class TextTokenizer(Protocol):
 
     def encode(self, text: str, max_length: int): ...
 
+    def encode_chunks(self, text: str, max_length: int): ...
+
     def decode(self, ids: Iterable[int]): ...
+
+
+def _pad_token_ids(
+    token_ids: list[int],
+    max_length: int,
+    *,
+    eos_token_id: int,
+    pad_token_id: int,
+):
+    if max_length < 1:
+        raise ValueError("max_length must be positive.")
+    token_ids = token_ids[: max_length - 1] + [eos_token_id]
+    attention_mask = [1] * len(token_ids)
+    pad_len = max_length - len(token_ids)
+    token_ids.extend([pad_token_id] * pad_len)
+    attention_mask.extend([0] * pad_len)
+    return token_ids, attention_mask
+
+
+def _chunk_token_ids(
+    token_ids: list[int],
+    max_length: int,
+    *,
+    eos_token_id: int,
+    pad_token_id: int,
+):
+    """Split all content tokens into consecutive fixed-width training samples."""
+    if max_length < 1:
+        raise ValueError("max_length must be positive.")
+
+    chunks = [
+        token_ids[start : start + max_length]
+        for start in range(0, len(token_ids), max_length)
+    ] or [[]]
+    final_chunk = chunks[-1]
+    if len(final_chunk) < max_length:
+        final_chunk.append(eos_token_id)
+        attention_mask = [1] * len(final_chunk)
+        pad_len = max_length - len(final_chunk)
+        final_chunk.extend([pad_token_id] * pad_len)
+        attention_mask.extend([0] * pad_len)
+    else:
+        attention_mask = [1] * max_length
+
+    return [
+        (
+            chunk,
+            attention_mask if index == len(chunks) - 1 else [1] * max_length,
+        )
+        for index, chunk in enumerate(chunks)
+    ]
 
 
 class ByteTokenizer:
@@ -56,15 +109,21 @@ class ByteTokenizer:
 
     def encode(self, text: str, max_length: int):
         byte_ids = list(text.encode("utf-8", errors="ignore"))
-        byte_ids = byte_ids[: max_length - 1] + [self.eos_token_id]
-        attention_mask = [1] * len(byte_ids)
+        return _pad_token_ids(
+            byte_ids,
+            max_length,
+            eos_token_id=self.eos_token_id,
+            pad_token_id=self.pad_token_id,
+        )
 
-        pad_len = max_length - len(byte_ids)
-        if pad_len > 0:
-            byte_ids.extend([self.pad_token_id] * pad_len)
-            attention_mask.extend([0] * pad_len)
-
-        return byte_ids, attention_mask
+    def encode_chunks(self, text: str, max_length: int):
+        byte_ids = list(text.encode("utf-8", errors="ignore"))
+        return _chunk_token_ids(
+            byte_ids,
+            max_length,
+            eos_token_id=self.eos_token_id,
+            pad_token_id=self.pad_token_id,
+        )
 
     def decode(self, ids: Iterable[int]):
         byte_values = []
@@ -98,15 +157,21 @@ class BPETokenizer:
 
     def encode(self, text: str, max_length: int):
         token_ids = self.tokenizer.encode(text, add_special_tokens=False).ids
-        token_ids = token_ids[: max_length - 1] + [self.eos_token_id]
-        attention_mask = [1] * len(token_ids)
+        return _pad_token_ids(
+            token_ids,
+            max_length,
+            eos_token_id=self.eos_token_id,
+            pad_token_id=self.pad_token_id,
+        )
 
-        pad_len = max_length - len(token_ids)
-        if pad_len > 0:
-            token_ids.extend([self.pad_token_id] * pad_len)
-            attention_mask.extend([0] * pad_len)
-
-        return token_ids, attention_mask
+    def encode_chunks(self, text: str, max_length: int):
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False).ids
+        return _chunk_token_ids(
+            token_ids,
+            max_length,
+            eos_token_id=self.eos_token_id,
+            pad_token_id=self.pad_token_id,
+        )
 
     def decode(self, ids: Iterable[int]):
         content_ids = []
@@ -125,16 +190,34 @@ class TextDataset(Dataset):
         texts: list[str],
         max_seq_len: int,
         tokenizer: TextTokenizer | None = None,
+        continuous_truncation: bool = False,
     ):
         self.texts = texts
         self.max_seq_len = max_seq_len
         self.tokenizer = tokenizer or ByteTokenizer()
+        self.continuous_truncation = continuous_truncation
+        self.encoded_samples = None
+        self.sample_text_indices = list(range(len(texts)))
+        if continuous_truncation:
+            self.encoded_samples = []
+            self.sample_text_indices = []
+            for text_index, text in enumerate(texts):
+                chunks = self.tokenizer.encode_chunks(text, max_seq_len)
+                self.encoded_samples.extend(chunks)
+                self.sample_text_indices.extend([text_index] * len(chunks))
 
     def __len__(self):
+        if self.encoded_samples is not None:
+            return len(self.encoded_samples)
         return len(self.texts)
 
     def __getitem__(self, idx):
-        input_ids, attention_mask = self.tokenizer.encode(self.texts[idx], self.max_seq_len)
+        if self.encoded_samples is not None:
+            input_ids, attention_mask = self.encoded_samples[idx]
+        else:
+            input_ids, attention_mask = self.tokenizer.encode(
+                self.texts[idx], self.max_seq_len
+            )
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
@@ -244,6 +327,7 @@ def build_text_dataset(
     cache_dir: str | None = None,
     streaming: bool = False,
     tokenizer: TextTokenizer | None = None,
+    continuous_truncation: bool = False,
 ):
     if data_file:
         texts = read_texts_from_file(
@@ -265,4 +349,9 @@ def build_text_dataset(
     if not texts:
         raise ValueError("No texts were loaded for the language compression experiment.")
 
-    return TextDataset(texts, max_seq_len=max_seq_len, tokenizer=tokenizer)
+    return TextDataset(
+        texts,
+        max_seq_len=max_seq_len,
+        tokenizer=tokenizer,
+        continuous_truncation=continuous_truncation,
+    )

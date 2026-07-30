@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 
 from common.text_vqvae_config import (
     CollapseControlConfig,
@@ -68,6 +68,30 @@ def make_loader(
 def split_dataset(dataset, val_fraction: float, seed: int, max_eval_samples: int):
     if len(dataset) < 2:
         raise ValueError("Need at least 2 text examples to create train/eval splits.")
+    if getattr(dataset, "continuous_truncation", False):
+        text_count = len(dataset.texts)
+        if text_count < 2:
+            raise ValueError(
+                "Need at least 2 source texts to create train/eval splits."
+            )
+        val_text_count = max(1, int(text_count * val_fraction))
+        val_text_count = min(val_text_count, max_eval_samples, text_count - 1)
+        generator = torch.Generator().manual_seed(seed)
+        shuffled_text_indices = torch.randperm(
+            text_count, generator=generator
+        ).tolist()
+        val_text_indices = set(shuffled_text_indices[:val_text_count])
+        train_indices = [
+            index
+            for index, text_index in enumerate(dataset.sample_text_indices)
+            if text_index not in val_text_indices
+        ]
+        val_indices = [
+            index
+            for index, text_index in enumerate(dataset.sample_text_indices)
+            if text_index in val_text_indices
+        ][:max_eval_samples]
+        return Subset(dataset, train_indices), Subset(dataset, val_indices)
     val_size = max(1, int(len(dataset) * val_fraction))
     val_size = min(val_size, max_eval_samples, len(dataset) - 1)
     train_size = len(dataset) - val_size

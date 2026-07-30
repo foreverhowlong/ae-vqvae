@@ -111,6 +111,7 @@ def main():
         cache_dir=data_cfg.cache_dir,
         streaming=bool(data_cfg.streaming),
         tokenizer=tokenizer,
+        continuous_truncation=data_cfg.continuous_truncation,
     )
     train_dataset, val_dataset = split_dataset(
         dataset,
