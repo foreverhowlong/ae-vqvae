@@ -1,0 +1,40 @@
+{
+  "module": "training.run_text_vqvae_experiment",
+  "experiments": [
+    {
+      "ablation": "adaptive-ae-warmup-32d",
+      "epochs": 10,
+      "latent-dim": 32,
+      "encoder-type": "rope",
+      "decoder-type": "memory_trunk",
+      "ae-warmup-mode": "adaptive",
+      "ae-warmup-max-steps": 6000
+    },
+    {
+      "ablation": "adaptive-ae-warmup-double-l2-32d",
+      "epochs": 10,
+      "latent-dim": 32,
+      "encoder-type": "rope",
+      "decoder-type": "memory_trunk",
+      "ae-warmup-mode": "adaptive",
+      "ae-warmup-max-steps": 6000,
+      "l2-normalize-before-vq": true,
+      "normalize-latents": true
+    },
+    {
+      "ablation": "no-ae-warmup-baseline-32d",
+      "epochs": 10,
+      "latent-dim": 32,
+      "encoder-type": "rope",
+      "decoder-type": "memory_trunk",
+      "ae-warmup-mode": "fixed",
+      "ae-warmup-steps": 0
+    }
+  ],
+  "_comments": {
+    "comparison": "All three runs use the same 10-epoch budget, seed-42 defaults, RoPE encoder, memory-trunk decoder, 32-dimensional latents, K-means codebook initialization, and otherwise resolved dataclass defaults.",
+    "adaptive": "Adaptive warmup keeps the default min_steps=1000, check_every=200, patience=5, dim_tolerance=1, probe_points=8192, and variance_threshold=0.99, with a 6000-step hard cap.",
+    "double_l2": "The second run L2-normalizes encoder latents before VQ and normalizes vectors used by VQ distance and EMA codebook updates.",
+    "baseline": "The baseline has no AE warmup; with the default K-means initialization it initializes the codebook before the first VQ optimizer step."
+  }
+}
