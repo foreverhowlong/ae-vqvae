@@ -62,6 +62,7 @@ from visualization.text_vqvae import (
     save_pca_metadata,
 )
 from visualization.render_geometry_animation import (
+    _encoder_spectrum_metrics,
     _snapshot_encoder_view,
     compute_animation_scales,
     fit_shared_pca,
@@ -682,6 +683,24 @@ class GeometrySnapshotTest(unittest.TestCase):
 
 
 class GeometryAnimationTest(unittest.TestCase):
+    def test_encoder_spectrum_metrics_include_rankme_and_twonn(self):
+        equal_spectrum = np.concatenate([np.eye(4), -np.eye(4)], axis=0)
+
+        metrics = _encoder_spectrum_metrics(equal_spectrum)
+
+        self.assertEqual(len(metrics["pca_eigenvalues"]), 4)
+        self.assertAlmostEqual(metrics["participation_ratio"], 4.0)
+        self.assertAlmostEqual(metrics["rankme"], 4.0)
+        self.assertEqual(metrics["twonn_points"], 8)
+
+        line_metrics = _encoder_spectrum_metrics(
+            np.array([[0.0], [1.0], [3.0]])
+        )
+        expected = 1.0 / (
+            (np.log(3.0) + np.log(2.0) + np.log(1.5)) / 3.0
+        )
+        self.assertAlmostEqual(line_metrics["twonn_intrinsic_dim"], expected)
+
     def test_mixed_warmup_and_vq_snapshots_render_phase_artifacts(self):
         with TemporaryDirectory() as temp_dir:
             run_dir = Path(temp_dir)

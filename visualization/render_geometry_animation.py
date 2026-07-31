@@ -18,6 +18,7 @@ import imageio_ffmpeg
 import numpy as np
 from PIL import Image
 from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
 
 from common.text_vqvae_config import GeometryRenderBasis
 
@@ -45,6 +46,73 @@ class SnapshotEncoderView:
     slot_indices: np.ndarray | None
     assignments: np.ndarray | None
     nearest_distances: np.ndarray | None
+
+
+def _encoder_spectrum_metrics(
+    encoder: np.ndarray,
+    *,
+    max_twonn_points: int = 2048,
+) -> dict[str, object]:
+    """Compute offline spectrum, smooth-rank, and TwoNN diagnostics."""
+    points = np.asarray(encoder, dtype=np.float64)
+    if points.ndim != 2 or len(points) == 0:
+        raise ValueError("Encoder spectrum diagnostics need a non-empty matrix.")
+
+    centered = points - points.mean(axis=0, keepdims=True)
+    covariance = (
+        centered.T @ centered / (len(centered) - 1)
+        if len(centered) > 1
+        else np.zeros((points.shape[1], points.shape[1]), dtype=np.float64)
+    )
+    eigenvalues = np.linalg.eigvalsh(covariance).clip(min=0)[::-1]
+    total_variance = eigenvalues.sum()
+    participation_ratio = (
+        float(total_variance**2 / np.square(eigenvalues).sum())
+        if total_variance > 0
+        else 0.0
+    )
+
+    singular_values = np.sqrt(eigenvalues)
+    singular_sum = singular_values.sum()
+    if singular_sum > 0:
+        probabilities = singular_values[singular_values > 0] / singular_sum
+        rankme = float(np.exp(-np.sum(probabilities * np.log(probabilities))))
+    else:
+        rankme = 0.0
+
+    twonn_points = points
+    if len(twonn_points) > max_twonn_points:
+        sample_indices = np.linspace(
+            0,
+            len(twonn_points) - 1,
+            num=max_twonn_points,
+        ).round().astype(np.int64)
+        twonn_points = twonn_points[sample_indices]
+    twonn_intrinsic_dim = 0.0
+    if len(twonn_points) >= 3:
+        distances = NearestNeighbors(n_neighbors=3).fit(twonn_points).kneighbors(
+            twonn_points,
+            return_distance=True,
+        )[0][:, 1:3]
+        valid = (
+            np.isfinite(distances).all(axis=1)
+            & (distances[:, 0] > 0)
+            & (distances[:, 1] > distances[:, 0])
+        )
+        if valid.any():
+            mean_log_ratio = np.log(
+                distances[valid, 1] / distances[valid, 0]
+            ).mean()
+            if np.isfinite(mean_log_ratio) and mean_log_ratio > 0:
+                twonn_intrinsic_dim = float(1.0 / mean_log_ratio)
+
+    return {
+        "pca_eigenvalues": eigenvalues.tolist(),
+        "participation_ratio": participation_ratio,
+        "rankme": rankme,
+        "twonn_intrinsic_dim": twonn_intrinsic_dim,
+        "twonn_points": int(len(twonn_points)),
+    }
 
 
 def _snapshot_encoder_view(data) -> SnapshotEncoderView:
@@ -639,8 +707,20 @@ def render_metric_series(
                 transition_step = row["step"]
     if not rows:
         raise ValueError("metrics.jsonl contains no geometry rows")
+
+    spectrum_rows = []
+    for step, path in load_snapshots(run_dir):
+        with np.load(path) as data:
+            spectrum_rows.append({
+                "step": step,
+                **_encoder_spectrum_metrics(
+                    _snapshot_encoder_view(data).encoder
+                ),
+            })
+
     excluded = {
         "split", "step", "elapsed_sec", "phase", "event", "quantizer_active",
+        "participation_ratio",
         # Legacy geometry rows may contain this noncanonical count. Keep the
         # files readable, but never revive it as a current metric plot.
         "used_codes",
@@ -652,17 +732,86 @@ def render_metric_series(
         if key not in excluded and isinstance(value, (int, float))
     })
     columns = 3
-    rows_count = (len(keys) + columns - 1) // columns
+    panel_count = len(keys) + 3
+    rows_count = (panel_count + columns - 1) // columns
     fig, axes = plt.subplots(rows_count, columns, figsize=(15, 3.5 * rows_count), squeeze=False)
     steps = [row["step"] for row in rows]
-    for ax, key in zip(axes.flat, keys):
+    flat_axes = list(axes.flat)
+
+    spectrum_axis = flat_axes[0]
+    spectrum_steps = [row["step"] for row in spectrum_rows]
+    step_min = min(spectrum_steps)
+    step_max = max(spectrum_steps)
+    if step_min == step_max:
+        step_min -= 0.5
+        step_max += 0.5
+    normalization = matplotlib.colors.Normalize(step_min, step_max)
+    colormap = matplotlib.colormaps["viridis"]
+    for row in spectrum_rows:
+        eigenvalues = np.asarray(row["pca_eigenvalues"])
+        positive = eigenvalues > 0
+        spectrum_axis.plot(
+            np.arange(1, len(eigenvalues) + 1)[positive],
+            eigenvalues[positive],
+            color=colormap(normalization(row["step"])),
+            alpha=.7,
+            linewidth=1,
+        )
+    colorbar = fig.colorbar(
+        matplotlib.cm.ScalarMappable(norm=normalization, cmap=colormap),
+        ax=spectrum_axis,
+        pad=.02,
+    )
+    colorbar.set_label("step")
+    spectrum_axis.set(
+        title="encoder covariance eigenvalue spectrum",
+        xlabel="eigenvalue rank",
+        ylabel="eigenvalue",
+        yscale="log",
+    )
+    spectrum_axis.grid(alpha=.2)
+
+    rank_axis = flat_axes[1]
+    rank_axis.plot(
+        spectrum_steps,
+        [row["participation_ratio"] for row in spectrum_rows],
+        marker=".",
+        linewidth=1.2,
+        label="participation ratio",
+    )
+    rank_axis.plot(
+        spectrum_steps,
+        [row["rankme"] for row in spectrum_rows],
+        marker=".",
+        linewidth=1.2,
+        label="RankMe",
+    )
+    rank_axis.set(title="participation ratio and RankMe", xlabel="step")
+    rank_axis.legend()
+
+    twonn_axis = flat_axes[2]
+    twonn_axis.plot(
+        spectrum_steps,
+        [row["twonn_intrinsic_dim"] for row in spectrum_rows],
+        marker=".",
+        linewidth=1.2,
+    )
+    twonn_axis.set(title="TwoNN intrinsic dimension", xlabel="step")
+
+    for ax in (rank_axis, twonn_axis):
+        if transition_step is not None:
+            ax.axvspan(0, transition_step, color="0.92", alpha=.55, zorder=-10)
+            ax.axvline(transition_step, color="0.35", linestyle=":", linewidth=1)
+        ax.grid(alpha=.2)
+
+    for ax, key in zip(flat_axes[3:], keys):
         ax.plot(steps, [row.get(key, np.nan) for row in rows], marker=".", linewidth=1.2)
         ax.set(title=key, xlabel="step")
         if transition_step is not None:
             ax.axvspan(0, transition_step, color="0.92", alpha=.55, zorder=-10)
             ax.axvline(transition_step, color="0.35", linestyle=":", linewidth=1)
         ax.grid(alpha=.2)
-    for ax in axes.flat[len(keys):]:
+    for ax in flat_axes[panel_count:]:
         ax.axis("off")
     if run_name:
         fig.text(
