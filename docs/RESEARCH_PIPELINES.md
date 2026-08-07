@@ -4,6 +4,95 @@ All primary VQ experiments in this set lock `codebook_size=8192`. Expensive
 commands are intentionally separate: first train/export tokenizers, then build
 immutable token corpora, and only then train the matched nanoGPT models.
 
+## One-command full pipeline
+
+The master config composes all five focused configs into 17 configured jobs,
+bootstraps the BPE tokenizer when it is missing, selects the GQ-VAE Pareto knee,
+exports its learned tokenizer, builds date-scoped corpora, and finally trains
+the three matched nanoGPT models.
+
+Inspect the complete command plan without writing outputs:
+
+```bash
+MPLCONFIGDIR=/tmp/ae-vqvae-mpl UV_CACHE_DIR=/tmp/uv-cache \
+  uv run python -m training.run_research_pipeline \
+  --config configs/full-research-pipeline-k8192-18m-20260807.json \
+  --dry-run
+```
+
+Launch everything sequentially with one command:
+
+```bash
+MPLCONFIGDIR=/tmp/ae-vqvae-mpl UV_CACHE_DIR=/tmp/uv-cache \
+  uv run python -m training.run_research_pipeline \
+  --config configs/full-research-pipeline-k8192-18m-20260807.json
+```
+
+The generated date is part of every run name. To continue a pipeline on a
+later day, rerun it with the original suffix, for example `--run-date
+20260807`. Completed outputs are skipped. An existing incomplete training
+directory stops the pipeline with its exact path because individual trainers
+do not yet implement checkpoint resume.
+
+By default the GQ-VAE choice is the Pareto-frontier point closest to the ideal
+of minimum validation reconstruction loss and maximum validation bytes/token.
+The candidates, frontier, score, and chosen checkpoint are recorded in
+`outputs/research_pipeline/<pipeline>__<date>/gqvae_selection.json`. To pin a
+specific cell instead, pass its exact label, for example:
+
+```bash
+--gqvae-ablation gqvae-k8192-alpha2
+```
+
+The final pipeline state is stored alongside that selection in `state.json`.
+Corpus outputs are date-scoped so a new run cannot silently reuse token streams
+from a different learned checkpoint.
+
+### Automatic visualizations
+
+After all nanoGPT runs finish, the one-command pipeline automatically runs
+`visualization.render_research_pipeline` and writes the following artifacts to
+`outputs/research_pipeline/<pipeline>__<date>/plots/`:
+
+```text
+paper_fig1_gqvae_architecture.png
+paper_fig2_decoder_head.png
+paper_fig3_compression_vocabulary.png
+paper_fig5_language_modeling.png
+paper_fig7_token_frequencies.png
+topk_curriculum.png
+topk_vs_nearest.png
+gqvae_rate_distortion.png
+gqvae_training_dynamics.png
+commitment_beta_sweep.png
+nanogpt_bpb_comparison.png
+tokenizer_compression_stats.png
+results_summary.json
+results_table.csv
+manifest.json
+```
+
+The GQ-VAE paper's Figure 4 is not emitted because this experiment design has
+only one fixed-length VQ baseline, not a fixed-length sweep. Figure 6 is not
+emitted because the locked design has BPE-8192 rather than a second
+compression-matched BPE tokenizer. These omissions and reasons are recorded in
+`manifest.json`; the renderer does not invent unsupported points.
+
+The paper-aligned language-model plot uses validation bits per raw UTF-8 byte
+instead of cross-tokenizer token loss. This preserves the paper's comparison
+question while keeping the vertical axis comparable across different token
+boundaries. Top-k runs additionally log sparse-mixture entropy and
+`effective_k = exp(entropy)` for the curriculum plot.
+
+Completed visualization manifests are skipped when the same pipeline is run
+again. To render an already-completed pipeline manually:
+
+```bash
+MPLCONFIGDIR=/tmp/ae-vqvae-mpl UV_CACHE_DIR=/tmp/uv-cache \
+  uv run python -m visualization.render_research_pipeline \
+  --pipeline-dir outputs/research_pipeline/full-k8192-18m__20260807
+```
+
 ## 1. Fixed VQ and Top-k curriculum
 
 ```bash
@@ -77,4 +166,3 @@ The evaluator scores each document with a sliding token context, sums NLL over
 all content/EOS predictions, and uses the immutable raw-byte count as the
 denominator. Token NLL and perplexity remain diagnostics and must not be used
 to rank different tokenizers.
-

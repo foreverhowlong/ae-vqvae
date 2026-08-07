@@ -320,6 +320,12 @@ def optimizer_step(
         "quantizer_temperature": float(
             outputs.get("quantizer_temperature", 0.0)
         ),
+        "quantizer_mixture_entropy": float(
+            outputs.get("quantizer_mixture_entropy", 0.0)
+        ),
+        "quantizer_effective_k": float(
+            outputs.get("quantizer_effective_k", 1.0)
+        ),
     })
     return metrics
 

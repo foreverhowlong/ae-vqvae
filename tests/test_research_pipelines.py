@@ -38,6 +38,8 @@ def test_topk_quantizer_anneals_8_4_2_1_and_eval_is_hard():
         observed.append(outputs["quantizer_topk"])
     assert observed == [8, 4, 2, 1]
     outputs = quantizer(latents, curriculum_progress=0.0)
+    assert 0.0 < outputs["quantizer_mixture_entropy"] <= math.log(8)
+    assert 1.0 < outputs["quantizer_effective_k"] <= 8.0
     outputs["z_q_st"].square().mean().backward()
     assert latents.grad is not None
     assert torch.count_nonzero(latents.grad) > 0
@@ -45,6 +47,8 @@ def test_topk_quantizer_anneals_8_4_2_1_and_eval_is_hard():
     quantizer.eval()
     hard = quantizer(latents.detach(), curriculum_progress=0.0)
     assert hard["quantizer_topk"] == 1
+    assert hard["quantizer_mixture_entropy"] == 0.0
+    assert hard["quantizer_effective_k"] == 1.0
     expected = quantizer.codebook(hard["indices"])
     torch.testing.assert_close(hard["z_q_raw"], expected)
 
@@ -154,4 +158,3 @@ def test_nanogpt_18m_shape_stays_within_declared_parameter_tolerance():
     model = NanoGPT(NanoGPTConfig(vocab_size=8192))
     error = abs(model.count_parameters() - 18_000_000) / 18_000_000
     assert error < 0.05
-

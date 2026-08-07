@@ -1,0 +1,20 @@
+{
+  "pipeline_version": 1,
+  "name": "full-k8192-18m",
+  "codebook_size": 8192,
+  "configs": {
+    "topk": "configs/topk-curriculum-k8192-20260807.json",
+    "gqvae": "configs/gqvae-compression-curriculum-k8192-20260807.json",
+    "commitment_beta": "configs/commitment-beta-sweep-k8192-20260807.json",
+    "lm_corpus": "configs/lm-corpus-k8192-20260807.json",
+    "nanogpt": "configs/nanogpt-tokenizer-comparison-18m-20260807.json"
+  },
+  "artifacts": {
+    "bpe_tokenizer": "outputs/tokenizers/tinystories_bpe_8k/tokenizer.json"
+  },
+  "vq_reference_ablation": "vq-k8192-nearest-adaptive-full",
+  "vq_tokenizer_device": "auto",
+  "gqvae_selection": {
+    "method": "pareto_knee"
+  }
+}

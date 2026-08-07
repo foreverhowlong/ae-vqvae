@@ -10,6 +10,7 @@ from typing import Iterable
 import numpy as np
 import torch
 
+from common import get_device
 from common.learned_tokenizer import LearnedByteFallbackTokenizer
 from common.text_data import BPETokenizer, iter_hf_texts, iter_texts_from_file
 from common.vq_block_tokenizer import VQBlockTokenizer
@@ -169,10 +170,11 @@ def main() -> None:
     else:
         if args.vq_checkpoint is None or args.vq_config is None:
             raise ValueError("--vq-checkpoint and --vq-config are required for VQ-VAE.")
+        device = get_device() if args.device == "auto" else torch.device(args.device)
         tokenizer = VQBlockTokenizer.load(
             args.vq_checkpoint,
             args.vq_config,
-            torch.device(args.device),
+            device,
         )
 
     train_texts = _texts(

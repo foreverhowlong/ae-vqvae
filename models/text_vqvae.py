@@ -80,6 +80,8 @@ class VectorQuantizer(nn.Module):
 
         active_topk = 1
         active_temperature = 0.0
+        mixture_entropy = 0.0
+        mixture_effective_k = 1.0
         if flat_valid_mask.any():
             distance_flat = flat[flat_valid_mask]
             distance_weights = weights
@@ -112,6 +114,12 @@ class VectorQuantizer(nn.Module):
                         -top_distances / active_temperature,
                         dim=-1,
                     )
+                    entropy = -(
+                        mixture_weights
+                        * mixture_weights.clamp_min(1e-12).log()
+                    ).sum(dim=-1)
+                    mixture_entropy = float(entropy.mean().detach())
+                    mixture_effective_k = float(entropy.exp().mean().detach())
                     selected_codes = self.codebook(mixture_indices)
                     valid_z_q_raw = torch.sum(
                         mixture_weights.unsqueeze(-1) * selected_codes,
@@ -158,6 +166,8 @@ class VectorQuantizer(nn.Module):
             "distances": distances.view(z_e.shape[0], z_e.shape[1], self.codebook_size),
             "quantizer_topk": active_topk,
             "quantizer_temperature": active_temperature,
+            "quantizer_mixture_entropy": mixture_entropy,
+            "quantizer_effective_k": mixture_effective_k,
         }
 
     def _topk_schedule(self, progress: float) -> tuple[int, float]:
