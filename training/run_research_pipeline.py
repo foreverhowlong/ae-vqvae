@@ -78,6 +78,11 @@ def validate_locked_experiments(definition: dict[str, Any]) -> int:
                         f"{stage} experiment {experiment.get('ablation')!r} is not locked "
                         f"to codebook_size={definition['codebook_size']}."
                     )
+                if experiment.get("continuous-truncation", False):
+                    raise ValueError(
+                        f"{stage} experiment {experiment.get('ablation')!r} enables "
+                        "continuous truncation, which is forbidden in this matched pipeline."
+                    )
     return total
 
 
@@ -541,6 +546,12 @@ def main() -> None:
             pipeline_dir,
             dry_run=args.dry_run,
         )
+    except KeyboardInterrupt:
+        if not args.dry_run:
+            state["status"] = "interrupted"
+            state["error"] = "KeyboardInterrupt"
+            atomic_json_dump(state, state_path)
+        raise
     except Exception as error:
         if not args.dry_run:
             state["status"] = "failed"

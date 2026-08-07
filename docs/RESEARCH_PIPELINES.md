@@ -3,6 +3,9 @@
 All primary VQ experiments in this set lock `codebook_size=8192`. Expensive
 commands are intentionally separate: first train/export tokenizers, then build
 immutable token corpora, and only then train the matched nanoGPT models.
+The fixed VQ, Top-k, and commitment-beta cells explicitly disable continuous
+truncation: each source story contributes at most one `max_seq_len=256` sample,
+so longer stories do not silently expand into extra training examples.
 
 ## One-command full pipeline
 
@@ -32,7 +35,10 @@ The generated date is part of every run name. To continue a pipeline on a
 later day, rerun it with the original suffix, for example `--run-date
 20260807`. Completed outputs are skipped. An existing incomplete training
 directory stops the pipeline with its exact path because individual trainers
-do not yet implement checkpoint resume.
+do not yet implement checkpoint resume. If the process is stopped with
+`Ctrl-C`, `state.json` records `status="interrupted"`; it is not a live-process
+indicator, so use `ps` or the tmux pane when checking whether training is still
+running.
 
 By default the GQ-VAE choice is the Pareto-frontier point closest to the ideal
 of minimum validation reconstruction loss and maximum validation bytes/token.

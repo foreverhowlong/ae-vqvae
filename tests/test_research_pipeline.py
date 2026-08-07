@@ -25,6 +25,14 @@ def test_master_pipeline_locks_8192_and_contains_all_17_experiments():
     assert definition["codebook_size"] == 8192
     assert validate_locked_experiments(definition) == 17
 
+    for stage in ("topk", "gqvae", "commitment_beta"):
+        config_path = ROOT / definition["configs"][stage]
+        experiments = json.loads(config_path.read_text(encoding="utf-8"))["experiments"]
+        assert all(
+            experiment.get("continuous-truncation", False) is False
+            for experiment in experiments
+        )
+
 
 def test_pareto_knee_rejects_dominated_point_and_selects_balanced_frontier_point():
     candidates = [
