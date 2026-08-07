@@ -51,7 +51,13 @@ class VectorQuantizer(nn.Module):
             self.register_buffer("ema_cluster_size", torch.zeros(codebook_size))
             self.register_buffer("ema_embed_sum", self.codebook.weight.detach().clone())
 
-    def forward(self, z_e: torch.Tensor, valid_mask: torch.Tensor | None = None):
+    def forward(
+        self,
+        z_e: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        *,
+        curriculum_progress: float | None = None,
+    ):
         flat = z_e.reshape(-1, self.d_model)
         if valid_mask is None:
             valid_mask = torch.ones(z_e.shape[:2], dtype=torch.bool, device=z_e.device)
@@ -72,6 +78,8 @@ class VectorQuantizer(nn.Module):
         flat_z_q_raw = flat.detach().clone()
         distances = flat.new_zeros((flat.shape[0], self.codebook_size))
 
+        active_topk = 1
+        active_temperature = 0.0
         if flat_valid_mask.any():
             distance_flat = flat[flat_valid_mask]
             distance_weights = weights
@@ -84,27 +92,105 @@ class VectorQuantizer(nn.Module):
                 - 2 * distance_flat @ distance_weights.t()
                 + distance_weights.pow(2).sum(dim=1).unsqueeze(0)
             )
-            valid_indices = self._select_codes(valid_distances)
+            mixture_weights = None
+            mixture_indices = None
+            if (
+                self.training
+                and self.collapse_config.quantizer_mode == "topk"
+            ):
+                active_topk, active_temperature = self._topk_schedule(
+                    0.0 if curriculum_progress is None else curriculum_progress
+                )
+                if active_topk > 1:
+                    top_distances, mixture_indices = torch.topk(
+                        valid_distances,
+                        k=active_topk,
+                        dim=-1,
+                        largest=False,
+                    )
+                    mixture_weights = torch.softmax(
+                        -top_distances / active_temperature,
+                        dim=-1,
+                    )
+                    selected_codes = self.codebook(mixture_indices)
+                    valid_z_q_raw = torch.sum(
+                        mixture_weights.unsqueeze(-1) * selected_codes,
+                        dim=1,
+                    )
+                    valid_indices = mixture_indices[:, 0]
+                else:
+                    valid_indices = valid_distances.argmin(dim=-1)
+                    valid_z_q_raw = self.codebook(valid_indices)
+            else:
+                valid_indices = self._select_codes(valid_distances)
+                valid_z_q_raw = self.codebook(valid_indices)
             flat_indices[flat_valid_mask] = valid_indices
-            flat_z_q_raw[flat_valid_mask] = self.codebook(valid_indices)
+            flat_z_q_raw[flat_valid_mask] = valid_z_q_raw
             distances[flat_valid_mask] = valid_distances
 
             if self.training and self.collapse_config.use_ema_codebook:
-                self._ema_update(
-                    flat[flat_valid_mask].detach(),
-                    valid_indices.detach(),
-                )
+                if mixture_weights is not None and mixture_indices is not None:
+                    self._ema_update_weighted(
+                        flat[flat_valid_mask].detach(),
+                        mixture_indices.detach(),
+                        mixture_weights.detach(),
+                    )
+                else:
+                    self._ema_update(
+                        flat[flat_valid_mask].detach(),
+                        valid_indices.detach(),
+                    )
 
         z_q_raw = flat_z_q_raw.view_as(z_e)
 
-        z_q_st = z_e + (z_q_raw - z_e).detach()
+        # While K > 1, decoder gradients train the mixture coefficients as in a
+        # top-k sparse autoencoder. Once K reaches one, restore the standard
+        # straight-through estimator used by hard VQ.
+        if self.training and active_topk > 1:
+            z_q_st = z_q_raw
+        else:
+            z_q_st = z_e + (z_q_raw - z_e).detach()
         indices = flat_indices.view(z_e.shape[0], z_e.shape[1])
         return {
             "z_q_raw": z_q_raw,
             "z_q_st": z_q_st,
             "indices": indices,
             "distances": distances.view(z_e.shape[0], z_e.shape[1], self.codebook_size),
+            "quantizer_topk": active_topk,
+            "quantizer_temperature": active_temperature,
         }
+
+    def _topk_schedule(self, progress: float) -> tuple[int, float]:
+        if not 0.0 <= progress <= 1.0:
+            raise ValueError(
+                f"curriculum_progress must be in [0, 1], got {progress}."
+            )
+        hard_start = 1.0 - self.collapse_config.topk_hard_fraction
+        if progress >= hard_start:
+            return 1, self.collapse_config.topk_temperature_end
+
+        k_values = []
+        current = min(self.collapse_config.topk_start, self.codebook_size)
+        while current > 1:
+            k_values.append(current)
+            current = max(1, current // 2)
+        if not k_values:
+            return 1, self.collapse_config.topk_temperature_end
+
+        soft_progress = progress / hard_start
+        stage = min(int(soft_progress * len(k_values)), len(k_values) - 1)
+        temperature = (
+            self.collapse_config.topk_temperature_start
+            + soft_progress
+            * (
+                self.collapse_config.topk_temperature_end
+                - self.collapse_config.topk_temperature_start
+            )
+        )
+        return k_values[stage], max(
+            temperature,
+            self.collapse_config.topk_temperature_end,
+        )
 
     def _select_codes(self, distances: torch.Tensor):
         if self.training and self.collapse_config.stochastic_code_sampling:
@@ -130,6 +216,38 @@ class VectorQuantizer(nn.Module):
         one_hot = F.one_hot(indices, num_classes=self.codebook_size).type_as(flat)
         cluster_size = one_hot.sum(dim=0)
         embed_sum = one_hot.t() @ flat
+
+        decay = self.collapse_config.ema_decay
+        self.ema_cluster_size.mul_(decay).add_(cluster_size, alpha=1 - decay)
+        self.ema_embed_sum.mul_(decay).add_(embed_sum, alpha=1 - decay)
+
+        n = self.ema_cluster_size.sum()
+        smoothed_cluster_size = (
+            (self.ema_cluster_size + self.collapse_config.ema_eps)
+            / (n + self.codebook_size * self.collapse_config.ema_eps)
+            * n.clamp_min(1.0)
+        )
+        normalized_embed = self.ema_embed_sum / smoothed_cluster_size.unsqueeze(1).clamp_min(1e-12)
+        if self.collapse_config.normalize_latents:
+            normalized_embed = F.normalize(normalized_embed, dim=-1)
+        self.codebook.weight.data.copy_(normalized_embed)
+
+    @torch.no_grad()
+    def _ema_update_weighted(
+        self,
+        flat: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> None:
+        cluster_size = flat.new_zeros(self.codebook_size)
+        cluster_size.scatter_add_(0, indices.reshape(-1), weights.reshape(-1))
+        embed_sum = flat.new_zeros(self.codebook_size, self.d_model)
+        weighted_vectors = weights.unsqueeze(-1) * flat.unsqueeze(1)
+        embed_sum.index_add_(
+            0,
+            indices.reshape(-1),
+            weighted_vectors.reshape(-1, self.d_model),
+        )
 
         decay = self.collapse_config.ema_decay
         self.ema_cluster_size.mul_(decay).add_(cluster_size, alpha=1 - decay)
@@ -338,6 +456,7 @@ class TextVQVAE(nn.Module):
         attention_mask: torch.Tensor | None = None,
         *,
         use_quantizer: bool | None = None,
+        quantizer_progress: float | None = None,
     ):
         if attention_mask is None:
             resolved_attention_mask = input_ids != self.config.pad_token_id
@@ -376,7 +495,11 @@ class TextVQVAE(nn.Module):
             }
 
         assert self.quantizer is not None
-        quantized = self.quantizer(z_e, valid_mask=latent_mask)
+        quantized = self.quantizer(
+            z_e,
+            valid_mask=latent_mask,
+            curriculum_progress=quantizer_progress,
+        )
         z_q_raw = quantized["z_q_raw"]
         z_q_st = quantized["z_q_st"]
         indices = quantized["indices"]
@@ -396,6 +519,8 @@ class TextVQVAE(nn.Module):
             "z_q_st": z_q_st,
             "indices": indices,
             "distances": quantized["distances"],
+            "quantizer_topk": quantized["quantizer_topk"],
+            "quantizer_temperature": quantized["quantizer_temperature"],
             "latent_mask": latent_mask,
             "lengths": lengths,
         }

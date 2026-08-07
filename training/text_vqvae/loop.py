@@ -235,11 +235,13 @@ def optimizer_step(
     step: int,
     *,
     use_quantizer: bool | None = None,
+    quantizer_progress: float | None = None,
 ):
     outputs = model(
         batch["input_ids"],
         batch["attention_mask"],
         use_quantizer=use_quantizer,
+        quantizer_progress=quantizer_progress,
     )
     is_vq = outputs.get("quantizer_active", False)
     codebook_weight = (
@@ -314,6 +316,10 @@ def optimizer_step(
             total,
         ),
         "dead_code_resets": reset_count,
+        "quantizer_topk": int(outputs.get("quantizer_topk", 1)),
+        "quantizer_temperature": float(
+            outputs.get("quantizer_temperature", 0.0)
+        ),
     })
     return metrics
 
@@ -606,6 +612,14 @@ def run(
     import shutil
 
     initialization_started = time.time()
+    # Some strict-initialization tests deliberately fail before a loader is
+    # needed. Preserve that failure boundary while normal runs always provide
+    # a concrete training loader.
+    planned_total_steps = (
+        train_cfg.epochs * len(train_loader)
+        if train_loader is not None
+        else 0
+    )
     adaptive_warmup = train_cfg.ae_warmup_mode == "adaptive"
     warmup_enabled = (
         adaptive_warmup or train_cfg.ae_warmup_steps > 0
@@ -627,11 +641,10 @@ def run(
             raise ValueError("AE warmup requires K-means codebook initialization.")
         if codebook_init_loader is None:
             raise ValueError("AE warmup requires a dedicated K-means initialization loader.")
-        total_steps = train_cfg.epochs * len(train_loader)
-        if warmup_limit is None or warmup_limit >= total_steps:
+        if warmup_limit is None or warmup_limit >= planned_total_steps:
             raise ValueError(
                 "AE warmup must leave at least one VQ optimizer step, got "
-                f"warmup_limit={warmup_limit} and total_steps={total_steps}."
+                f"warmup_limit={warmup_limit} and total_steps={planned_total_steps}."
             )
     else:
         try:
@@ -947,10 +960,20 @@ def run(
                     if quantizer_active
                     else model_config.commitment_beta
                 )
+                total_vq_steps = max(
+                    1,
+                    planned_total_steps - (transition_step or 0),
+                )
+                quantizer_progress = (
+                    min(max((vq_step - 1) / max(total_vq_steps - 1, 1), 0.0), 1.0)
+                    if quantizer_active
+                    else None
+                )
                 train_metrics = optimizer_step(
                     model, optimizer, batch, model_config, collapse_config,
                     train_cfg.grad_clip, beta, vq_step or global_step,
                     use_quantizer=quantizer_active,
+                    quantizer_progress=quantizer_progress,
                 )
                 append_jsonl(
                     {"split": "train", "epoch": epoch, "step": global_step,

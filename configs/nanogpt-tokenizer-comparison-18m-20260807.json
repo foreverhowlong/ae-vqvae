@@ -1,0 +1,38 @@
+{
+  "module": "training.run_nanogpt_experiment",
+  "experiments": [
+    {
+      "ablation": "nanogpt18m-bpe8k",
+      "data-dir": "outputs/lm_corpora/bpe8k",
+      "seed": 42,
+      "epochs": 1,
+      "n-layer": 8,
+      "n-head": 6,
+      "n-embd": 384,
+      "block-size": 256,
+      "dropout": 0.0
+    },
+    {
+      "ablation": "nanogpt18m-gqvae-k8192",
+      "data-dir": "outputs/lm_corpora/gqvae-k8192",
+      "seed": 42,
+      "epochs": 1,
+      "n-layer": 8,
+      "n-head": 6,
+      "n-embd": 384,
+      "block-size": 256,
+      "dropout": 0.0
+    },
+    {
+      "ablation": "nanogpt18m-vqvae-k8192-lossless",
+      "data-dir": "outputs/lm_corpora/vqvae-k8192",
+      "seed": 42,
+      "epochs": 1,
+      "n-layer": 8,
+      "n-head": 6,
+      "n-embd": 384,
+      "block-size": 256,
+      "dropout": 0.0
+    }
+  ]
+}

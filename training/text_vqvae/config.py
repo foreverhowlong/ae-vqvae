@@ -41,6 +41,7 @@ from common.text_vqvae_config import (
     EncoderType,
     GeometryRenderBasis,
     PCAFitMode,
+    QuantizerMode,
     TextVQVAEConfig,
     TokenizerType,
     TrainConfig,
@@ -93,6 +94,7 @@ def _annotate_effective_defaults(parser) -> None:
         "skip_initial_pca": not diagnostics.initial_pca_enabled,
         "strict_initial_pca": diagnostics.initial_pca_strict,
         "print_config": False,
+        "full_train_data": False,
     })
     for action in parser._actions:
         if action.dest in defaults:
@@ -180,6 +182,12 @@ def add_arguments(parser) -> None:
     )
     g.add_argument("--streaming", action="store_true", default=None)
     g.add_argument("--max-train-samples", type=int, default=None)
+    g.add_argument(
+        "--full-train-data",
+        action="store_true",
+        default=None,
+        help="Use the complete training split instead of the configured sample cap.",
+    )
     g.add_argument("--max-eval-samples", type=int, default=None)
     g.add_argument("--val-fraction", type=float, default=None)
     g.add_argument(
@@ -264,6 +272,16 @@ def add_arguments(parser) -> None:
     g.add_argument("--no-stochastic-code-sampling", dest="stochastic_code_sampling", action="store_false")
     g.add_argument("--sampling-temperature", type=float, default=None)
     g.add_argument("--sampling-topk", type=int, default=None)
+    g.add_argument(
+        "--quantizer-mode",
+        choices=get_args(QuantizerMode),
+        default=None,
+        help="Nearest-code VQ or an SAE-inspired top-k mixture curriculum.",
+    )
+    g.add_argument("--topk-start", type=int, default=None)
+    g.add_argument("--topk-hard-fraction", type=float, default=None)
+    g.add_argument("--topk-temperature-start", type=float, default=None)
+    g.add_argument("--topk-temperature-end", type=float, default=None)
     g.add_argument("--dead-code-reset-every", type=int, default=None)
     g.add_argument("--dead-code-reset-usage-threshold", type=float, default=None)
     g.add_argument("--normalize-latents", dest="normalize_latents", action="store_true", default=None)
@@ -290,16 +308,34 @@ def add_arguments(parser) -> None:
         help="Fail the run instead of warning if the initialisation PCA diagnostic fails.",
     )
     g.add_argument(
-        "--geometry-snapshot-enabled", type=_parse_bool, default=None,
+        "--geometry-snapshot-enabled",
+        nargs="?",
+        const=True,
+        type=_parse_bool,
+        default=None,
         help="Enable periodic raw geometry snapshots (true/false).",
+    )
+    g.add_argument(
+        "--no-geometry-snapshot-enabled",
+        dest="geometry_snapshot_enabled",
+        action="store_false",
     )
     g.add_argument("--geometry-dense-every", type=int, default=None)
     g.add_argument("--geometry-dense-until", type=int, default=None)
     g.add_argument("--geometry-sparse-every", type=int, default=None)
     g.add_argument("--geometry-probe-points", type=int, default=None)
     g.add_argument(
-        "--geometry-render-enabled", type=_parse_bool, default=None,
+        "--geometry-render-enabled",
+        nargs="?",
+        const=True,
+        type=_parse_bool,
+        default=None,
         help="Render geometry plots and animation when training completes (true/false).",
+    )
+    g.add_argument(
+        "--no-geometry-render-enabled",
+        dest="geometry_render_enabled",
+        action="store_false",
     )
     g.add_argument(
         "--geometry-render-basis", choices=get_args(GeometryRenderBasis), default=None,
@@ -457,12 +493,37 @@ def build_collapse_config(args) -> CollapseControlConfig:
         "stochastic_code_sampling": getattr(args, "stochastic_code_sampling", None),
         "sampling_temperature": getattr(args, "sampling_temperature", None),
         "sampling_topk": getattr(args, "sampling_topk", None),
+        "quantizer_mode": getattr(args, "quantizer_mode", None),
+        "topk_start": getattr(args, "topk_start", None),
+        "topk_hard_fraction": getattr(args, "topk_hard_fraction", None),
+        "topk_temperature_start": getattr(args, "topk_temperature_start", None),
+        "topk_temperature_end": getattr(args, "topk_temperature_end", None),
         "dead_code_reset_every": getattr(args, "dead_code_reset_every", None),
         "dead_code_reset_usage_threshold": getattr(args, "dead_code_reset_usage_threshold", None),
         "normalize_latents": getattr(args, "normalize_latents", None),
         "commitment_beta_start": getattr(args, "commitment_beta_start", None),
         "commitment_beta_warmup_steps": getattr(args, "commitment_beta_warmup_steps", None),
     })
+
+    if config.topk_start < 1:
+        raise ValueError("--topk-start must be positive.")
+    if not 0.0 < config.topk_hard_fraction < 1.0:
+        raise ValueError("--topk-hard-fraction must be between 0 and 1.")
+    if config.topk_temperature_start <= 0 or config.topk_temperature_end <= 0:
+        raise ValueError("Top-k temperatures must be positive.")
+    if config.topk_temperature_end > config.topk_temperature_start:
+        raise ValueError(
+            "--topk-temperature-end must not exceed --topk-temperature-start."
+        )
+    if config.quantizer_mode == "topk" and config.stochastic_code_sampling:
+        raise ValueError(
+            "--quantizer-mode topk cannot be combined with "
+            "--stochastic-code-sampling."
+        )
+    if config.quantizer_mode == "topk" and config.code_dropout > 0:
+        raise ValueError(
+            "--quantizer-mode topk cannot be combined with --code-dropout."
+        )
 
     return config
 
@@ -490,6 +551,12 @@ def build_configs(args, tokenizer, train_cfg: TrainConfig | None = None):
             "cache_dir": getattr(args, "cache_dir", None),
             "streaming": True if getattr(args, "streaming", None) else None,
         })
+    if getattr(args, "full_train_data", None):
+        if getattr(args, "max_train_samples", None) is not None:
+            raise ValueError(
+                "--full-train-data cannot be combined with --max-train-samples."
+            )
+        data_cfg.max_train_samples = None
     _override(data_cfg, {
         "text_field": getattr(args, "text_field", None),
         "max_train_samples": getattr(args, "max_train_samples", None),

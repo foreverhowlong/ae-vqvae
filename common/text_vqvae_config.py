@@ -24,6 +24,7 @@ DataSource = Literal["huggingface", "file"]
 PCAFitMode = Literal["balanced", "all"]
 GeometryRenderBasis = Literal["t0", "first_last", "pooled"]
 CollapsePreset = Literal["none", "anti"]
+QuantizerMode = Literal["nearest", "topk"]
 
 
 @dataclass
@@ -117,6 +118,13 @@ class CollapseControlConfig:
     stochastic_code_sampling: bool = False
     sampling_temperature: float = 0.5
     sampling_topk: int = 8
+    # Opt-in SAE-inspired curriculum: decode a convex combination of the
+    # nearest K codes, halve K in three stages, then finish with hard top-1.
+    quantizer_mode: QuantizerMode = "nearest"
+    topk_start: int = 8
+    topk_hard_fraction: float = 0.4
+    topk_temperature_start: float = 1.0
+    topk_temperature_end: float = 0.1
     dead_code_reset_every: int = 0
     dead_code_reset_usage_threshold: float = 1.0
     normalize_latents: bool = False
@@ -132,6 +140,7 @@ class CollapseControlConfig:
             self.diversity_weight > 0,
             self.code_dropout > 0,
             self.stochastic_code_sampling,
+            self.quantizer_mode != "nearest",
             self.dead_code_reset_every > 0,
             self.normalize_latents,
             self.commitment_beta_start is not None,
