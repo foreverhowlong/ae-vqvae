@@ -214,7 +214,7 @@ def render_pca_comparison(
         )
         if result.encoder_pad_ratios is not None:
             colorbar = fig.colorbar(encoder_scatter, ax=ax, pad=0.02)
-            colorbar.set_label("PAD ratio within slot")
+            colorbar.set_label("PAD-token fraction within latent slot [0, 1]")
         ax.scatter(
             codebook_2d[:, 0],
             codebook_2d[:, 1],
@@ -247,8 +247,12 @@ def render_pca_comparison(
             zorder=4,
         )
         explained = result.explained_variance_ratio
-        ax.set_xlabel(f"PC1 ({explained[0]:.1%} explained variance)")
-        ax.set_ylabel(f"PC2 ({explained[1]:.1%} explained variance)")
+        ax.set_xlabel(
+            f"PC1 score (arbitrary latent units; {explained[0]:.1%} explained variance)"
+        )
+        ax.set_ylabel(
+            f"PC2 score (arbitrary latent units; {explained[1]:.1%} explained variance)"
+        )
         ax.set_title(title)
         ax.grid(True, alpha=0.2)
         ax.legend(frameon=True)

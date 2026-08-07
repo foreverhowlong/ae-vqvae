@@ -154,23 +154,36 @@ def plot_training_curves(
             )
     if eval_rows:
         axes[0, 0].plot([r["step"] for r in eval_rows], [r["loss"] for r in eval_rows], label="eval")
-    axes[0, 0].set_title("Training objective by phase")
+    axes[0, 0].set(
+        title="Training objective by phase",
+        xlabel="Optimizer step (parameter updates)",
+        ylabel="Mean total loss (composite objective units)",
+    )
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
 
     if eval_rows:
         axes[0, 1].plot([r["step"] for r in eval_rows], [r["token_ppl"] for r in eval_rows])
-    axes[0, 1].set_title("Eval token perplexity")
+    axes[0, 1].set(
+        title="Eval reconstruction token perplexity",
+        xlabel="Optimizer step (parameter updates)",
+        ylabel="Perplexity (dimensionless)",
+    )
     axes[0, 1].grid(True, alpha=0.3)
 
     if train_rows:
         axes[1, 0].plot([r["step"] for r in train_rows], [r["token_accuracy"] for r in train_rows], label="train")
     if eval_rows:
         axes[1, 0].plot([r["step"] for r in eval_rows], [r["token_accuracy"] for r in eval_rows], label="eval")
-    axes[1, 0].set_title("Token accuracy")
+    axes[1, 0].set(
+        title="Reconstruction token accuracy",
+        xlabel="Optimizer step (parameter updates)",
+        ylabel="Correct-token fraction [0, 1]",
+    )
     axes[1, 0].legend()
     axes[1, 0].grid(True, alpha=0.3)
 
+    latent_rows = []
     if probe_rows:
         axes[1, 1].plot(
             [r["step"] for r in probe_rows],
@@ -234,10 +247,10 @@ def plot_training_curves(
             label="eval full-set, frozen K-means C0",
         )
         utilization_title = (
-            "Codebook utilization: current codebook vs frozen K-means C0"
+            "Codebook utilization: current vs frozen K-means C0"
         )
     elif has_codebook_curves:
-        utilization_title = "Codebook utilization: current codebook"
+        utilization_title = "Codebook utilization (current codebook)"
     else:
         latent_rows = [
             r for r in geometry_rows if "encoder_mean_norm" in r
@@ -256,9 +269,17 @@ def plot_training_curves(
             utilization_title = "Continuous bottleneck: latent norm dynamics"
         else:
             utilization_title = "Codebook metrics not applicable (continuous bottleneck)"
-    if transition_step is not None and has_codebook_curves:
-        utilization_title += f" (VQ phase after step {transition_step})"
-    axes[1, 1].set_title(utilization_title)
+    axes[1, 1].set(
+        title=utilization_title,
+        xlabel="Optimizer step (parameter updates)",
+        ylabel=(
+            "Used-code fraction [0, 1]"
+            if has_codebook_curves
+            else "Encoder latent L2 norm (arbitrary latent units)"
+            if latent_rows
+            else "Not applicable"
+        ),
+    )
     if axes[1, 1].lines:
         axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
@@ -309,27 +330,32 @@ def plot_training_curves(
         threshold = warmup_rows[0]["variance_threshold"]
         axes[0].set(
             title=f"AE warmup dimensionality (PCA threshold {threshold:.0%})",
-            xlabel="optimizer step",
-            ylabel="dimensions",
+            xlabel="Optimizer step (parameter updates)",
+            ylabel="Effective latent dimensions (count)",
         )
         axes[0].legend()
-        axes[1].plot(
+        water_axis = axes[1]
+        rank_axis = water_axis.twinx()
+        water_axis.plot(
             steps,
             [row["water_filling_level"] for row in warmup_rows],
             marker=".",
+            color="#4C78A8",
             label="water level",
         )
-        axes[1].plot(
+        rank_axis.plot(
             steps,
             [row["participation_ratio"] for row in warmup_rows],
             marker=".",
+            color="#F58518",
             label="participation ratio",
         )
-        axes[1].set(
+        water_axis.set(
             title="Target-rate water level and latent participation ratio",
-            xlabel="optimizer step",
+            xlabel="Optimizer step (parameter updates)",
+            ylabel="Water-filling level (arbitrary latent units²)",
         )
-        axes[1].legend()
+        rank_axis.set_ylabel("Participation ratio (effective dimensions)")
         for axis in axes:
             if transition_step is not None:
                 axis.axvline(
@@ -341,6 +367,12 @@ def plot_training_curves(
                 )
             axis.grid(alpha=0.2)
             axis.legend()
+        warmup_lines = water_axis.lines + rank_axis.lines
+        water_axis.legend(
+            warmup_lines,
+            [line.get_label() for line in warmup_lines],
+            loc="best",
+        )
         _add_run_label(fig, run_name)
         fig.tight_layout(rect=(0, 0, 1, 0.985))
         fig.savefig(plot_dir / "ae_warmup_diagnostics.png", dpi=160)
@@ -358,17 +390,17 @@ def plot_codebook_usage(
     nonzero = counts_tensor[counts_tensor > 0].numpy()
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    axes[0].plot(sorted_counts)
+    axes[0].plot(range(1, len(sorted_counts) + 1), sorted_counts)
     axes[0].set_title("Code usage counts, sorted")
-    axes[0].set_xlabel("Code rank")
-    axes[0].set_ylabel("Count")
+    axes[0].set_xlabel("Code rank by assignments (1 = most used)")
+    axes[0].set_ylabel("Validation assignments (count)")
     axes[0].grid(True, alpha=0.3)
 
     if len(nonzero) > 0:
         axes[1].hist(nonzero, bins=50)
     axes[1].set_title("Nonzero code count histogram")
-    axes[1].set_xlabel("Count")
-    axes[1].set_ylabel("Codes")
+    axes[1].set_xlabel("Assignments per active code (count)")
+    axes[1].set_ylabel("Active codes per histogram bin (count)")
     axes[1].grid(True, alpha=0.3)
 
     _add_run_label(fig, run_name)

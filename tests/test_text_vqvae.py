@@ -9,6 +9,7 @@ from unittest.mock import patch
 import warnings
 
 import numpy as np
+from sklearn.decomposition import PCA
 import torch
 import torch.nn as nn
 
@@ -53,7 +54,7 @@ from training.text_vqvae.warmup import (
     latent_spectrum_metrics,
     reverse_water_filling,
 )
-from training.text_vqvae.reporting import plot_training_curves
+from training.text_vqvae.reporting import plot_codebook_usage, plot_training_curves
 from training.text_vqvae.geometry import dump_geometry_snapshot, finalize_geometry_artifacts
 from visualization.text_vqvae import (
     collect_encoder_vectors,
@@ -63,6 +64,8 @@ from visualization.text_vqvae import (
 )
 from visualization.render_geometry_animation import (
     _encoder_spectrum_metrics,
+    _geometry_metric_panel_labels,
+    _pca_component_label,
     _snapshot_encoder_view,
     compute_animation_scales,
     fit_shared_pca,
@@ -439,6 +442,8 @@ class EvaluationPipelineTest(unittest.TestCase):
 
             with (
                 patch("matplotlib.figure.Figure.text") as figure_text,
+                patch("matplotlib.axes.Axes.set_xlabel") as set_xlabel,
+                patch("matplotlib.axes.Axes.set_ylabel") as set_ylabel,
                 patch("matplotlib.axes.Axes.set_title") as set_title,
             ):
                 plot_training_curves(
@@ -453,8 +458,45 @@ class EvaluationPipelineTest(unittest.TestCase):
                 "run: compact-run-name",
             )
             self.assertIn(
-                "Codebook utilization: current codebook vs frozen K-means C0",
+                "Codebook utilization: current vs frozen K-means C0",
                 [call.args[0] for call in set_title.call_args_list],
+            )
+            self.assertEqual(
+                {
+                    "Optimizer step (parameter updates)",
+                },
+                {call.args[0] for call in set_xlabel.call_args_list},
+            )
+            self.assertTrue({
+                "Mean total loss (composite objective units)",
+                "Perplexity (dimensionless)",
+                "Correct-token fraction [0, 1]",
+                "Used-code fraction [0, 1]",
+            }.issubset({call.args[0] for call in set_ylabel.call_args_list}))
+
+    def test_codebook_usage_panels_label_counts_and_rank_semantics(self):
+        with TemporaryDirectory() as temp_dir:
+            plot_dir = Path(temp_dir)
+            with (
+                patch("matplotlib.axes.Axes.set_xlabel") as set_xlabel,
+                patch("matplotlib.axes.Axes.set_ylabel") as set_ylabel,
+            ):
+                plot_codebook_usage([4, 2, 0], plot_dir)
+
+            self.assertTrue((plot_dir / "codebook_usage.png").is_file())
+            self.assertEqual(
+                {
+                    "Code rank by assignments (1 = most used)",
+                    "Assignments per active code (count)",
+                },
+                {call.args[0] for call in set_xlabel.call_args_list},
+            )
+            self.assertEqual(
+                {
+                    "Validation assignments (count)",
+                    "Active codes per histogram bin (count)",
+                },
+                {call.args[0] for call in set_ylabel.call_args_list},
             )
 
     def test_persistent_workers_are_opt_in_and_require_workers(self):
@@ -683,6 +725,30 @@ class GeometrySnapshotTest(unittest.TestCase):
 
 
 class GeometryAnimationTest(unittest.TestCase):
+    def test_geometry_metric_panels_define_meaning_and_units(self):
+        current_metrics = {
+            "valid_probe_points",
+            "encoder_mean_norm",
+            "encoder_norm_std",
+            "encoder_pairwise_mean_distance",
+            "nearest_code_distance_p10",
+            "nearest_code_distance_p50",
+            "nearest_code_distance_p90",
+            "win_count_gini",
+            "centroid_distance",
+        }
+
+        for key in current_metrics:
+            title, ylabel = _geometry_metric_panel_labels(key)
+            self.assertNotEqual(title, key)
+            self.assertNotIn("source-defined", ylabel)
+
+        pca = PCA(n_components=2).fit(
+            np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        )
+        self.assertIn("arbitrary latent units", _pca_component_label(pca, 0))
+        self.assertIn("variance", _pca_component_label(pca, 1))
+
     def test_encoder_spectrum_metrics_include_rankme_and_twonn(self):
         equal_spectrum = np.concatenate([np.eye(4), -np.eye(4)], axis=0)
 

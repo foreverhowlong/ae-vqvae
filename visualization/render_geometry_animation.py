@@ -48,6 +48,62 @@ class SnapshotEncoderView:
     nearest_distances: np.ndarray | None
 
 
+_GEOMETRY_METRIC_PANELS = {
+    "valid_probe_points": (
+        "Valid latent points in fixed geometry probe",
+        "Valid latent vectors (count)",
+    ),
+    "encoder_mean_norm": (
+        "Mean encoder latent norm",
+        "Mean vector L2 norm (arbitrary latent units)",
+    ),
+    "encoder_norm_std": (
+        "Encoder latent norm spread",
+        "L2-norm standard deviation (arbitrary latent units)",
+    ),
+    "encoder_pairwise_mean_distance": (
+        "Mean pairwise encoder distance",
+        "Mean pairwise L2 distance (arbitrary latent units)",
+    ),
+    "nearest_code_distance_p10": (
+        "Encoder-to-assigned-code distance (10th percentile)",
+        "Quantizer-space L2 distance (arbitrary latent units)",
+    ),
+    "nearest_code_distance_p50": (
+        "Encoder-to-assigned-code distance (median)",
+        "Quantizer-space L2 distance (arbitrary latent units)",
+    ),
+    "nearest_code_distance_p90": (
+        "Encoder-to-assigned-code distance (90th percentile)",
+        "Quantizer-space L2 distance (arbitrary latent units)",
+    ),
+    "win_count_gini": (
+        "Code-assignment inequality on fixed probe",
+        "Gini coefficient [0 = equal, 1 = concentrated]",
+    ),
+    "centroid_distance": (
+        "Encoder-to-codebook centroid distance",
+        "Centroid L2 distance (arbitrary latent units)",
+    ),
+}
+
+
+def _pca_component_label(pca: PCA, component: int) -> str:
+    explained = pca.explained_variance_ratio_[component]
+    return (
+        f"PC{component + 1} score "
+        f"(arbitrary latent units; {explained:.1%} explained variance)"
+    )
+
+
+def _geometry_metric_panel_labels(key: str) -> tuple[str, str]:
+    """Return a human-readable title and y-axis unit for a geometry metric."""
+    return _GEOMETRY_METRIC_PANELS.get(
+        key,
+        (key.replace("_", " ").capitalize(), "Metric value (source-defined units)"),
+    )
+
+
 def _encoder_spectrum_metrics(
     encoder: np.ndarray,
     *,
@@ -269,19 +325,20 @@ def render_frame(
     ax.scatter(
         codebook_2d[~alive, 0], codebook_2d[~alive, 1],
         color="#3F3F3F", marker="x", s=22, alpha=.72, linewidths=.8,
-        rasterized=True, label="dead code", zorder=3,
+        rasterized=True, label="0 assignments on fixed probe", zorder=3,
     )
     ax.scatter(
         codebook_2d[alive, 0], codebook_2d[alive, 1],
         color="#E45756", marker="*", s=72, alpha=.98, linewidths=.55,
-        edgecolors="#5B1717", rasterized=True, label="winning code", zorder=5,
+        edgecolors="#5B1717", rasterized=True,
+        label="≥1 assignment on fixed probe", zorder=5,
     )
     ax.set(
         xlim=scales.pca_xlim,
         ylim=scales.pca_ylim,
         title="Shared-basis PCA: encoder outputs and codebook state",
-        xlabel="PC1",
-        ylabel="PC2",
+        xlabel=_pca_component_label(pca, 0),
+        ylabel=_pca_component_label(pca, 1),
     )
     ax.legend(loc="upper right", fontsize=8)
 
@@ -293,25 +350,30 @@ def render_frame(
         np.linalg.norm(codebook, axis=1), bins=scales.norm_bins,
         color="#F58518", alpha=.58, density=True, label="codebook",
     )
-    axes[0, 1].set(xlim=(scales.norm_bins[0], scales.norm_bins[-1]), ylim=scales.norm_ylim)
-    axes[0, 1].set_title("Vector norms")
+    axes[0, 1].set(
+        xlim=(scales.norm_bins[0], scales.norm_bins[-1]),
+        ylim=scales.norm_ylim,
+        title="Encoder and codebook vector-norm distributions",
+        xlabel="Vector L2 norm (arbitrary latent units)",
+        ylabel="Probability density (per arbitrary latent unit)",
+    )
     axes[0, 1].legend(loc="upper right")
     axes[1, 0].hist(nearest, bins=scales.nearest_bins, color="#4C78A8", alpha=.8)
     axes[1, 0].set(
         xlim=(scales.nearest_bins[0], scales.nearest_bins[-1]),
         ylim=scales.nearest_ylim,
         title="Distance to assigned nearest code",
-        xlabel="L2 distance",
-        ylabel="points",
+        xlabel="Quantizer-space L2 distance (arbitrary latent units)",
+        ylabel="Valid probe points per bin (count)",
     )
     ranked = np.sort(wins)[::-1]
     axes[1, 1].plot(np.arange(1, len(ranked) + 1), ranked, color="#E45756")
     axes[1, 1].set(
         xlim=scales.rank_xlim,
         ylim=scales.rank_ylim,
-        title="Win-count rank curve",
-        xlabel="code rank",
-        ylabel="probe wins",
+        title="Fixed-probe code-assignment rank curve",
+        xlabel="Code rank by probe assignments (1 = most used)",
+        ylabel="Fixed-probe assignments per code (count)",
         yscale="symlog",
         xscale="log",
     )
@@ -371,10 +433,14 @@ def _render_continuous_frame(
         xlim=scales.pca_xlim,
         ylim=scales.pca_ylim,
         title="Shared-basis PCA of continuous encoder latents",
-        xlabel="PC1",
-        ylabel="PC2",
+        xlabel=_pca_component_label(pca, 0),
+        ylabel=_pca_component_label(pca, 1),
     )
-    fig.colorbar(scatter, ax=axes[0, 0], label="latent slot")
+    fig.colorbar(
+        scatter,
+        ax=axes[0, 0],
+        label="Latent slot index (0-based)",
+    )
 
     axes[0, 1].hist(
         norms,
@@ -387,15 +453,15 @@ def _render_continuous_frame(
         xlim=(scales.norm_bins[0], scales.norm_bins[-1]),
         ylim=scales.norm_ylim,
         title="Continuous latent vector norms",
-        xlabel="L2 norm",
-        ylabel="density",
+        xlabel="Vector L2 norm (arbitrary latent units)",
+        ylabel="Probability density (per arbitrary latent unit)",
     )
 
     axes[1, 0].plot(unique_slots, slot_mean_norms, marker=".", color="#F58518")
     axes[1, 0].set(
         title="Mean latent norm by slot",
-        xlabel="latent slot",
-        ylabel="mean L2 norm",
+        xlabel="Latent slot index (0-based)",
+        ylabel="Mean vector L2 norm (arbitrary latent units)",
     )
 
     axes[1, 1].scatter(
@@ -409,8 +475,8 @@ def _render_continuous_frame(
     )
     axes[1, 1].set(
         title="Padding exposure versus latent norm",
-        xlabel="PAD ratio in receptive segment",
-        ylabel="L2 norm",
+        xlabel="PAD-token fraction in slot receptive segment [0, 1]",
+        ylabel="Vector L2 norm (arbitrary latent units)",
     )
     for axis in axes.flat:
         axis.grid(alpha=.2)
@@ -556,7 +622,14 @@ def render_code_trajectories(
                 alpha=.9 if is_top else .45, linewidth=1.6 if is_top else 1.0)
         ax.scatter(tracks[-1, column, 0], tracks[-1, column, 1], s=20, color=color)
         ax.annotate(str(code_id), tracks[-1, column], fontsize=7, color=color)
-    ax.set(title="Code trajectories in the shared PCA basis\n(top-16 final winners + up to 16 final dead codes)", xlabel="PC1", ylabel="PC2")
+    ax.set(
+        title=(
+            "Code trajectories in the shared PCA basis\n"
+            "(top-16 final probe winners + up to 16 codes unused by final probe)"
+        ),
+        xlabel=_pca_component_label(pca, 0),
+        ylabel=_pca_component_label(pca, 1),
+    )
     ax.grid(alpha=.2)
     if run_name:
         fig.text(
@@ -597,15 +670,15 @@ def render_latent_centroid_trajectory(
         axes[0].annotate(f"step {steps[index]:,}", projected[index], fontsize=8)
     axes[0].set(
         title=f"{phase_name} latent centroid trajectory in shared PCA basis",
-        xlabel="PC1",
-        ylabel="PC2",
+        xlabel=_pca_component_label(pca, 0),
+        ylabel=_pca_component_label(pca, 1),
     )
     axes[1].plot(steps, mean_norms, label="mean norm", color="#F58518")
     axes[1].plot(steps, norm_stds, label="norm std", color="#54A24B")
     axes[1].set(
         title=f"{phase_name} latent norm dynamics",
-        xlabel="step",
-        ylabel="L2 norm",
+        xlabel="Optimizer step (parameter updates)",
+        ylabel="Encoder latent L2 norm (arbitrary latent units)",
     )
     axes[1].legend()
     for axis in axes:
@@ -673,12 +746,12 @@ def render_warmup_transition(
             ax.legend(fontsize=8)
         ax.set(
             title=title,
-            xlabel="PC1",
+            xlabel=_pca_component_label(pca, 0),
             xlim=(low[0] - margin[0], high[0] + margin[0]),
             ylim=(low[1] - margin[1], high[1] + margin[1]),
         )
         ax.grid(alpha=.2)
-    axes[0].set_ylabel("PC2")
+    axes[0].set_ylabel(_pca_component_label(pca, 1))
     fig.suptitle(f"AE warmup → K-means transition at step {pre[0]:,}", fontsize=15)
     if run_name:
         fig.text(
@@ -762,11 +835,11 @@ def render_metric_series(
         ax=spectrum_axis,
         pad=.02,
     )
-    colorbar.set_label("step")
+    colorbar.set_label("Optimizer step (parameter updates)")
     spectrum_axis.set(
-        title="encoder covariance eigenvalue spectrum",
-        xlabel="eigenvalue rank",
-        ylabel="eigenvalue",
+        title="Encoder covariance eigenvalue spectrum",
+        xlabel="Covariance eigenvalue rank (1 = largest)",
+        ylabel="Covariance eigenvalue (arbitrary latent units²)",
         yscale="log",
     )
     spectrum_axis.grid(alpha=.2)
@@ -786,7 +859,11 @@ def render_metric_series(
         linewidth=1.2,
         label="RankMe",
     )
-    rank_axis.set(title="participation ratio and RankMe", xlabel="step")
+    rank_axis.set(
+        title="Participation ratio and RankMe",
+        xlabel="Optimizer step (parameter updates)",
+        ylabel="Effective rank (dimensions)",
+    )
     rank_axis.legend()
 
     twonn_axis = flat_axes[2]
@@ -796,7 +873,11 @@ def render_metric_series(
         marker=".",
         linewidth=1.2,
     )
-    twonn_axis.set(title="TwoNN intrinsic dimension", xlabel="step")
+    twonn_axis.set(
+        title="TwoNN intrinsic dimension",
+        xlabel="Optimizer step (parameter updates)",
+        ylabel="Estimated intrinsic dimension (dimensions)",
+    )
 
     for ax in (rank_axis, twonn_axis):
         if transition_step is not None:
@@ -806,7 +887,12 @@ def render_metric_series(
 
     for ax, key in zip(flat_axes[3:], keys):
         ax.plot(steps, [row.get(key, np.nan) for row in rows], marker=".", linewidth=1.2)
-        ax.set(title=key, xlabel="step")
+        title, ylabel = _geometry_metric_panel_labels(key)
+        ax.set(
+            title=title,
+            xlabel="Optimizer step (parameter updates)",
+            ylabel=ylabel,
+        )
         if transition_step is not None:
             ax.axvspan(0, transition_step, color="0.92", alpha=.55, zorder=-10)
             ax.axvline(transition_step, color="0.35", linestyle=":", linewidth=1)
