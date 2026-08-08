@@ -78,10 +78,10 @@ def validate_locked_experiments(definition: dict[str, Any]) -> int:
                         f"{stage} experiment {experiment.get('ablation')!r} is not locked "
                         f"to codebook_size={definition['codebook_size']}."
                     )
-                if experiment.get("continuous-truncation", False):
+                if experiment.get("continuous-truncation") is not False:
                     raise ValueError(
-                        f"{stage} experiment {experiment.get('ablation')!r} enables "
-                        "continuous truncation, which is forbidden in this matched pipeline."
+                        f"{stage} experiment {experiment.get('ablation')!r} must explicitly "
+                        "set continuous-truncation=false in this matched pipeline."
                     )
     return total
 

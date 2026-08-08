@@ -3,9 +3,10 @@
 All primary VQ experiments in this set lock `codebook_size=8192`. Expensive
 commands are intentionally separate: first train/export tokenizers, then build
 immutable token corpora, and only then train the matched nanoGPT models.
-The fixed VQ, Top-k, and commitment-beta cells explicitly disable continuous
-truncation: each source story contributes at most one `max_seq_len=256` sample,
-so longer stories do not silently expand into extra training examples.
+The fixed VQ, Top-k, GQ-VAE, and commitment-beta cells explicitly disable
+continuous truncation: each source story contributes at most one
+`max_seq_len=256` sample, so longer stories do not silently expand into extra
+training examples.
 
 ## One-command full pipeline
 
