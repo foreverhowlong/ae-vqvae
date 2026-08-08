@@ -4,7 +4,7 @@
     {
       "ablation": "vq-k8192-beta005",
       "seed": 42,
-      "epochs": 10,
+      "epochs": 1,
       "full-train-data": true,
       "continuous-truncation": false,
       "max-seq-len": 256,
@@ -27,7 +27,7 @@
     {
       "ablation": "vq-k8192-beta010",
       "seed": 42,
-      "epochs": 10,
+      "epochs": 1,
       "full-train-data": true,
       "continuous-truncation": false,
       "max-seq-len": 256,
@@ -50,7 +50,7 @@
     {
       "ablation": "vq-k8192-beta025",
       "seed": 42,
-      "epochs": 10,
+      "epochs": 1,
       "full-train-data": true,
       "continuous-truncation": false,
       "max-seq-len": 256,
@@ -73,7 +73,7 @@
     {
       "ablation": "vq-k8192-beta050",
       "seed": 42,
-      "epochs": 10,
+      "epochs": 1,
       "full-train-data": true,
       "continuous-truncation": false,
       "max-seq-len": 256,
@@ -96,7 +96,7 @@
     {
       "ablation": "vq-k8192-beta100",
       "seed": 42,
-      "epochs": 10,
+      "epochs": 1,
       "full-train-data": true,
       "continuous-truncation": false,
       "max-seq-len": 256,

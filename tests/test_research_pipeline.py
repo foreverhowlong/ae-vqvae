@@ -28,6 +28,7 @@ def test_master_pipeline_locks_8192_and_contains_all_17_experiments():
     for stage in ("topk", "gqvae", "commitment_beta"):
         config_path = ROOT / definition["configs"][stage]
         experiments = json.loads(config_path.read_text(encoding="utf-8"))["experiments"]
+        assert all(experiment["epochs"] == 1 for experiment in experiments)
         assert all(
             experiment.get("continuous-truncation", False) is False
             for experiment in experiments

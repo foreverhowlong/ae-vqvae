@@ -4,7 +4,7 @@
     {
       "ablation": "gqvae-k8192-alpha1",
       "seed": 42,
-      "epochs": 10,
+      "epochs": 1,
       "batch-size": 64,
       "num-workers": 0,
       "continuous-truncation": false,
@@ -18,7 +18,7 @@
     {
       "ablation": "gqvae-k8192-alpha2",
       "seed": 42,
-      "epochs": 10,
+      "epochs": 1,
       "batch-size": 64,
       "num-workers": 0,
       "continuous-truncation": false,
@@ -32,7 +32,7 @@
     {
       "ablation": "gqvae-k8192-alpha3",
       "seed": 42,
-      "epochs": 10,
+      "epochs": 1,
       "batch-size": 64,
       "num-workers": 0,
       "continuous-truncation": false,
@@ -46,7 +46,7 @@
     {
       "ablation": "gqvae-k8192-alpha4",
       "seed": 42,
-      "epochs": 10,
+      "epochs": 1,
       "batch-size": 64,
       "num-workers": 0,
       "continuous-truncation": false,

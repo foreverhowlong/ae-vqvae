@@ -6,7 +6,9 @@ immutable token corpora, and only then train the matched nanoGPT models.
 The fixed VQ, Top-k, GQ-VAE, and commitment-beta cells explicitly disable
 continuous truncation: each source story contributes at most one
 `max_seq_len=256` sample, so longer stories do not silently expand into extra
-training examples.
+training examples. Every tokenizer-training cell uses one full-data epoch; the
+adaptive AE warmup is capped at 6,000 steps, leaving most of that epoch for the
+quantized phase without multiplying the sweep cost by ten.
 
 ## One-command full pipeline
 
