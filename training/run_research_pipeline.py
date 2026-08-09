@@ -12,12 +12,17 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import shlex
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from queue import Empty, Queue
+from threading import Event, Lock
+from typing import Any, Callable
 
 from common import ROOT
 from training.run_experiment_sequence import build_command, load_config, make_run_name
@@ -30,6 +35,33 @@ TRAIN_OUTPUT_ROOTS = {
     "training.run_nanogpt_experiment": ROOT / "outputs" / "nanogpt",
 }
 STAGE_ORDER = ("topk", "gqvae", "commitment_beta")
+
+
+@dataclass(frozen=True)
+class ExperimentJob:
+    stage: str
+    module: str
+    parameters: dict[str, Any]
+    run_name: str
+    target: Path
+    command: list[str]
+
+
+def _parse_gpu_ids(value: str) -> tuple[str, ...]:
+    values = tuple(part.strip() for part in value.split(",") if part.strip())
+    if not values:
+        raise argparse.ArgumentTypeError("--gpus requires at least one comma-separated GPU index.")
+    if any(not item.isdigit() for item in values):
+        raise argparse.ArgumentTypeError("--gpus accepts non-negative integer indices, e.g. 0,1,2.")
+    if len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError("--gpus must not contain duplicate indices.")
+    return values
+
+
+def _gpu_slots(gpu_ids: tuple[str, ...], jobs_per_gpu: int) -> tuple[str, ...]:
+    if jobs_per_gpu < 1:
+        raise ValueError("--jobs-per-gpu must be positive.")
+    return tuple(gpu for _ in range(jobs_per_gpu) for gpu in gpu_ids)
 
 
 def _root_path(value: str | Path) -> Path:
@@ -137,6 +169,254 @@ def _run_command(label: str, command: list[str], *, dry_run: bool) -> None:
         subprocess.run(command, cwd=ROOT, check=True)
 
 
+def _build_job(
+    stage: str,
+    module: str,
+    parameters: dict[str, Any],
+    run_date: str,
+) -> ExperimentJob:
+    run_name = make_run_name(parameters, run_date)
+    return ExperimentJob(
+        stage=stage,
+        module=module,
+        parameters=dict(parameters),
+        run_name=run_name,
+        target=_experiment_target(module, parameters, run_name),
+        command=build_command(module, parameters, run_name),
+    )
+
+
+def _job_record(
+    job: ExperimentJob,
+    status: str,
+    *,
+    gpu: str | None = None,
+    log_path: Path | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "run_name": job.run_name,
+        "target": str(job.target),
+        "status": status,
+    }
+    if gpu is not None:
+        record["gpu"] = gpu
+    if log_path is not None:
+        record["log"] = str(log_path)
+    return record
+
+
+def _preflight_gpus(gpu_ids: tuple[str, ...]) -> None:
+    probe = (
+        "import sys, torch; "
+        "ok=torch.cuda.is_available() and torch.cuda.device_count()==1; "
+        "print(f'torch={torch.__version__} cuda={torch.version.cuda} "
+        "available={torch.cuda.is_available()} count={torch.cuda.device_count()} "
+        "device={torch.cuda.get_device_name(0) if ok else None}'); "
+        "sys.exit(0 if ok else 1)"
+    )
+    for gpu in gpu_ids:
+        env = os.environ.copy()
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        env["CUDA_VISIBLE_DEVICES"] = gpu
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        detail = (result.stdout or result.stderr).strip()
+        if result.returncode:
+            raise RuntimeError(f"CUDA preflight failed for GPU {gpu}: {detail}")
+        print(f"[GPU {gpu}] READY {detail}")
+
+
+def _launch_logged_job(
+    job: ExperimentJob,
+    gpu: str,
+    log_path: Path,
+    on_started: Callable[[int], None],
+) -> None:
+    env = os.environ.copy()
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    env["CUDA_VISIBLE_DEVICES"] = gpu
+    env["PYTHONUNBUFFERED"] = "1"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(
+            f"\n[{datetime.now().astimezone().isoformat()}] "
+            f"GPU={gpu} {shlex.join(job.command)}\n"
+        )
+        log.flush()
+        process = subprocess.Popen(
+            job.command,
+            cwd=ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        on_started(process.pid)
+        return_code = process.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, job.command)
+
+
+def _run_parallel_jobs(
+    jobs: list[ExperimentJob],
+    gpu_ids: tuple[str, ...],
+    jobs_per_gpu: int,
+    pipeline_dir: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    *,
+    dry_run: bool,
+    launcher: Callable[
+        [ExperimentJob, str, Path, Callable[[int], None]], None
+    ] = _launch_logged_job,
+) -> dict[str, list[dict[str, Any]]]:
+    slots = _gpu_slots(gpu_ids, jobs_per_gpu)
+    if not slots:
+        raise ValueError("Parallel execution requires at least one GPU slot.")
+
+    logs_dir = pipeline_dir / "logs"
+    records: dict[tuple[str, str], dict[str, Any]] = {}
+    pending: list[ExperimentJob] = []
+    by_stage: dict[str, list[dict[str, Any]]] = {}
+    for job in jobs:
+        by_stage.setdefault(job.stage, [])
+        log_path = logs_dir / f"{job.run_name}.log"
+        if _experiment_completed(job.module, job.target):
+            record = _job_record(job, "skipped_completed", log_path=log_path)
+            print(f"\n[{job.stage}] READY, skipping {job.run_name}\n  {job.target}")
+        else:
+            if not dry_run and job.target.exists():
+                raise RuntimeError(
+                    f"Incomplete output blocks {job.stage}/{job.run_name}: {job.target}. "
+                    "Inspect or move that directory, then rerun with the same --run-date."
+                )
+            record = _job_record(
+                job,
+                "planned" if dry_run else "queued",
+                log_path=log_path,
+            )
+            pending.append(job)
+        records[(job.stage, job.run_name)] = record
+        by_stage[job.stage].append(record)
+
+    for stage, stage_records in by_stage.items():
+        state["stages"][stage] = stage_records
+
+    if dry_run:
+        for index, job in enumerate(pending):
+            gpu = slots[index % len(slots)]
+            record = records[(job.stage, job.run_name)]
+            record["gpu"] = gpu
+            print(
+                f"\n[{job.stage}: {job.run_name} | GPU {gpu}]\n"
+                f"  CUDA_VISIBLE_DEVICES={gpu} {shlex.join(job.command)}\n"
+                f"  log: {record['log']}"
+            )
+        return by_stage
+
+    pipeline_dir.mkdir(parents=True, exist_ok=True)
+    atomic_json_dump(state, state_path)
+    # Seed each slot in breadth-first GPU order before workers compete for the
+    # shared queue. With slots 0,1,2,0,1,2 this guarantees that a short stage
+    # uses all three GPUs before assigning a second process to any one GPU.
+    initial_jobs = pending[: len(slots)]
+    work_queue: Queue[ExperimentJob] = Queue()
+    for job in pending[len(slots) :]:
+        work_queue.put(job)
+    state_lock = Lock()
+    stop = Event()
+    failures: list[tuple[ExperimentJob, BaseException]] = []
+
+    def update_record(job: ExperimentJob, **updates: Any) -> None:
+        with state_lock:
+            records[(job.stage, job.run_name)].update(updates)
+            atomic_json_dump(state, state_path)
+
+    def worker(gpu: str, initial_job: ExperimentJob | None) -> None:
+        job = initial_job
+        while not stop.is_set():
+            if job is None:
+                try:
+                    job = work_queue.get_nowait()
+                except Empty:
+                    return
+            record = records[(job.stage, job.run_name)]
+            log_path = Path(str(record["log"]))
+            started_at = datetime.now().astimezone().isoformat()
+            update_record(job, status="running", gpu=gpu, started_at=started_at)
+            print(
+                f"\n[START GPU {gpu}] {job.stage}/{job.run_name}\n"
+                f"  {shlex.join(job.command)}\n"
+                f"  log: {log_path}",
+                flush=True,
+            )
+            try:
+                launcher(
+                    job,
+                    gpu,
+                    log_path,
+                    lambda pid, current=job: update_record(current, pid=pid),
+                )
+                if not _experiment_completed(job.module, job.target):
+                    raise RuntimeError(
+                        f"{job.stage}/{job.run_name} exited without complete artifacts: "
+                        f"{job.target}"
+                    )
+            except BaseException as error:
+                update_record(
+                    job,
+                    status="failed",
+                    error=repr(error),
+                    completed_at=datetime.now().astimezone().isoformat(),
+                )
+                with state_lock:
+                    failures.append((job, error))
+                stop.set()
+                print(
+                    f"\n[FAILED GPU {gpu}] {job.stage}/{job.run_name}\n"
+                    f"  log: {log_path}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
+            else:
+                update_record(
+                    job,
+                    status="completed",
+                    completed_at=datetime.now().astimezone().isoformat(),
+                )
+                print(
+                    f"\n[DONE GPU {gpu}] {job.stage}/{job.run_name}",
+                    flush=True,
+                )
+            job = None
+
+    with ThreadPoolExecutor(max_workers=len(slots)) as executor:
+        futures = [
+            executor.submit(
+                worker,
+                gpu,
+                initial_jobs[index] if index < len(initial_jobs) else None,
+            )
+            for index, gpu in enumerate(slots)
+        ]
+        for future in futures:
+            future.result()
+
+    if failures:
+        job, error = failures[0]
+        raise RuntimeError(
+            f"Parallel job failed: {job.stage}/{job.run_name}. "
+            f"See {records[(job.stage, job.run_name)]['log']}"
+        ) from error
+    return by_stage
+
+
 def _run_experiment(
     stage: str,
     module: str,
@@ -174,6 +454,21 @@ def _run_stage(
     selected = configured if experiments is None else experiments
     return [
         _run_experiment(stage, module, dict(parameters), run_date, dry_run=dry_run)
+        for parameters in selected
+    ]
+
+
+def _stage_jobs(
+    definition: dict[str, Any],
+    stage: str,
+    run_date: str,
+    *,
+    experiments: list[dict[str, Any]] | None = None,
+) -> list[ExperimentJob]:
+    module, configured = _load_stage(definition, stage)
+    selected = configured if experiments is None else experiments
+    return [
+        _build_job(stage, module, dict(parameters), run_date)
         for parameters in selected
     ]
 
@@ -438,6 +733,20 @@ def _parse_args() -> argparse.Namespace:
         "--gqvae-ablation",
         help="Override Pareto-knee selection with one exact GQ-VAE ablation label.",
     )
+    parser.add_argument(
+        "--gpus",
+        type=_parse_gpu_ids,
+        help=(
+            "Comma-separated physical GPU indices for dynamic experiment scheduling, "
+            "for example 0,1,2. Omit to preserve sequential execution."
+        ),
+    )
+    parser.add_argument(
+        "--jobs-per-gpu",
+        type=int,
+        default=1,
+        help="Concurrent training processes per selected GPU. Defaults to 1.",
+    )
     return parser.parse_args()
 
 
@@ -445,6 +754,10 @@ def main() -> None:
     args = _parse_args()
     if len(args.run_date) != 8 or not args.run_date.isdigit():
         raise ValueError("--run-date must use YYYYMMDD format.")
+    if args.jobs_per_gpu < 1:
+        raise ValueError("--jobs-per-gpu must be positive.")
+    if args.gpus is None and args.jobs_per_gpu != 1:
+        raise ValueError("--jobs-per-gpu requires --gpus.")
     definition = load_pipeline_definition(args.config)
     experiment_count = validate_locked_experiments(definition)
     pipeline_dir = (
@@ -454,6 +767,16 @@ def main() -> None:
     gqvae_tokenizer = pipeline_dir / "gqvae_tokenizer.json"
     fingerprint = _pipeline_fingerprint(definition)
     state_path = pipeline_dir / "state.json"
+    execution = (
+        {
+            "mode": "gpu_pool",
+            "gpus": list(args.gpus),
+            "jobs_per_gpu": args.jobs_per_gpu,
+            "max_parallel_jobs": len(args.gpus) * args.jobs_per_gpu,
+        }
+        if args.gpus is not None
+        else {"mode": "sequential"}
+    )
     state: dict[str, Any] = {
         "pipeline": definition["name"],
         "run_date": args.run_date,
@@ -461,8 +784,11 @@ def main() -> None:
         "config": str(_root_path(args.config)),
         "config_fingerprint": fingerprint,
         "configured_experiments": experiment_count,
+        "execution": execution,
         "stages": {},
     }
+    if args.gpus is not None and not args.dry_run:
+        _preflight_gpus(args.gpus)
     if not args.dry_run:
         if state_path.is_file():
             previous = json.loads(state_path.read_text(encoding="utf-8"))
@@ -476,17 +802,37 @@ def main() -> None:
 
     print(
         f"[Pipeline] {definition['name']} date={args.run_date} "
-        f"configured_experiments={experiment_count} dry_run={args.dry_run}"
+        f"configured_experiments={experiment_count} dry_run={args.dry_run} "
+        f"execution={execution['mode']}"
     )
     try:
         bpe_path = _prepare_bpe(definition, dry_run=args.dry_run)
-        for stage in STAGE_ORDER:
-            state["current_stage"] = stage
-            state["stages"][stage] = _run_stage(
-                definition, stage, args.run_date, dry_run=args.dry_run
+        if args.gpus is not None:
+            state["current_stage"] = "tokenizer_training"
+            tokenizer_jobs = [
+                job
+                for stage in STAGE_ORDER
+                for job in _stage_jobs(definition, stage, args.run_date)
+            ]
+            _run_parallel_jobs(
+                tokenizer_jobs,
+                args.gpus,
+                args.jobs_per_gpu,
+                pipeline_dir,
+                state,
+                state_path,
+                dry_run=args.dry_run,
             )
             if not args.dry_run:
                 atomic_json_dump(state, state_path)
+        else:
+            for stage in STAGE_ORDER:
+                state["current_stage"] = stage
+                state["stages"][stage] = _run_stage(
+                    definition, stage, args.run_date, dry_run=args.dry_run
+                )
+                if not args.dry_run:
+                    atomic_json_dump(state, state_path)
 
         if args.dry_run:
             selection_plan = (
@@ -532,13 +878,29 @@ def main() -> None:
             atomic_json_dump(state, state_path)
         nano_experiments = _dynamic_nanogpt_experiments(definition, corpora)
         state["current_stage"] = "nanogpt"
-        state["stages"]["nanogpt"] = _run_stage(
-            definition,
-            "nanogpt",
-            args.run_date,
-            dry_run=args.dry_run,
-            experiments=nano_experiments,
-        )
+        if args.gpus is not None:
+            _run_parallel_jobs(
+                _stage_jobs(
+                    definition,
+                    "nanogpt",
+                    args.run_date,
+                    experiments=nano_experiments,
+                ),
+                args.gpus,
+                args.jobs_per_gpu,
+                pipeline_dir,
+                state,
+                state_path,
+                dry_run=args.dry_run,
+            )
+        else:
+            state["stages"]["nanogpt"] = _run_stage(
+                definition,
+                "nanogpt",
+                args.run_date,
+                dry_run=args.dry_run,
+                experiments=nano_experiments,
+            )
         if not args.dry_run:
             atomic_json_dump(state, state_path)
         state["current_stage"] = "visualization"

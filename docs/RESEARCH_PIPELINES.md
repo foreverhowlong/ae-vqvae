@@ -34,6 +34,35 @@ MPLCONFIGDIR=/tmp/ae-vqvae-mpl UV_CACHE_DIR=/tmp/uv-cache \
   --config configs/full-research-pipeline-k8192-18m-20260807.json
 ```
 
+To schedule the 11 independent tokenizer-training cells dynamically across
+three GPUs, use the Python interpreter whose CUDA probe succeeds and pass the
+physical GPU indices to the pipeline itself:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+  python -m training.run_research_pipeline \
+  --config configs/full-research-pipeline-k8192-18m-20260807.json \
+  --run-date 20260808 \
+  --gpus 0,1,2 \
+  --jobs-per-gpu 1
+```
+
+Do not set an outer `CUDA_VISIBLE_DEVICES` for this form: the scheduler pins
+each child process to one selected GPU. It validates every GPU with the same
+interpreter before creating training outputs and aborts instead of silently
+falling back to CPU. Each GPU worker takes the next queued experiment as soon
+as its current one completes. After tokenizer selection and corpus preparation,
+the three nanoGPT jobs use the same pool. `--jobs-per-gpu 2` permits two
+training processes per GPU, but one is the safe default because each process
+also materializes the full text list and competes for CPU and storage I/O.
+
+Parallel child output is written to
+`outputs/research_pipeline/<pipeline>__<date>/logs/<run-name>.log`. The parent
+terminal prints start/completion events, while `state.json` records each job's
+`queued`, `running`, `completed`, or `failed` status together with its GPU, PID,
+timestamps, target, and log path. A rerun skips completed artifacts and refuses
+to overwrite an incomplete run directory.
+
 The generated date is part of every run name. To continue a pipeline on a
 later day, rerun it with the original suffix, for example `--run-date
 20260807`. Completed outputs are skipped. An existing incomplete training

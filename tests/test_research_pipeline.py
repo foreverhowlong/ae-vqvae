@@ -1,12 +1,24 @@
+import argparse
 import json
+import subprocess
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from common import ROOT
+import training.run_research_pipeline as research_pipeline
 from training.run_research_pipeline import (
+    ExperimentJob,
     _dynamic_corpus_experiments,
     _dynamic_nanogpt_experiments,
+    _gpu_slots,
+    _launch_logged_job,
+    _parse_gpu_ids,
+    _preflight_gpus,
+    _run_parallel_jobs,
     load_pipeline_definition,
     select_gqvae,
     select_pareto_knee,
@@ -33,6 +45,225 @@ def test_master_pipeline_locks_8192_and_contains_all_17_experiments():
             experiment.get("continuous-truncation", False) is False
             for experiment in experiments
         )
+
+
+def test_gpu_pool_cli_parsing_and_slot_expansion():
+    assert _parse_gpu_ids("0, 1,2") == ("0", "1", "2")
+    assert _gpu_slots(("0", "1", "2"), 2) == ("0", "1", "2", "0", "1", "2")
+
+    with pytest.raises(argparse.ArgumentTypeError, match="duplicate"):
+        _parse_gpu_ids("0,1,1")
+    with pytest.raises(argparse.ArgumentTypeError, match="non-negative"):
+        _parse_gpu_ids("0,gpu2")
+    with pytest.raises(ValueError, match="positive"):
+        _gpu_slots(("0",), 0)
+
+
+def _synthetic_jobs(tmp_path: Path, count: int) -> list[ExperimentJob]:
+    return [
+        ExperimentJob(
+            stage="topk" if index < 2 else "gqvae",
+            module="training.run_text_vqvae_experiment",
+            parameters={"ablation": f"job-{index}"},
+            run_name=f"job-{index}",
+            target=tmp_path / f"job-{index}",
+            command=["python", "-m", "training.fake", "--run-name", f"job-{index}"],
+        )
+        for index in range(count)
+    ]
+
+
+def test_parallel_dry_run_assigns_jobs_round_robin_without_writes(tmp_path, capsys):
+    state = {"stages": {}}
+    stages = _run_parallel_jobs(
+        _synthetic_jobs(tmp_path, 5),
+        ("0", "1", "2"),
+        1,
+        tmp_path / "pipeline",
+        state,
+        tmp_path / "pipeline" / "state.json",
+        dry_run=True,
+    )
+
+    records = [*stages["topk"], *stages["gqvae"]]
+    assert [record["gpu"] for record in records] == ["0", "1", "2", "0", "1"]
+    assert all(record["status"] == "planned" for record in records)
+    assert not (tmp_path / "pipeline").exists()
+    assert "CUDA_VISIBLE_DEVICES=2" in capsys.readouterr().out
+
+
+def test_parallel_pool_refills_each_gpu_and_persists_completion(tmp_path, monkeypatch):
+    jobs = _synthetic_jobs(tmp_path, 7)
+    completed: set[Path] = set()
+    active_by_gpu = {"0": 0, "1": 0, "2": 0}
+    max_by_gpu = {"0": 0, "1": 0, "2": 0}
+    used_gpus: set[str] = set()
+    lock = threading.Lock()
+
+    monkeypatch.setattr(
+        research_pipeline,
+        "_experiment_completed",
+        lambda _module, target: target in completed,
+    )
+
+    def fake_launcher(job, gpu, _log_path, on_started):
+        on_started(10_000 + int(job.run_name.rsplit("-", 1)[1]))
+        with lock:
+            active_by_gpu[gpu] += 1
+            max_by_gpu[gpu] = max(max_by_gpu[gpu], active_by_gpu[gpu])
+            used_gpus.add(gpu)
+        time.sleep(0.01)
+        completed.add(job.target)
+        with lock:
+            active_by_gpu[gpu] -= 1
+
+    state = {"status": "running", "stages": {}}
+    state_path = tmp_path / "pipeline" / "state.json"
+    stages = _run_parallel_jobs(
+        jobs,
+        ("0", "1", "2"),
+        1,
+        tmp_path / "pipeline",
+        state,
+        state_path,
+        dry_run=False,
+        launcher=fake_launcher,
+    )
+
+    records = [record for values in stages.values() for record in values]
+    assert used_gpus == {"0", "1", "2"}
+    assert max_by_gpu == {"0": 1, "1": 1, "2": 1}
+    assert all(record["status"] == "completed" for record in records)
+    assert all("pid" in record and "started_at" in record for record in records)
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert sum(len(values) for values in persisted["stages"].values()) == 7
+
+
+def test_parallel_pool_spreads_short_stage_before_reusing_gpu(tmp_path, monkeypatch):
+    jobs = _synthetic_jobs(tmp_path, 3)
+    completed: set[Path] = set()
+    assignments: dict[str, str] = {}
+    lock = threading.Lock()
+
+    monkeypatch.setattr(
+        research_pipeline,
+        "_experiment_completed",
+        lambda _module, target: target in completed,
+    )
+
+    def fake_launcher(job, gpu, _log_path, on_started):
+        on_started(20_000 + int(job.run_name.rsplit("-", 1)[1]))
+        with lock:
+            assignments[job.run_name] = gpu
+            completed.add(job.target)
+
+    _run_parallel_jobs(
+        jobs,
+        ("0", "1", "2"),
+        2,
+        tmp_path / "pipeline",
+        {"status": "running", "stages": {}},
+        tmp_path / "pipeline" / "state.json",
+        dry_run=False,
+        launcher=fake_launcher,
+    )
+
+    assert assignments == {"job-0": "0", "job-1": "1", "job-2": "2"}
+
+
+def test_parallel_failure_is_persisted_and_reports_log(tmp_path, monkeypatch):
+    job = _synthetic_jobs(tmp_path, 1)[0]
+    monkeypatch.setattr(
+        research_pipeline,
+        "_experiment_completed",
+        lambda _module, _target: False,
+    )
+
+    def failing_launcher(_job, _gpu, _log_path, on_started):
+        on_started(999)
+        raise subprocess.CalledProcessError(7, _job.command)
+
+    state = {"status": "running", "stages": {}}
+    state_path = tmp_path / "pipeline" / "state.json"
+    with pytest.raises(RuntimeError, match="Parallel job failed") as error:
+        _run_parallel_jobs(
+            [job],
+            ("0",),
+            1,
+            tmp_path / "pipeline",
+            state,
+            state_path,
+            dry_run=False,
+            launcher=failing_launcher,
+        )
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    record = persisted["stages"][job.stage][0]
+    assert record["status"] == "failed"
+    assert record["gpu"] == "0"
+    assert record["pid"] == 999
+    assert record["log"] in str(error.value)
+
+
+def test_logged_job_pins_one_visible_gpu_and_unbuffers_output(tmp_path, monkeypatch):
+    captured = {}
+
+    class FakeProcess:
+        pid = 4321
+
+        def __init__(self, command, **kwargs):
+            captured["command"] = command
+            captured.update(kwargs)
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(research_pipeline.subprocess, "Popen", FakeProcess)
+    job = _synthetic_jobs(tmp_path, 1)[0]
+    pids = []
+    _launch_logged_job(job, "2", tmp_path / "job.log", pids.append)
+
+    assert pids == [4321]
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "2"
+    assert captured["env"]["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    assert captured["env"]["PYTHONUNBUFFERED"] == "1"
+    assert captured["stderr"] == research_pipeline.subprocess.STDOUT
+
+
+def test_gpu_preflight_checks_each_gpu_with_the_current_interpreter(monkeypatch):
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = "torch=2.6.0+cu118 cuda=11.8 available=True count=1 device=RTX 3090"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return Result()
+
+    monkeypatch.setattr(research_pipeline.subprocess, "run", fake_run)
+    _preflight_gpus(("0", "2"))
+
+    assert [call[1]["env"]["CUDA_VISIBLE_DEVICES"] for call in calls] == ["0", "2"]
+    assert all(call[0][0] == research_pipeline.sys.executable for call in calls)
+    assert all(call[1]["env"]["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID" for call in calls)
+
+
+def test_gpu_preflight_rejects_cpu_fallback(monkeypatch):
+    class Result:
+        returncode = 1
+        stdout = "torch=2.11.0 cuda=13.0 available=False count=0 device=None"
+        stderr = ""
+
+    monkeypatch.setattr(
+        research_pipeline.subprocess,
+        "run",
+        lambda *_args, **_kwargs: Result(),
+    )
+
+    with pytest.raises(RuntimeError, match="CUDA preflight failed for GPU 1"):
+        _preflight_gpus(("1",))
 
 
 def test_pareto_knee_rejects_dominated_point_and_selects_balanced_frontier_point():
