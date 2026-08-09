@@ -2,12 +2,12 @@
   "module": "training.run_text_vqvae_experiment",
   "experiments": [
     {
-      "ablation": "vq-k8192-nearest-adaptive-full",
+      "ablation": "vq-k8192-nearest-adaptive-n50k-e10",
       "seed": 42,
-      "epochs": 1,
+      "epochs": 10,
       "batch-size": 32,
       "num-workers": 0,
-      "full-train-data": true,
+      "max-train-samples": 50000,
       "continuous-truncation": false,
       "max-eval-samples": 2048,
       "max-seq-len": 256,
@@ -29,12 +29,12 @@
       "geometry-render-enabled": false
     },
     {
-      "ablation": "vq-k8192-topk8-to-1-adaptive-full",
+      "ablation": "vq-k8192-topk8-to-1-adaptive-n50k-e10",
       "seed": 42,
-      "epochs": 1,
+      "epochs": 10,
       "batch-size": 32,
       "num-workers": 0,
-      "full-train-data": true,
+      "max-train-samples": 50000,
       "continuous-truncation": false,
       "max-eval-samples": 2048,
       "max-seq-len": 256,

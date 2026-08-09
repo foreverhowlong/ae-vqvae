@@ -115,6 +115,21 @@ def validate_locked_experiments(definition: dict[str, Any]) -> int:
                         f"{stage} experiment {experiment.get('ablation')!r} must explicitly "
                         "set continuous-truncation=false in this matched pipeline."
                     )
+                if experiment.get("max-train-samples") != 50000:
+                    raise ValueError(
+                        f"{stage} experiment {experiment.get('ablation')!r} must explicitly "
+                        "set max-train-samples=50000 for historical comparability."
+                    )
+                if experiment.get("epochs") != 10:
+                    raise ValueError(
+                        f"{stage} experiment {experiment.get('ablation')!r} must explicitly "
+                        "set epochs=10 for historical comparability."
+                    )
+                if experiment.get("full-train-data"):
+                    raise ValueError(
+                        f"{stage} experiment {experiment.get('ablation')!r} must not enable "
+                        "full-train-data in the historical 50k protocol."
+                    )
     return total
 
 

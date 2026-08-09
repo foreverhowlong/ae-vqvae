@@ -12,7 +12,7 @@
   "artifacts": {
     "bpe_tokenizer": "outputs/tokenizers/tinystories_bpe_8k/tokenizer.json"
   },
-  "vq_reference_ablation": "vq-k8192-nearest-adaptive-full",
+  "vq_reference_ablation": "vq-k8192-nearest-adaptive-n50k-e10",
   "vq_tokenizer_device": "auto",
   "gqvae_selection": {
     "method": "pareto_knee"

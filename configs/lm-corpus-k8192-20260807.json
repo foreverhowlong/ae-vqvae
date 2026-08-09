@@ -16,8 +16,8 @@
     {
       "ablation": "prepare-vqvae-k8192-corpus",
       "tokenizer": "vqvae",
-      "vq-checkpoint": "outputs/text_vqvae/vq-k8192-nearest-adaptive-full__20260807/checkpoints/best.pt",
-      "vq-config": "outputs/text_vqvae/vq-k8192-nearest-adaptive-full__20260807/config.json",
+      "vq-checkpoint": "outputs/text_vqvae/vq-k8192-nearest-adaptive-n50k-e10__20260807/checkpoints/best.pt",
+      "vq-config": "outputs/text_vqvae/vq-k8192-nearest-adaptive-n50k-e10__20260807/config.json",
       "device": "cuda",
       "output-dir": "outputs/lm_corpora/vqvae-k8192"
     }

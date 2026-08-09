@@ -40,7 +40,15 @@ def test_master_pipeline_locks_8192_and_contains_all_17_experiments():
     for stage in ("topk", "gqvae", "commitment_beta"):
         config_path = ROOT / definition["configs"][stage]
         experiments = json.loads(config_path.read_text(encoding="utf-8"))["experiments"]
-        assert all(experiment["epochs"] == 1 for experiment in experiments)
+        assert all(experiment["epochs"] == 10 for experiment in experiments)
+        assert all(
+            experiment["max-train-samples"] == 50000
+            for experiment in experiments
+        )
+        assert all(
+            not experiment.get("full-train-data", False)
+            for experiment in experiments
+        )
         assert all(
             experiment.get("continuous-truncation", False) is False
             for experiment in experiments
@@ -309,7 +317,7 @@ def test_downstream_paths_are_date_scoped_and_generated_from_selected_artifacts(
     assert by_tokenizer["bpe"]["tokenizer-path"] == str(bpe_path)
     assert by_tokenizer["gqvae"]["tokenizer-path"] == str(gqvae_path)
     assert by_tokenizer["vqvae"]["device"] == "auto"
-    assert "vq-k8192-nearest-adaptive-full__20990102" in by_tokenizer["vqvae"][
+    assert "vq-k8192-nearest-adaptive-n50k-e10__20990102" in by_tokenizer["vqvae"][
         "vq-checkpoint"
     ]
     assert all("full-k8192-18m__20990102" in str(path) for path in corpora.values())

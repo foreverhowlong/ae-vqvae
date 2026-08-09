@@ -6,9 +6,10 @@ immutable token corpora, and only then train the matched nanoGPT models.
 The fixed VQ, Top-k, GQ-VAE, and commitment-beta cells explicitly disable
 continuous truncation: each source story contributes at most one
 `max_seq_len=256` sample, so longer stories do not silently expand into extra
-training examples. Every tokenizer-training cell uses one full-data epoch; the
-adaptive AE warmup is capped at 6,000 steps, leaving most of that epoch for the
-quantized phase without multiplying the sweep cost by ten.
+training examples. Every tokenizer-training cell uses the historical protocol
+of 50,000 source stories for 10 epochs. This preserves the data exposure,
+optimizer-step scale, and adaptive-warmup semantics of the earlier K=8192 runs;
+full-data training is reserved for a later scale-up of selected candidates.
 
 ## One-command full pipeline
 
@@ -42,7 +43,7 @@ physical GPU indices to the pipeline itself:
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
   python -m training.run_research_pipeline \
   --config configs/full-research-pipeline-k8192-18m-20260807.json \
-  --run-date 20260808 \
+  --run-date 20260809 \
   --gpus 0,1,2 \
   --jobs-per-gpu 1
 ```

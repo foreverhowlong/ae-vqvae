@@ -2,10 +2,10 @@
   "module": "training.run_text_vqvae_experiment",
   "experiments": [
     {
-      "ablation": "vq-k8192-beta005",
+      "ablation": "vq-k8192-beta005-n50k-e10",
       "seed": 42,
-      "epochs": 1,
-      "full-train-data": true,
+      "epochs": 10,
+      "max-train-samples": 50000,
       "continuous-truncation": false,
       "max-seq-len": 256,
       "latent-slots": 128,
@@ -25,10 +25,10 @@
       "geometry-render-enabled": false
     },
     {
-      "ablation": "vq-k8192-beta010",
+      "ablation": "vq-k8192-beta010-n50k-e10",
       "seed": 42,
-      "epochs": 1,
-      "full-train-data": true,
+      "epochs": 10,
+      "max-train-samples": 50000,
       "continuous-truncation": false,
       "max-seq-len": 256,
       "latent-slots": 128,
@@ -48,10 +48,10 @@
       "geometry-render-enabled": false
     },
     {
-      "ablation": "vq-k8192-beta025",
+      "ablation": "vq-k8192-beta025-n50k-e10",
       "seed": 42,
-      "epochs": 1,
-      "full-train-data": true,
+      "epochs": 10,
+      "max-train-samples": 50000,
       "continuous-truncation": false,
       "max-seq-len": 256,
       "latent-slots": 128,
@@ -71,10 +71,10 @@
       "geometry-render-enabled": false
     },
     {
-      "ablation": "vq-k8192-beta050",
+      "ablation": "vq-k8192-beta050-n50k-e10",
       "seed": 42,
-      "epochs": 1,
-      "full-train-data": true,
+      "epochs": 10,
+      "max-train-samples": 50000,
       "continuous-truncation": false,
       "max-seq-len": 256,
       "latent-slots": 128,
@@ -94,10 +94,10 @@
       "geometry-render-enabled": false
     },
     {
-      "ablation": "vq-k8192-beta100",
+      "ablation": "vq-k8192-beta100-n50k-e10",
       "seed": 42,
-      "epochs": 1,
-      "full-train-data": true,
+      "epochs": 10,
+      "max-train-samples": 50000,
       "continuous-truncation": false,
       "max-seq-len": 256,
       "latent-slots": 128,
