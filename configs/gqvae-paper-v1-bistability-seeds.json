@@ -1,0 +1,4 @@
+{
+  "experiment-config": "configs/gqvae-paper-v1-faithful.json",
+  "seeds": [1, 2, 3, 4, 5]
+}

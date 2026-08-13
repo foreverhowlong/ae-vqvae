@@ -1,0 +1,60 @@
+{
+  "paper": {
+    "revision": "9366387cafc3aeaa16fb33506762698b077d28d8"
+  },
+  "model": {
+    "input_len": 16,
+    "embedding_dim": 1024,
+    "codebook_dim": 1024,
+    "alphabet_size": 128,
+    "codebook_size": 50000,
+    "decode_width": 10,
+    "encoder_depth": 4,
+    "gater_depth": 2,
+    "decoder_depth": 4,
+    "attention_head_dim": 64,
+    "compression_alpha": 3.0,
+    "commitment_beta": 0.25,
+    "length_gamma": 1.0,
+    "gate_threshold": 0.5,
+    "quantizer_reservoir_size": 131072,
+    "quantizer_warmup_steps": 500,
+    "quantizer_resample_every": 250,
+    "quantizer_usage_decay": 0.99,
+    "quantizer_hardset": null
+  },
+  "train": {
+    "epochs": 1,
+    "batch_size": 1024,
+    "learning_rate": 0.0001,
+    "codebook_learning_rate_multiplier": 10.0,
+    "weight_decay": 0.0001,
+    "adam_amsgrad": true,
+    "lr_warmup_steps": 1000,
+    "lr_warmup_start_factor": 0.1,
+    "log_every": 50,
+    "eval_every": 1001,
+    "eval_batches": 50,
+    "save_every": 5000,
+    "num_workers": 0
+  },
+  "data": {
+    "dataset": "roneneldan/TinyStories",
+    "dataset_config": null,
+    "split": "train[:10%]",
+    "text_field": "text",
+    "cache_dir": "data/huggingface",
+    "regex_rule": "gpt2",
+    "ascii_only": true,
+    "max_piece_length": 16,
+    "train_fraction": 0.9,
+    "max_source_documents": null,
+    "prepared_data": null
+  },
+  "bistability": {
+    "histogram_bins": 20,
+    "low_threshold": 0.1,
+    "high_threshold": 0.9,
+    "collapse_fraction": 0.95
+  }
+}

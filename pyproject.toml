@@ -10,13 +10,16 @@ dependencies = [
     "matplotlib>=3.10.9",
     "pandas>=3.0.3",
     "pillow>=11.0.0",
+    "pykeops>=2.3",
     "python-dotenv>=1.0.0",
+    "regex>=2026.7.19",
     "scikit-dimension>=0.3.4",
     "scikit-learn>=1.8.0",
     "tokenizers>=0.20.0",
     "torch>=2.3.0",
     "torchvision>=0.18.0",
     "wandb>=0.21.0",
+    "x-transformers>=2.25.5",
 ]
 
 
