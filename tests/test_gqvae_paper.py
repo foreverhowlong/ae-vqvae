@@ -1,13 +1,26 @@
 import math
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 
 from common.gqvae_paper_config import (
+    GQVAEPaperDataConfig,
+    GQVAEPaperTrainConfig,
     GQVAEPaperModelConfig,
     GateBistabilityConfig,
 )
 from models.gqvae_paper import GQVAEPaper
-from training.gqvae_paper import gate_statistics, preprocess_ascii_pieces
+from training.gqvae_paper import (
+    gate_statistics,
+    load_or_prepare_dataset,
+    preprocess_ascii_pieces,
+)
+from training.run_gqvae_paper_bistability import (
+    _finalize_checkpoints,
+    _rolling_checkpoint_due,
+    _save_resume_checkpoint,
+)
 
 
 def small_config(**overrides):
@@ -76,3 +89,69 @@ def test_gate_bistability_classification_separates_collapses_and_polarization():
     assert gate_statistics(torch.full((2, 16), 0.99), config)["gate_state"] == "collapsed_one"
     polarized = torch.tensor([[0.01] * 8 + [0.99] * 8])
     assert gate_statistics(polarized, config)["gate_state"] == "polarized"
+
+
+def test_shared_prepared_tensor_is_loaded_without_regeneration():
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "prepared.pt"
+        rows = torch.arange(32, dtype=torch.uint8).reshape(2, 16)
+        torch.save(rows, path)
+        dataset = load_or_prepare_dataset(
+            # Only the existing path is exercised; no dataset download occurs.
+            GQVAEPaperDataConfig(),
+            input_len=16,
+            prepared_output=path,
+        )
+        assert torch.equal(dataset.rows, rows)
+
+
+def test_checkpoint_policy_overwrites_latest_and_metrics_only_removes_it():
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.Adam(model.parameters(), amsgrad=True)
+    with TemporaryDirectory() as directory:
+        checkpoint_dir = Path(directory)
+        latest = checkpoint_dir / "latest.pt"
+        _save_resume_checkpoint(model, optimizer, latest, step=10)
+        _save_resume_checkpoint(model, optimizer, latest, step=20)
+        assert torch.load(latest, weights_only=True)["step"] == 20
+        retained = _finalize_checkpoints(
+            model,
+            optimizer,
+            checkpoint_dir,
+            step=30,
+            mode="none",
+        )
+        assert retained is None
+        assert not latest.exists()
+
+
+def test_rolling_checkpoint_never_saves_step_zero():
+    assert not _rolling_checkpoint_due(step=0, every=5000)
+    assert not _rolling_checkpoint_due(step=5000, every=0)
+    assert _rolling_checkpoint_due(step=5000, every=5000)
+
+
+def test_model_only_final_checkpoint_excludes_optimizer_state():
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.Adam(model.parameters(), amsgrad=True)
+    with TemporaryDirectory() as directory:
+        checkpoint_dir = Path(directory)
+        retained = _finalize_checkpoints(
+            model,
+            optimizer,
+            checkpoint_dir,
+            step=30,
+            mode="model",
+        )
+        payload = torch.load(retained, weights_only=True)
+        assert set(payload) == {"model", "step"}
+        assert not (checkpoint_dir / "latest.pt").exists()
+
+
+def test_train_config_rejects_unknown_final_checkpoint_mode():
+    try:
+        GQVAEPaperTrainConfig(final_checkpoint="all").validate()
+    except ValueError as error:
+        assert "final_checkpoint" in str(error)
+    else:
+        raise AssertionError("Expected invalid final checkpoint mode to fail.")

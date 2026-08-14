@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import subprocess
@@ -11,6 +12,8 @@ import time
 from pathlib import Path
 
 from common import ROOT
+from training.gqvae_paper import load_or_prepare_dataset, resolve_prepared_data_path
+from training.run_gqvae_paper_bistability import load_config
 from training.text_vqvae.reporting import atomic_json_dump
 
 
@@ -65,6 +68,32 @@ def aggregate(run_names: list[str], output: Path) -> None:
     )
 
 
+def prepare_shared_data(experiment: Path) -> Path:
+    model, _train, data, _diagnostics = load_config(experiment)
+    output = resolve_prepared_data_path(
+        data,
+        root=ROOT,
+        default_output=(
+            ROOT
+            / "data"
+            / "prepared"
+            / "gqvae-paper-v1-tinystories-train-10pct-ascii-gpt2-len16.pt"
+        ),
+    )
+    if output.exists():
+        print(f"[Prepared data] READY\n  {output}")
+        return output
+    print(f"[Prepared data] building once for all seeds\n  {output}")
+    dataset = load_or_prepare_dataset(
+        data,
+        input_len=model.input_len,
+        prepared_output=output,
+    )
+    del dataset
+    gc.collect()
+    return output
+
+
 def main() -> None:
     args = parse_args()
     seeds = load_seeds(args.config)
@@ -98,6 +127,8 @@ def main() -> None:
                 prefix = f"CUDA_VISIBLE_DEVICES={environment['CUDA_VISIBLE_DEVICES']} "
             print(f"[{run_name}]\n  {prefix}{' '.join(command)}")
         return
+
+    prepare_shared_data(experiment)
 
     # Run one process per assigned GPU concurrently. With no explicit GPU list,
     # run sequentially to avoid accidental device oversubscription.

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
@@ -60,8 +62,13 @@ def load_or_prepare_dataset(
     input_len: int,
     prepared_output: Path,
 ) -> ASCIIPieceDataset:
-    if config.prepared_data is not None:
-        rows = torch.load(config.prepared_data, map_location="cpu", weights_only=True)
+    if prepared_output.exists():
+        rows = torch.load(
+            prepared_output,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
         return ASCIIPieceDataset(rows)
 
     from datasets import load_dataset
@@ -76,8 +83,31 @@ def load_or_prepare_dataset(
         dataset = dataset.select(range(min(config.max_source_documents, len(dataset))))
     rows = preprocess_ascii_pieces(list(dataset[config.text_field]), input_len=input_len)
     prepared_output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(rows, prepared_output)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{prepared_output.name}.",
+        suffix=".tmp",
+        dir=prepared_output.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        torch.save(rows, temporary)
+        temporary.replace(prepared_output)
+    finally:
+        temporary.unlink(missing_ok=True)
     return ASCIIPieceDataset(rows)
+
+
+def resolve_prepared_data_path(
+    config: GQVAEPaperDataConfig,
+    *,
+    root: Path,
+    default_output: Path,
+) -> Path:
+    if config.prepared_data is None:
+        return default_output
+    path = Path(config.prepared_data).expanduser()
+    return path if path.is_absolute() else root / path
 
 
 def split_paper_dataset(
@@ -278,6 +308,10 @@ def reproduction_manifest(
             "gate_threshold": 0.5,
             "epoch_semantics": "one full loader pass, matching released executable code",
             "validation_mode": "train mode, matching released validate()",
+            "checkpoint_policy": (
+                "overwrite one latest.pt during training; skip step 0; "
+                f"final={train.final_checkpoint}"
+            ),
         },
         "paper_code_ambiguities": {
             "declared_epochs": 15,

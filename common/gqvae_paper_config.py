@@ -74,6 +74,7 @@ class GQVAEPaperTrainConfig:
     eval_every: int = 1001
     eval_batches: int = 50
     save_every: int = 5000
+    final_checkpoint: str = "none"
     num_workers: int = 0
 
     def validate(self) -> None:
@@ -85,6 +86,12 @@ class GQVAEPaperTrainConfig:
             raise ValueError("batch_size and learning_rate must be positive.")
         if self.lr_warmup_steps < 1:
             raise ValueError("lr_warmup_steps must be positive.")
+        if self.save_every < 0:
+            raise ValueError("save_every must be non-negative.")
+        if self.final_checkpoint not in {"none", "model", "resume"}:
+            raise ValueError(
+                "final_checkpoint must be one of: none, model, resume."
+            )
 
 
 @dataclass(frozen=True)
@@ -99,7 +106,9 @@ class GQVAEPaperDataConfig:
     max_piece_length: int = 16
     train_fraction: float = 0.9
     max_source_documents: int | None = None
-    prepared_data: str | None = None
+    prepared_data: str | None = (
+        "data/prepared/gqvae-paper-v1-tinystories-train-10pct-ascii-gpt2-len16.pt"
+    )
 
     def validate(self) -> None:
         if self.regex_rule != "gpt2":

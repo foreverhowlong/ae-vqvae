@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
+import tempfile
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -35,6 +37,7 @@ from training.gqvae_paper import (
     numeric_tracker_metrics,
     output_metrics,
     reproduction_manifest,
+    resolve_prepared_data_path,
     split_paper_dataset,
 )
 from training.text_vqvae.reporting import append_jsonl, atomic_json_dump
@@ -73,6 +76,53 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _atomic_torch_save(payload: object, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        torch.save(payload, temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _save_resume_checkpoint(model, optimizer, path: Path, *, step: int) -> None:
+    _atomic_torch_save(
+        {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step},
+        path,
+    )
+
+
+def _rolling_checkpoint_due(*, step: int, every: int) -> bool:
+    return every > 0 and step > 0 and step % every == 0
+
+
+def _finalize_checkpoints(
+    model,
+    optimizer,
+    checkpoint_dir: Path,
+    *,
+    step: int,
+    mode: str,
+) -> str | None:
+    latest = checkpoint_dir / "latest.pt"
+    if mode == "resume":
+        _save_resume_checkpoint(model, optimizer, latest, step=step)
+        return str(latest)
+    latest.unlink(missing_ok=True)
+    if mode == "model":
+        model_path = checkpoint_dir / "last_model.pt"
+        _atomic_torch_save({"model": model.state_dict(), "step": step}, model_path)
+        return str(model_path)
+    return None
 
 
 @torch.no_grad()
@@ -155,10 +205,20 @@ def main() -> None:
     seed_everything(args.seed)
     device = get_device()
     enable_tf32(device)
+    prepared_data_path = resolve_prepared_data_path(
+        data_config,
+        root=ROOT,
+        default_output=(
+            ROOT
+            / "data"
+            / "prepared"
+            / "gqvae-paper-v1-tinystories-train-10pct-ascii-gpt2-len16.pt"
+        ),
+    )
     dataset = load_or_prepare_dataset(
         data_config,
         input_len=model_config.input_len,
-        prepared_output=run_dir / "prepared_ascii_gpt2.pt",
+        prepared_output=prepared_data_path,
     )
     train_dataset, validation_dataset = split_paper_dataset(
         dataset,
@@ -191,6 +251,7 @@ def main() -> None:
         "validation_examples": len(validation_dataset),
         "total_steps": total_steps,
         "device": str(device),
+        "prepared_data_path": str(prepared_data_path),
     })
     atomic_json_dump(payload, run_dir / "config.json")
     metrics_path = run_dir / "metrics.jsonl"
@@ -257,10 +318,15 @@ def main() -> None:
                         f"hard_on={validation['gate_hard_on_fraction']:.4f} "
                         f"state={validation['gate_state']}"
                     )
-                if step % train_config.save_every == 0:
-                    torch.save(
-                        {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step},
-                        run_dir / "checkpoints" / f"step{step}.pt",
+                if _rolling_checkpoint_due(
+                    step=step,
+                    every=train_config.save_every,
+                ):
+                    _save_resume_checkpoint(
+                        model,
+                        optimizer,
+                        run_dir / "checkpoints" / "latest.pt",
+                        step=step,
                     )
                 step += 1
 
@@ -275,9 +341,12 @@ def main() -> None:
         final_row = {"split": "eval", "epoch": train_config.epochs, "step": step, **final_eval}
         append_jsonl(final_row, metrics_path)
         eval_rows.append(final_row)
-        torch.save(
-            {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step},
-            run_dir / "checkpoints" / "last.pt",
+        retained_checkpoint = _finalize_checkpoints(
+            model,
+            optimizer,
+            run_dir / "checkpoints",
+            step=step,
+            mode=train_config.final_checkpoint,
         )
 
     summary = {
@@ -287,6 +356,7 @@ def main() -> None:
         "steps": step,
         "elapsed_sec": time.time() - started,
         "final_eval": final_eval,
+        "retained_checkpoint": retained_checkpoint,
         **classify_trajectory(eval_rows),
     }
     atomic_json_dump(summary, run_dir / "summary.json")

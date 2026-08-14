@@ -36,6 +36,7 @@
     "eval_every": 1001,
     "eval_batches": 50,
     "save_every": 5000,
+    "final_checkpoint": "none",
     "num_workers": 0
   },
   "data": {
@@ -49,7 +50,7 @@
     "max_piece_length": 16,
     "train_fraction": 0.9,
     "max_source_documents": null,
-    "prepared_data": null
+    "prepared_data": "data/prepared/gqvae-paper-v1-tinystories-train-10pct-ascii-gpt2-len16.pt"
   },
   "bistability": {
     "histogram_bins": 20,

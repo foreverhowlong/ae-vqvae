@@ -34,6 +34,13 @@ checkpoints below `outputs/gqvae_paper_bistability/`. The sweep writes
 `summary__<run-date>.json` with terminal state counts and a conservative
 `observed_zero_one_bistability` verdict.
 
+All seeds memory-map one shared preprocessed tensor under `data/prepared/`.
+During training, `checkpoints/latest.pt` is overwritten every 5000 steps and
+step 0 is never saved. The default `final_checkpoint: "none"` removes this
+resume checkpoint after a successful run because the bistability verdict only
+needs metrics. Set it to `"model"` to retain one model-only `last_model.pt`, or
+to `"resume"` to retain the full model plus Adam/AMSGrad state.
+
 Gate states are defined only for diagnosis and do not enter the loss:
 
 - `collapsed_zero`: at least 95% of gate values are below 0.1.
