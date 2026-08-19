@@ -146,6 +146,9 @@ class BPETokenizer:
 
         self.tokenizer = Tokenizer.from_file(str(self.path))
         self.pad_token_id = self._required_token_id("<pad>")
+        # Existing reconstruction-only pipelines do not require BOS. Keep such
+        # tokenizer artifacts loadable while exposing BOS to AR consumers.
+        self.bos_token_id = self.tokenizer.token_to_id("<bos>")
         self.eos_token_id = self._required_token_id("<eos>")
         self.vocab_size = self.tokenizer.get_vocab_size()
 
