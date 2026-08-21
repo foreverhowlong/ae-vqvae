@@ -5,7 +5,10 @@ from tempfile import TemporaryDirectory
 
 import torch
 
-from common.segmental_vqvae_config import SegmentalVQVAEConfig
+from common.segmental_vqvae_config import (
+    SegmentalVQVAEConfig,
+    SegmentalVQVAEDataConfig,
+)
 from models.segmental_vqvae import (
     SegmentPooler,
     SegmentalVQVAE,
@@ -16,6 +19,7 @@ from training.run_segmental_vqvae_experiment import (
     evaluate_interventions,
 )
 from training.segmental_vqvae_reporting import (
+    build_segmentation_snapshot,
     finalize_checkpoints,
     plot_segmental_metrics,
     rolling_checkpoint_due,
@@ -91,6 +95,8 @@ def test_warmup_forward_keeps_gate_losses_active_and_backpropagates():
         model.config,
     )
     assert float(losses["commitment_loss"].detach()) == 0.0
+    assert outputs["decoder_boundary_logits"] is None
+    assert float(losses["decoder_boundary_loss"].detach()) == 0.0
     assert float(losses["compression_loss"].detach()) >= 0.0
     assert float(losses["gate_logit_l2_loss"].detach()) >= 0.0
     losses["loss"].backward()
@@ -115,6 +121,87 @@ def test_teacher_forced_decoder_is_causal():
     )
     # target[4] is shifted into decoder input position 5.
     torch.testing.assert_close(first_logits[:, :5], second_logits[:, :5])
+
+
+def test_monotonic_decoder_cannot_read_future_latents():
+    model = SegmentalVQVAE(
+        _config(latent_routing="monotonic_pointer")
+    ).eval()
+    latents = torch.randn(1, 3, model.config.latent_dim)
+    changed = latents.clone()
+    changed[:, 2] += 100.0
+    latent_mask = torch.ones(1, 3, dtype=torch.bool)
+    targets = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 2]])
+    attention_mask = torch.ones_like(targets, dtype=torch.bool)
+    segment_ids = torch.tensor([[0, 0, 0, 1, 1, 2, 2, 2]])
+
+    original_logits = model.decode_teacher_forced(
+        latents,
+        latent_mask,
+        targets,
+        attention_mask,
+        segment_ids=segment_ids,
+    )
+    changed_logits = model.decode_teacher_forced(
+        changed,
+        latent_mask,
+        targets,
+        attention_mask,
+        segment_ids=segment_ids,
+    )
+
+    torch.testing.assert_close(original_logits[:, :5], changed_logits[:, :5])
+    assert not torch.equal(original_logits[:, 5:], changed_logits[:, 5:])
+
+
+def test_monotonic_boundary_head_is_shallow_and_backpropagates():
+    model = SegmentalVQVAE(_config(latent_routing="monotonic_pointer"))
+    batch = _batch()
+    outputs = model(
+        batch["input_ids"],
+        batch["attention_mask"],
+        use_quantizer=False,
+        sample_gates=False,
+    )
+    losses = segmental_vqvae_losses(
+        outputs,
+        batch["input_ids"],
+        batch["attention_mask"],
+        model.config,
+    )
+
+    assert outputs["decoder_boundary_logits"].shape == batch["input_ids"].shape
+    assert float(losses["decoder_boundary_loss"].detach()) > 0.0
+    losses["loss"].backward()
+    assert model.boundary_head is not None
+    gradient = model.boundary_head.mlp[-1].weight.grad
+    assert gradient is not None
+    assert torch.count_nonzero(gradient) > 0
+
+
+def test_monotonic_predicted_boundaries_advance_and_clamp_pointer():
+    model = SegmentalVQVAE(
+        _config(latent_routing="monotonic_pointer")
+    ).eval()
+    assert model.boundary_head is not None
+    for parameter in model.boundary_head.parameters():
+        parameter.data.zero_()
+    model.boundary_head.mlp[-1].bias.data.fill_(10.0)
+    latents = torch.randn(1, 3, model.config.latent_dim)
+    latent_mask = torch.ones(1, 3, dtype=torch.bool)
+    targets = torch.tensor([[3, 4, 5, 6, 2]])
+    attention_mask = torch.ones_like(targets, dtype=torch.bool)
+
+    decoded = model.decode_with_predicted_pointers(
+        latents,
+        latent_mask,
+        targets,
+        attention_mask,
+    )
+
+    assert decoded["pointer_trace"].tolist() == [[0, 1, 2, 2, 2]]
+    assert decoded["local_position_trace"].tolist() == [[0, 0, 0, 1, 2]]
+    assert decoded["final_pointers"].tolist() == [2]
 
 
 def test_chunk_ordinal_embedding_is_added_after_vq_latents():
@@ -142,6 +229,10 @@ def test_interventions_are_length_matched_and_report_rate_aligned_gains():
     assert snapshot["examples"]
     assert snapshot["chunk_lengths"]
     assert 0.0 <= metrics["boundary_fraction"] <= 1.0
+    assert 0.0 <= metrics["boundary_position_dependence_hard"] <= 1.0
+    assert 0.0 <= metrics["boundary_position_dependence_soft"] <= 1.0
+    assert 0.0 <= metrics["singleton_chunk_fraction"] <= 1.0
+    assert math.isfinite(metrics["excess_singleton_fraction"])
     for key in (
         "ce_0_nats_per_bpe",
         "ce_rand_nats_per_bpe",
@@ -149,6 +240,39 @@ def test_interventions_are_length_matched_and_report_rate_aligned_gains():
         "ce_null_nats_per_bpe",
     ):
         assert math.isfinite(metrics[key])
+
+
+def test_segmentation_snapshot_detects_position_determined_boundaries():
+    token_count = 21
+    input_ids = torch.arange(3, 3 + token_count).unsqueeze(0)
+    attention_mask = torch.ones_like(input_ids)
+    hard_boundaries = torch.tensor(
+        [[False] * 10 + [True] * 11],
+        dtype=torch.bool,
+    )
+    segment_ids = (
+        hard_boundaries.long().cumsum(dim=1) - hard_boundaries.long()
+    )
+    gate_probabilities = torch.tensor(
+        [[0.0] * 10 + [1.0] * 10 + [0.0]],
+        dtype=torch.float,
+    )
+    snapshot = build_segmentation_snapshot(
+        input_ids,
+        attention_mask,
+        {
+            "gate_probabilities": gate_probabilities,
+            "hard_boundaries": hard_boundaries,
+            "segment_ids": segment_ids,
+        },
+    )
+
+    assert snapshot["position_bin_candidate_counts"] == [2] * 10
+    assert snapshot["hard_boundary_rate_by_position"] == [0.0] * 5 + [1.0] * 5
+    assert snapshot["soft_boundary_rate_by_position"] == [0.0] * 5 + [1.0] * 5
+    assert math.isclose(snapshot["boundary_position_dependence_hard"], 1.0)
+    assert math.isclose(snapshot["boundary_position_dependence_soft"], 1.0)
+    assert snapshot["excess_singleton_fraction"] > 0.0
 
 
 def test_cached_greedy_free_running_reports_exposure_metrics():
@@ -166,8 +290,28 @@ def test_cached_greedy_free_running_reports_exposure_metrics():
     assert math.isfinite(metrics["exposure_gap_bits_per_bpe"])
 
 
+def test_monotonic_free_running_reports_pointer_health():
+    model = SegmentalVQVAE(
+        _config(latent_routing="monotonic_pointer")
+    ).eval()
+    metrics = evaluate_free_running(
+        model,
+        _batch(),
+        torch.device("cpu"),
+        use_quantizer=True,
+    )
+
+    assert 0.0 <= metrics["predicted_pointer_token_alignment"] <= 1.0
+    assert metrics["predicted_pointer_mae"] >= 0.0
+    assert 0.0 <= metrics["target_end_code_consumption"] <= 1.0
+    assert 0.0 <= metrics["free_running_code_consumption_at_eos"] <= 1.0
+    assert 0.0 <= metrics["premature_code_exhaustion_fraction"] <= 1.0
+    assert math.isfinite(metrics["predicted_pointer_gap_bits_per_bpe"])
+
+
 def test_research_defaults_match_the_confirmed_architecture():
     config = SegmentalVQVAEConfig()
+    data_config = SegmentalVQVAEDataConfig()
     assert config.codebook_size == 8192
     assert config.d_model == 448
     assert config.n_heads == 8
@@ -177,6 +321,31 @@ def test_research_defaults_match_the_confirmed_architecture():
     assert config.compression_target == 1.67
     assert config.compression_weight == 10.0
     assert config.gate_logit_l2_weight == 1e-4
+    assert data_config.continuous_truncation is False
+    assert config.latent_routing == "global_cross_attention"
+    assert config.decoder_boundary_loss_weight == 1.0
+
+
+def test_monotonic_experiment_config_is_paired_with_comparable_global_decoder():
+    config_path = (
+        Path(__file__).parents[1]
+        / "configs"
+        / "segmental-vqvae-bpe-k8192-monotonic.json"
+    )
+    experiments = json.loads(config_path.read_text())["experiments"]
+    assert len(experiments) == 2
+    monotonic, global_decoder = experiments
+    assert monotonic["continuous-truncation"] is False
+    assert global_decoder["continuous-truncation"] is False
+    assert monotonic["latent-routing"] == "monotonic_pointer"
+    assert global_decoder["latent-routing"] == "global_cross_attention"
+    assert monotonic["decoder-boundary-loss-weight"] == 1.0
+    differing_keys = {
+        key
+        for key in monotonic
+        if monotonic[key] != global_decoder[key]
+    }
+    assert differing_keys == {"ablation", "latent-routing"}
 
 
 def test_metrics_first_checkpoints_overwrite_and_drop_resume_state():
@@ -224,13 +393,21 @@ def test_metrics_first_checkpoints_overwrite_and_drop_resume_state():
 
 
 def test_segmental_visualizations_overwrite_bounded_artifacts():
-    model = SegmentalVQVAE(_config()).eval()
+    model = SegmentalVQVAE(
+        _config(latent_routing="monotonic_pointer")
+    ).eval()
     metrics, snapshot = evaluate_interventions(
         model,
         _batch(),
         torch.device("cpu"),
         use_quantizer=True,
         seed=59,
+    )
+    free_metrics = evaluate_free_running(
+        model,
+        _batch(),
+        torch.device("cpu"),
+        use_quantizer=True,
     )
     with TemporaryDirectory() as temporary:
         run_dir = Path(temporary)
@@ -265,10 +442,7 @@ def test_segmental_visualizations_overwrite_bounded_artifacts():
             {
                 "split": "free_running",
                 "step": 2,
-                "exposure_gap_bits_per_bpe": 0.5,
-                "free_running_token_accuracy": 0.2,
-                "free_running_exact_match": 0.0,
-                "free_running_normalized_edit_distance": 0.8,
+                **free_metrics,
             },
         ]
         metrics_path.write_text(
@@ -292,8 +466,12 @@ def test_segmental_visualizations_overwrite_bounded_artifacts():
         assert (plot_dir / "ae_warmup_diagnostics.png").is_file()
         assert (plot_dir / "segmentation_latest.png").is_file()
         assert (plot_dir / "segmentation_latest.json").is_file()
+        assert (plot_dir / "segmentation_health.png").is_file()
+        assert (plot_dir / "pointer_health.png").is_file()
         assert sorted(path.name for path in plot_dir.iterdir()) == [
             "ae_warmup_diagnostics.png",
+            "pointer_health.png",
+            "segmentation_health.png",
             "segmentation_latest.json",
             "segmentation_latest.png",
             "training_curves.png",

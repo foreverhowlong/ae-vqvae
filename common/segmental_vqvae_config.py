@@ -8,6 +8,11 @@ from common.text_data import (
     DEFAULT_TEXT_DATASET,
 )
 
+LATENT_ROUTING_MODES = (
+    "global_cross_attention",
+    "monotonic_pointer",
+)
+
 
 @dataclass
 class SegmentalVQVAETrainConfig:
@@ -47,7 +52,7 @@ class SegmentalVQVAEDataConfig:
     max_train_samples: int | None = 50000
     max_eval_samples: int = 2048
     val_fraction: float = 0.02
-    continuous_truncation: bool = True
+    continuous_truncation: bool = False
 
 
 @dataclass
@@ -62,6 +67,7 @@ class SegmentalVQVAEConfig:
     n_heads: int = 8
     encoder_layers: int = 4
     decoder_layers: int = 6
+    latent_routing: str = "global_cross_attention"
     ffn_mult: int = 4
     dropout: float = 0.1
     codebook_size: int = 8192
@@ -70,6 +76,8 @@ class SegmentalVQVAEConfig:
     compression_weight: float = 10.0
     gate_logit_l2_weight: float = 1e-4
     gate_threshold: float = 0.5
+    decoder_boundary_loss_weight: float = 1.0
+    decoder_boundary_threshold: float = 0.5
     ema_decay: float = 0.99
     ema_eps: float = 1e-5
 
@@ -84,16 +92,25 @@ class SegmentalVQVAEConfig:
             raise ValueError("RoPE requires an even attention head dimension.")
         if self.encoder_layers < 1 or self.decoder_layers < 1:
             raise ValueError("Encoder and decoder depths must be positive.")
+        if self.latent_routing not in LATENT_ROUTING_MODES:
+            raise ValueError(
+                "latent_routing must be global_cross_attention or monotonic_pointer."
+            )
         if self.codebook_size < 2:
             raise ValueError("codebook_size must be at least two.")
         if not 0.0 < self.gate_threshold < 1.0:
             raise ValueError("gate_threshold must be strictly between zero and one.")
+        if not 0.0 < self.decoder_boundary_threshold < 1.0:
+            raise ValueError(
+                "decoder_boundary_threshold must be strictly between zero and one."
+            )
         if self.compression_target < 1.0:
             raise ValueError("compression_target must be at least one token per chunk.")
         if min(
             self.commitment_beta,
             self.compression_weight,
             self.gate_logit_l2_weight,
+            self.decoder_boundary_loss_weight,
         ) < 0:
             raise ValueError("Loss weights must be non-negative.")
         special_ids = {

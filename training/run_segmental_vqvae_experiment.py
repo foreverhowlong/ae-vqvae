@@ -15,6 +15,7 @@ from torch.utils.data import Subset
 
 from common import ROOT, enable_tf32, get_device
 from common.segmental_vqvae_config import (
+    LATENT_ROUTING_MODES,
     SegmentalVQVAEConfig,
     SegmentalVQVAEDataConfig,
     SegmentalVQVAETrainConfig,
@@ -87,6 +88,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         ("compression-weight", float),
         ("gate-logit-l2-weight", float),
         ("gate-threshold", float),
+        ("decoder-boundary-loss-weight", float),
+        ("decoder-boundary-threshold", float),
         ("ema-decay", float),
         ("ema-eps", float),
     ):
@@ -101,6 +104,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "cache-dir",
     ):
         parser.add_argument(f"--{name}")
+    parser.add_argument(
+        "--latent-routing",
+        choices=LATENT_ROUTING_MODES,
+    )
     parser.add_argument(
         "--continuous-truncation",
         action=argparse.BooleanOptionalAction,
@@ -202,6 +209,60 @@ def _masked_ce(
     return F.cross_entropy(logits[valid_mask], targets[valid_mask])
 
 
+def _boundary_candidate_mask(valid_mask: torch.Tensor) -> torch.Tensor:
+    next_valid = F.pad(valid_mask[:, 1:], (0, 1), value=False)
+    return valid_mask & next_valid
+
+
+def _boundary_counts(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    threshold: float,
+) -> dict[str, int]:
+    candidate_mask = _boundary_candidate_mask(valid_mask)
+    predictions = torch.sigmoid(logits) > threshold
+    target_boundaries = targets.bool()
+    return {
+        "decoder_boundary_tp": int(
+            (predictions & target_boundaries & candidate_mask).sum()
+        ),
+        "decoder_boundary_fp": int(
+            (predictions & ~target_boundaries & candidate_mask).sum()
+        ),
+        "decoder_boundary_fn": int(
+            (~predictions & target_boundaries & candidate_mask).sum()
+        ),
+        "decoder_boundary_tn": int(
+            (~predictions & ~target_boundaries & candidate_mask).sum()
+        ),
+    }
+
+
+def _boundary_metrics_from_counts(counts: dict[str, float]) -> dict[str, float]:
+    true_positive = counts.get("decoder_boundary_tp", 0.0)
+    false_positive = counts.get("decoder_boundary_fp", 0.0)
+    false_negative = counts.get("decoder_boundary_fn", 0.0)
+    true_negative = counts.get("decoder_boundary_tn", 0.0)
+    precision = true_positive / max(true_positive + false_positive, 1.0)
+    recall = true_positive / max(true_positive + false_negative, 1.0)
+    return {
+        "decoder_boundary_accuracy": (
+            (true_positive + true_negative)
+            / max(
+                true_positive + false_positive + false_negative + true_negative,
+                1.0,
+            )
+        ),
+        "decoder_boundary_precision": precision,
+        "decoder_boundary_recall": recall,
+        "decoder_boundary_f1": (
+            2.0 * precision * recall / max(precision + recall, 1e-12)
+        ),
+    }
+
+
 @torch.no_grad()
 def evaluate(
     model: SegmentalVQVAE,
@@ -257,6 +318,16 @@ def evaluate(
             totals["hard_ratio"] = totals.get("hard_ratio", 0.0) + float(
                 outputs["hard_tokens_per_chunk"].mean()
             )
+            boundary_logits = outputs.get("decoder_boundary_logits")
+            if isinstance(boundary_logits, torch.Tensor):
+                boundary_counts = _boundary_counts(
+                    boundary_logits,
+                    outputs["hard_boundaries"],
+                    valid,
+                    threshold=model.config.decoder_boundary_threshold,
+                )
+                for key, value in boundary_counts.items():
+                    totals[key] = totals.get(key, 0.0) + value
             if use_quantizer:
                 all_indices.append(outputs["indices"].detach().cpu())
                 all_masks.append(outputs["latent_mask"].detach().cpu())
@@ -271,6 +342,10 @@ def evaluate(
             "soft_ratio",
             "hard_ratio",
             "reconstruction_nll_sum",
+            "decoder_boundary_tp",
+            "decoder_boundary_fp",
+            "decoder_boundary_fn",
+            "decoder_boundary_tn",
         }
     }
     metrics.update({
@@ -291,6 +366,8 @@ def evaluate(
     metrics["distortion_bits_per_bpe"] = (
         float(metrics["distortion_nats_per_bpe"]) / math.log(2.0)
     )
+    if "decoder_boundary_tp" in totals:
+        metrics.update(_boundary_metrics_from_counts(totals))
     if use_quantizer and all_indices:
         stats = codebook_stats(
             torch.cat(all_indices),
@@ -351,6 +428,7 @@ def evaluate_interventions(
                 latent_mask,
                 batch["input_ids"],
                 valid,
+                segment_ids=outputs["segment_ids"],
             ),
             batch["input_ids"],
             valid,
@@ -368,6 +446,7 @@ def evaluate_interventions(
                 latent_mask,
                 batch["input_ids"],
                 valid,
+                segment_ids=outputs["segment_ids"],
             ),
             batch["input_ids"],
             valid,
@@ -379,6 +458,7 @@ def evaluate_interventions(
                 latent_mask,
                 batch["input_ids"],
                 valid,
+                segment_ids=outputs["segment_ids"],
                 disable_cross_attention=True,
             ),
             batch["input_ids"],
@@ -400,6 +480,7 @@ def evaluate_interventions(
             valid,
             outputs,
             tokenizer=tokenizer,
+            decoder_boundary_threshold=model.config.decoder_boundary_threshold,
         )
         metrics = {
             "examples": int(batch["input_ids"].shape[0]),
@@ -417,9 +498,33 @@ def evaluate_interventions(
             "gate_probability_mean": snapshot["gate_probability_mean"],
             "gate_probability_std": snapshot["gate_probability_std"],
             "boundary_fraction": snapshot["boundary_fraction"],
+            "boundary_position_dependence_hard": snapshot[
+                "boundary_position_dependence_hard"
+            ],
+            "boundary_position_dependence_soft": snapshot[
+                "boundary_position_dependence_soft"
+            ],
+            "singleton_chunk_fraction": snapshot["singleton_chunk_fraction"],
+            "excess_singleton_fraction": snapshot["excess_singleton_fraction"],
             "chunk_length_p50": snapshot["chunk_length_p50"],
             "chunk_length_p90": snapshot["chunk_length_p90"],
         }
+        boundary_logits = outputs.get("decoder_boundary_logits")
+        if isinstance(boundary_logits, torch.Tensor):
+            metrics.update({
+                "decoder_boundary_position_dependence_hard": snapshot[
+                    "decoder_boundary_position_dependence_hard"
+                ],
+                "decoder_boundary_position_dependence_soft": snapshot[
+                    "decoder_boundary_position_dependence_soft"
+                ],
+            })
+            metrics.update(_boundary_metrics_from_counts(_boundary_counts(
+                boundary_logits,
+                outputs["hard_boundaries"],
+                valid,
+                threshold=model.config.decoder_boundary_threshold,
+            )))
         return metrics, snapshot
     finally:
         model.train(was_training)
@@ -464,11 +569,14 @@ def evaluate_free_running(
             use_quantizer=use_quantizer,
             sample_gates=False,
         )
-        free_logits, generated = model.free_running(
+        free_details = model.free_running(
             outputs["z_latent"],
             outputs["latent_mask"],
             max_length=batch["input_ids"].shape[1],
+            return_details=True,
         )
+        free_logits = free_details["logits"]
+        generated = free_details["generated"]
         valid = batch["attention_mask"].bool()
         teacher_ce = _masked_ce(outputs["logits"], batch["input_ids"], valid)
         free_ce = _masked_ce(free_logits, batch["input_ids"], valid)
@@ -491,7 +599,7 @@ def evaluate_free_running(
             exact += prediction == target
             normalized_edit += _edit_distance(prediction, target) / max(len(target), 1)
         examples = int(batch["input_ids"].shape[0])
-        return {
+        metrics = {
             "examples": examples,
             "teacher_forced_ce_nats_per_bpe": float(teacher_ce),
             "free_running_ce_nats_per_bpe": float(free_ce),
@@ -502,6 +610,112 @@ def evaluate_free_running(
             "free_running_normalized_edit_distance": normalized_edit
             / max(examples, 1),
         }
+        if model.config.latent_routing == "monotonic_pointer":
+            predicted_pointer = model.decode_with_predicted_pointers(
+                outputs["z_latent"],
+                outputs["latent_mask"],
+                batch["input_ids"],
+                valid,
+            )
+            predicted_pointer_ce = _masked_ce(
+                predicted_pointer["logits"],
+                batch["input_ids"],
+                valid,
+            )
+            teacher_pointers = outputs["segment_ids"]
+            predicted_pointers = predicted_pointer["pointer_trace"]
+            pointer_error = (
+                predicted_pointers - teacher_pointers
+            ).abs()
+            pointer_tokens = max(int(valid.sum()), 1)
+            pointer_exact = float(
+                ((predicted_pointers == teacher_pointers) & valid).sum()
+            ) / pointer_tokens
+            pointer_mae = float(pointer_error[valid].float().mean())
+
+            chunk_counts = outputs["chunk_counts"].long()
+            lengths = valid.sum(dim=1).long()
+            final_target_positions = (lengths - 1).clamp_min(0)
+            batch_indices = torch.arange(
+                examples,
+                device=predicted_pointers.device,
+            )
+            target_end_pointers = predicted_pointers[
+                batch_indices,
+                final_target_positions,
+            ]
+            target_consumption = (
+                (target_end_pointers + 1).float() / chunk_counts.clamp_min(1)
+            ).clamp(max=1.0)
+            teacher_last_pointers = chunk_counts - 1
+            premature_exhaustion = (
+                (predicted_pointers >= teacher_last_pointers.unsqueeze(1))
+                & (teacher_pointers < teacher_last_pointers.unsqueeze(1))
+                & valid
+            ).any(dim=1)
+
+            free_pointers = free_details["pointer_trace"]
+            free_consumption = []
+            first_drift_fractions = []
+            for row_index, length in enumerate(lengths.tolist()):
+                pointer_matches = (
+                    predicted_pointers[row_index, :length]
+                    == teacher_pointers[row_index, :length]
+                )
+                drift = (~pointer_matches).nonzero(as_tuple=False)
+                first_drift_fractions.append(
+                    float(drift[0, 0]) / max(length, 1)
+                    if drift.numel()
+                    else 1.0
+                )
+                generated_row = generated[row_index].tolist()
+                try:
+                    stop_position = generated_row.index(model.config.eos_token_id)
+                except ValueError:
+                    stop_position = len(generated_row) - 1
+                free_pointer = free_pointers[row_index, stop_position]
+                free_consumption.append(float(
+                    ((free_pointer + 1).float() / chunk_counts[row_index]).clamp(
+                        max=1.0
+                    )
+                ))
+
+            boundary_metrics = _boundary_metrics_from_counts(_boundary_counts(
+                predicted_pointer["boundary_logits"],
+                outputs["hard_boundaries"],
+                valid,
+                threshold=model.config.decoder_boundary_threshold,
+            ))
+            metrics.update({
+                "predicted_pointer_ce_nats_per_bpe": float(predicted_pointer_ce),
+                "predicted_pointer_gap_nats_per_bpe": float(
+                    predicted_pointer_ce - teacher_ce
+                ),
+                "predicted_pointer_gap_bits_per_bpe": float(
+                    predicted_pointer_ce - teacher_ce
+                ) / math.log(2.0),
+                "predicted_pointer_token_alignment": pointer_exact,
+                "predicted_pointer_mae": pointer_mae,
+                "mean_first_pointer_drift_fraction": sum(first_drift_fractions)
+                / max(examples, 1),
+                "target_end_code_consumption": float(target_consumption.mean()),
+                "target_end_unconsumed_code_fraction": float(
+                    (1.0 - target_consumption).mean()
+                ),
+                "premature_code_exhaustion_fraction": float(
+                    premature_exhaustion.float().mean()
+                ),
+                "free_running_code_consumption_at_eos": sum(free_consumption)
+                / max(examples, 1),
+                **{
+                    key.replace(
+                        "decoder_boundary_",
+                        "predicted_pointer_boundary_",
+                    ): value
+                    for key, value in boundary_metrics.items()
+                },
+            })
+        return metrics
     finally:
         model.train(was_training)
 
@@ -649,7 +863,7 @@ def main() -> None:
     )
     print(
         "[Architecture] BPE -> RoPE encoder -> Bernoulli segments -> "
-        "EMA VQ -> teacher-forced AR decoder"
+        f"EMA VQ -> {model_cfg.latent_routing} AR decoder"
     )
     print(
         f"[Rate target] {model_cfg.compression_target:.2f} BPE/chunk "
@@ -659,7 +873,14 @@ def main() -> None:
     with wandb_run(
         run_name,
         group="segmental-vqvae",
-        tags=["text", "bpe", "segmental", "vqvae", "autoregressive"],
+        tags=[
+            "text",
+            "bpe",
+            "segmental",
+            "vqvae",
+            "autoregressive",
+            model_cfg.latent_routing,
+        ],
         config=payload,
     ) as tracker:
         for epoch in range(1, train_cfg.epochs + 1):

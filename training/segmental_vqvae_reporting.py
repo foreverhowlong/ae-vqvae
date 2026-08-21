@@ -129,6 +129,24 @@ def _token_label(tokenizer, token_id: int) -> str:
     return token.replace("Ġ", " ").replace("▁", " ")
 
 
+def _position_dependence_score(
+    rates: list[float | None],
+    counts: list[int],
+    global_rate: float,
+) -> float:
+    """Fraction of boundary-decision variance explained by position bins."""
+    total = sum(counts)
+    variance = global_rate * (1.0 - global_rate)
+    if total == 0 or variance <= 1e-12:
+        return 0.0
+    between_bin_variance = sum(
+        count / total * (rate - global_rate) ** 2
+        for rate, count in zip(rates, counts, strict=True)
+        if rate is not None and count > 0
+    )
+    return min(max(between_bin_variance / variance, 0.0), 1.0)
+
+
 def build_segmentation_snapshot(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -136,18 +154,39 @@ def build_segmentation_snapshot(
     *,
     tokenizer=None,
     max_examples: int = 8,
+    position_bin_count: int = 10,
+    decoder_boundary_threshold: float = 0.5,
 ) -> dict:
     """Convert one already-computed intervention forward into bounded CPU data."""
+    if position_bin_count <= 0:
+        raise ValueError("position_bin_count must be positive.")
     ids = input_ids.detach().cpu()
     valid = attention_mask.detach().cpu().bool()
     probabilities = outputs["gate_probabilities"].detach().cpu()
     boundaries = outputs["hard_boundaries"].detach().cpu().bool()
     segment_ids = outputs["segment_ids"].detach().cpu()
+    decoder_boundary_logits = outputs.get("decoder_boundary_logits")
+    if isinstance(decoder_boundary_logits, torch.Tensor):
+        decoder_probabilities = torch.sigmoid(
+            decoder_boundary_logits.detach().cpu()
+        )
+        decoder_boundaries = (
+            decoder_probabilities > decoder_boundary_threshold
+        )
+    else:
+        decoder_probabilities = None
+        decoder_boundaries = None
 
     all_probabilities: list[float] = []
     all_chunk_lengths: list[int] = []
     hard_candidate_boundaries = 0
     candidate_count = 0
+    position_candidate_counts = [0] * position_bin_count
+    position_hard_boundary_counts = [0] * position_bin_count
+    position_soft_boundary_sums = [0.0] * position_bin_count
+    decoder_position_hard_boundary_counts = [0] * position_bin_count
+    decoder_position_soft_boundary_sums = [0.0] * position_bin_count
+    all_decoder_probabilities: list[float] = []
     examples = []
     for row_index in range(ids.shape[0]):
         length = int(valid[row_index].sum())
@@ -156,8 +195,36 @@ def build_segmentation_snapshot(
         row_boundaries = boundaries[row_index, :length].tolist()
         row_segments = segment_ids[row_index, :length].tolist()
         all_probabilities.extend(float(value) for value in row_probabilities)
+        if decoder_probabilities is not None:
+            all_decoder_probabilities.extend(
+                float(value)
+                for value in decoder_probabilities[
+                    row_index,
+                    :candidate_length,
+                ].tolist()
+            )
         hard_candidate_boundaries += sum(row_boundaries[:candidate_length])
         candidate_count += candidate_length
+        for position in range(candidate_length):
+            normalized_position = (position + 0.5) / candidate_length
+            bin_index = min(
+                int(normalized_position * position_bin_count),
+                position_bin_count - 1,
+            )
+            position_candidate_counts[bin_index] += 1
+            position_hard_boundary_counts[bin_index] += int(
+                row_boundaries[position]
+            )
+            position_soft_boundary_sums[bin_index] += float(
+                row_probabilities[position]
+            )
+            if decoder_probabilities is not None and decoder_boundaries is not None:
+                decoder_position_hard_boundary_counts[bin_index] += int(
+                    decoder_boundaries[row_index, position]
+                )
+                decoder_position_soft_boundary_sums[bin_index] += float(
+                    decoder_probabilities[row_index, position]
+                )
 
         chunk_lengths = []
         if row_segments:
@@ -172,6 +239,11 @@ def build_segmentation_snapshot(
                 "token_ids": token_ids,
                 "tokens": [_token_label(tokenizer, token_id) for token_id in token_ids],
                 "gate_probabilities": probabilities[row_index, :length].tolist(),
+                "decoder_boundary_probabilities": (
+                    decoder_probabilities[row_index, :length].tolist()
+                    if decoder_probabilities is not None
+                    else None
+                ),
                 "hard_boundaries": row_boundaries,
                 "segment_ids": row_segments,
                 "chunk_lengths": chunk_lengths,
@@ -179,6 +251,77 @@ def build_segmentation_snapshot(
 
     probability_tensor = torch.tensor(all_probabilities, dtype=torch.float)
     length_tensor = torch.tensor(all_chunk_lengths, dtype=torch.float)
+    hard_boundary_rate_by_position = [
+        hard_count / count if count else None
+        for hard_count, count in zip(
+            position_hard_boundary_counts,
+            position_candidate_counts,
+            strict=True,
+        )
+    ]
+    soft_boundary_rate_by_position = [
+        soft_sum / count if count else None
+        for soft_sum, count in zip(
+            position_soft_boundary_sums,
+            position_candidate_counts,
+            strict=True,
+        )
+    ]
+    hard_boundary_rate = hard_candidate_boundaries / max(candidate_count, 1)
+    soft_boundary_rate = (
+        sum(all_probabilities) / candidate_count if candidate_count else 0.0
+    )
+    singleton_chunk_fraction = (
+        sum(length == 1 for length in all_chunk_lengths) / len(all_chunk_lengths)
+        if all_chunk_lengths
+        else 0.0
+    )
+    mean_chunk_length = (
+        sum(all_chunk_lengths) / len(all_chunk_lengths)
+        if all_chunk_lengths
+        else 0.0
+    )
+    memoryless_singleton_baseline = (
+        1.0 / mean_chunk_length if mean_chunk_length > 0.0 else 0.0
+    )
+    if decoder_probabilities is not None:
+        decoder_hard_boundary_rate_by_position = [
+            hard_count / count if count else None
+            for hard_count, count in zip(
+                decoder_position_hard_boundary_counts,
+                position_candidate_counts,
+                strict=True,
+            )
+        ]
+        decoder_soft_boundary_rate_by_position = [
+            soft_sum / count if count else None
+            for soft_sum, count in zip(
+                decoder_position_soft_boundary_sums,
+                position_candidate_counts,
+                strict=True,
+            )
+        ]
+        decoder_hard_boundary_rate = (
+            sum(decoder_position_hard_boundary_counts) / max(candidate_count, 1)
+        )
+        decoder_soft_boundary_rate = (
+            sum(all_decoder_probabilities) / max(candidate_count, 1)
+        )
+        decoder_bpd_hard = _position_dependence_score(
+            decoder_hard_boundary_rate_by_position,
+            position_candidate_counts,
+            decoder_hard_boundary_rate,
+        )
+        decoder_bpd_soft = _position_dependence_score(
+            decoder_soft_boundary_rate_by_position,
+            position_candidate_counts,
+            decoder_soft_boundary_rate,
+        )
+    else:
+        decoder_hard_boundary_rate_by_position = []
+        decoder_soft_boundary_rate_by_position = []
+        decoder_bpd_hard = None
+        decoder_bpd_soft = None
     return {
         "examples": examples,
         "gate_probabilities": all_probabilities,
@@ -191,7 +334,36 @@ def build_segmentation_snapshot(
             if probability_tensor.numel()
             else 0.0
         ),
-        "boundary_fraction": hard_candidate_boundaries / max(candidate_count, 1),
+        "boundary_fraction": hard_boundary_rate,
+        "position_bin_centers": [
+            (index + 0.5) / position_bin_count
+            for index in range(position_bin_count)
+        ],
+        "position_bin_candidate_counts": position_candidate_counts,
+        "hard_boundary_rate_by_position": hard_boundary_rate_by_position,
+        "soft_boundary_rate_by_position": soft_boundary_rate_by_position,
+        "boundary_position_dependence_hard": _position_dependence_score(
+            hard_boundary_rate_by_position,
+            position_candidate_counts,
+            hard_boundary_rate,
+        ),
+        "boundary_position_dependence_soft": _position_dependence_score(
+            soft_boundary_rate_by_position,
+            position_candidate_counts,
+            soft_boundary_rate,
+        ),
+        "decoder_hard_boundary_rate_by_position": (
+            decoder_hard_boundary_rate_by_position
+        ),
+        "decoder_soft_boundary_rate_by_position": (
+            decoder_soft_boundary_rate_by_position
+        ),
+        "decoder_boundary_position_dependence_hard": decoder_bpd_hard,
+        "decoder_boundary_position_dependence_soft": decoder_bpd_soft,
+        "singleton_chunk_fraction": singleton_chunk_fraction,
+        "excess_singleton_fraction": (
+            singleton_chunk_fraction - memoryless_singleton_baseline
+        ),
         "chunk_length_p50": (
             float(torch.quantile(length_tensor, 0.5)) if length_tensor.numel() else 0.0
         ),
@@ -277,6 +449,7 @@ def plot_segmental_metrics(
             ("commitment_weighted_loss", "commitment weighted"),
             ("compression_loss", "compression weighted"),
             ("gate_logit_l2_loss", "gate L2 weighted"),
+            ("decoder_boundary_weighted_loss", "decoder boundary weighted"),
         )
         for key, label in component_keys:
             if key in eval_rows[-1]:
@@ -380,6 +553,18 @@ def plot_segmental_metrics(
             marker="o",
             label="free - teacher CE",
         )
+        pointer_gap_rows = [
+            row
+            for row in free_rows
+            if "predicted_pointer_gap_bits_per_bpe" in row
+        ]
+        if pointer_gap_rows:
+            axes[1, 2].plot(
+                [row["step"] for row in pointer_gap_rows],
+                [row["predicted_pointer_gap_bits_per_bpe"] for row in pointer_gap_rows],
+                marker=".",
+                label="predicted pointer - teacher pointer CE",
+            )
     axes[1, 2].axhline(0.0, color="0.3", linestyle=":")
     axes[1, 2].set(
         title="Teacher/free-running gap",
@@ -420,6 +605,185 @@ def plot_segmental_metrics(
     fig.tight_layout(rect=(0, 0, 1, 0.985))
     fig.savefig(plot_dir / "training_curves.png", dpi=150)
     plt.close(fig)
+
+    segmentation_health_rows = [
+        row
+        for row in intervention_rows
+        if "boundary_position_dependence_hard" in row
+        and "boundary_position_dependence_soft" in row
+    ]
+    if segmentation_health_rows:
+        steps = [row["step"] for row in segmentation_health_rows]
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+        axes[0].plot(
+            steps,
+            [row["boundary_position_dependence_hard"] for row in segmentation_health_rows],
+            marker="o",
+            label="hard BPD",
+        )
+        axes[0].plot(
+            steps,
+            [row["boundary_position_dependence_soft"] for row in segmentation_health_rows],
+            marker=".",
+            label="soft BPD",
+        )
+        decoder_bpd_rows = [
+            row
+            for row in segmentation_health_rows
+            if "decoder_boundary_position_dependence_hard" in row
+            and "decoder_boundary_position_dependence_soft" in row
+        ]
+        if decoder_bpd_rows:
+            decoder_steps = [row["step"] for row in decoder_bpd_rows]
+            axes[0].plot(
+                decoder_steps,
+                [
+                    row["decoder_boundary_position_dependence_hard"]
+                    for row in decoder_bpd_rows
+                ],
+                marker="o",
+                linestyle="--",
+                label="decoder hard BPD",
+            )
+            axes[0].plot(
+                decoder_steps,
+                [
+                    row["decoder_boundary_position_dependence_soft"]
+                    for row in decoder_bpd_rows
+                ],
+                marker=".",
+                linestyle="--",
+                label="decoder soft BPD",
+            )
+        axes[0].set(
+            title="Boundary-position dependence",
+            xlabel="step",
+            ylabel="position-explained boundary variance",
+            ylim=(-0.02, 1.02),
+        )
+
+        singleton_rows = [
+            row
+            for row in segmentation_health_rows
+            if "singleton_chunk_fraction" in row
+            and "excess_singleton_fraction" in row
+        ]
+        if singleton_rows:
+            singleton_steps = [row["step"] for row in singleton_rows]
+            axes[1].plot(
+                singleton_steps,
+                [row["singleton_chunk_fraction"] for row in singleton_rows],
+                marker="o",
+                label="singleton chunks",
+            )
+            axes[1].plot(
+                singleton_steps,
+                [row["excess_singleton_fraction"] for row in singleton_rows],
+                marker=".",
+                label="excess vs geometric",
+            )
+        axes[1].axhline(0.0, color="0.3", linestyle=":")
+        axes[1].set(
+            title="Singleton-chunk concentration",
+            xlabel="step",
+            ylabel="fraction",
+        )
+        for axis in axes:
+            if transition_step is not None:
+                axis.axvline(transition_step, color="0.5", linestyle=":")
+            axis.grid(alpha=0.2)
+            axis.legend()
+        _add_run_label(fig, run_name)
+        fig.tight_layout(rect=(0, 0, 1, 0.985))
+        fig.savefig(plot_dir / "segmentation_health.png", dpi=150)
+        plt.close(fig)
+
+    pointer_rows = [
+        row for row in free_rows if "predicted_pointer_token_alignment" in row
+    ]
+    if pointer_rows:
+        steps = [row["step"] for row in pointer_rows]
+        fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+        axes[0, 0].plot(
+            steps,
+            [row["predicted_pointer_token_alignment"] for row in pointer_rows],
+            marker="o",
+            label="aligned token fraction",
+        )
+        axes[0, 0].plot(
+            steps,
+            [row["mean_first_pointer_drift_fraction"] for row in pointer_rows],
+            marker=".",
+            label="first drift position",
+        )
+        axes[0, 0].set(
+            title="Predicted-pointer alignment",
+            xlabel="step",
+            ylabel="fraction",
+            ylim=(-0.02, 1.02),
+        )
+
+        axes[0, 1].plot(
+            steps,
+            [row["predicted_pointer_mae"] for row in pointer_rows],
+            marker="o",
+            label="pointer MAE",
+        )
+        axes[0, 1].set(
+            title="Pointer displacement",
+            xlabel="step",
+            ylabel="latent ordinals",
+        )
+
+        for key, label in (
+            ("target_end_code_consumption", "codes consumed at target end"),
+            ("free_running_code_consumption_at_eos", "codes consumed at free EOS"),
+            ("premature_code_exhaustion_fraction", "premature exhaustion"),
+        ):
+            axes[1, 0].plot(
+                steps,
+                [row[key] for row in pointer_rows],
+                marker=".",
+                label=label,
+            )
+        axes[1, 0].set(
+            title="Code-consumption health",
+            xlabel="step",
+            ylabel="fraction",
+            ylim=(-0.02, 1.02),
+        )
+
+        boundary_f1_key = "predicted_pointer_boundary_f1"
+        for key, label in (
+            (boundary_f1_key, "boundary F1"),
+            (
+                "predicted_pointer_boundary_precision",
+                "boundary precision",
+            ),
+            ("predicted_pointer_boundary_recall", "boundary recall"),
+        ):
+            axes[1, 1].plot(
+                steps,
+                [row[key] for row in pointer_rows],
+                marker=".",
+                label=label,
+            )
+        axes[1, 1].set(
+            title="Boundary prediction under pointer rollout",
+            xlabel="step",
+            ylabel="fraction",
+            ylim=(-0.02, 1.02),
+        )
+
+        for axis in axes.flat:
+            if transition_step is not None:
+                axis.axvline(transition_step, color="0.5", linestyle=":")
+            axis.grid(alpha=0.2)
+            axis.legend(fontsize=8)
+        _add_run_label(fig, run_name)
+        fig.tight_layout(rect=(0, 0, 1, 0.985))
+        fig.savefig(plot_dir / "pointer_health.png", dpi=150)
+        plt.close(fig)
 
     warmup_rows = [
         row for row in rows if row.get("split") == "ae_warmup_diagnostic"
@@ -489,12 +853,18 @@ def write_segmentation_visualization(
     plot_dir.mkdir(parents=True, exist_ok=True)
     atomic_json_dump(snapshot, plot_dir / "segmentation_latest.json")
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 8))
+    fig, axes = plt.subplot_mosaic(
+        [
+            ["gate", "length", "position"],
+            ["example_1", "example_1", "example_2"],
+        ],
+        figsize=(18, 8),
+    )
     probabilities = snapshot["gate_probabilities"]
     if probabilities:
-        axes[0, 0].hist(probabilities, bins=30, range=(0.0, 1.0))
-    axes[0, 0].axvline(0.5, color="0.3", linestyle=":", label="hard threshold")
-    axes[0, 0].set(
+        axes["gate"].hist(probabilities, bins=30, range=(0.0, 1.0))
+    axes["gate"].axvline(0.5, color="0.3", linestyle=":", label="hard threshold")
+    axes["gate"].set(
         title="Gate probability distribution",
         xlabel="boundary probability",
         ylabel="candidate token positions",
@@ -503,22 +873,86 @@ def write_segmentation_visualization(
     chunk_lengths = snapshot["chunk_lengths"]
     if chunk_lengths:
         max_length = max(chunk_lengths)
-        axes[0, 1].hist(
+        axes["length"].hist(
             chunk_lengths,
             bins=range(1, max_length + 2),
             align="left",
             rwidth=0.85,
         )
-    axes[0, 1].axvline(
+    axes["length"].axvline(
         compression_target,
         color="0.3",
         linestyle=":",
         label=f"target mean {compression_target:g}",
     )
-    axes[0, 1].set(title="Hard chunk lengths", xlabel="BPE tokens / chunk", ylabel="chunks")
+    axes["length"].set(title="Hard chunk lengths", xlabel="BPE tokens / chunk", ylabel="chunks")
+
+    position_centers = snapshot.get("position_bin_centers", [])
+    for key, label, marker, linestyle in (
+        ("soft_boundary_rate_by_position", "encoder soft", ".", "-"),
+        ("hard_boundary_rate_by_position", "encoder hard", "o", "-"),
+        (
+            "decoder_soft_boundary_rate_by_position",
+            "decoder soft",
+            ".",
+            "--",
+        ),
+        (
+            "decoder_hard_boundary_rate_by_position",
+            "decoder hard",
+            "o",
+            "--",
+        ),
+    ):
+        rates = snapshot.get(key, [])
+        if not rates:
+            continue
+        plotted = [
+            (position, rate)
+            for position, rate in zip(position_centers, rates, strict=True)
+            if rate is not None
+        ]
+        if plotted:
+            axes["position"].plot(
+                [position for position, _ in plotted],
+                [rate for _, rate in plotted],
+                marker=marker,
+                linestyle=linestyle,
+                label=label,
+            )
+    axes["position"].axhline(
+        snapshot.get("boundary_fraction", 0.0),
+        color="0.3",
+        linestyle=":",
+        label="global hard rate",
+    )
+    hard_bpd = snapshot.get("boundary_position_dependence_hard")
+    soft_bpd = snapshot.get("boundary_position_dependence_soft")
+    bpd_title = "Boundary rate by normalized position"
+    if hard_bpd is not None and soft_bpd is not None:
+        bpd_title += f"\nencoder BPD H/S={hard_bpd:.3f}/{soft_bpd:.3f}"
+    decoder_hard_bpd = snapshot.get(
+        "decoder_boundary_position_dependence_hard"
+    )
+    decoder_soft_bpd = snapshot.get(
+        "decoder_boundary_position_dependence_soft"
+    )
+    if decoder_hard_bpd is not None and decoder_soft_bpd is not None:
+        bpd_title += (
+            f"\ndecoder BPD H/S={decoder_hard_bpd:.3f}/"
+            f"{decoder_soft_bpd:.3f}"
+        )
+    axes["position"].set(
+        title=bpd_title,
+        xlabel="normalized token position",
+        ylabel="boundary rate",
+        xlim=(0.0, 1.0),
+        ylim=(-0.03, 1.03),
+    )
 
     examples = snapshot["examples"][:2]
-    for example_index, axis in enumerate(axes[1]):
+    example_axes = [axes["example_1"], axes["example_2"]]
+    for example_index, axis in enumerate(example_axes):
         if example_index >= len(examples):
             axis.text(0.5, 0.5, "No example", ha="center", va="center", transform=axis.transAxes)
             continue
@@ -534,6 +968,16 @@ def write_segmentation_visualization(
                 zorder=-2,
             )
         axis.plot(positions, example["gate_probabilities"], marker=".", label="gate p")
+        decoder_example_probabilities = example.get(
+            "decoder_boundary_probabilities"
+        )
+        if decoder_example_probabilities is not None:
+            axis.plot(
+                positions,
+                decoder_example_probabilities,
+                linestyle="--",
+                label="decoder boundary p",
+            )
         boundary_positions = [
             position
             for position, boundary in enumerate(example["hard_boundaries"])
@@ -556,7 +1000,7 @@ def write_segmentation_visualization(
             ylabel="boundary probability",
         )
 
-    for axis in axes.flat:
+    for axis in axes.values():
         axis.grid(alpha=0.15)
         handles, labels = axis.get_legend_handles_labels()
         if handles and labels:

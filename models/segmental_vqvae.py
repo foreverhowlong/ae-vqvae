@@ -373,6 +373,183 @@ class SegmentalAutoregressiveDecoder(nn.Module):
         return self.output_norm(hidden), next_caches
 
 
+class MonotonicDecoderBlock(nn.Module):
+    """Causal decoder block conditioned only on the currently consumed latent."""
+
+    def __init__(self, config: SegmentalVQVAEConfig):
+        super().__init__()
+        self.self_norm = nn.LayerNorm(config.d_model)
+        self.self_attention = CausalRotarySelfAttention(config)
+        self.condition_norm = nn.LayerNorm(config.d_model)
+        self.condition_gate = nn.Linear(2 * config.d_model, config.d_model)
+        self.condition_value = nn.Linear(config.d_model, config.d_model)
+        self.condition_dropout = nn.Dropout(config.dropout)
+        self.ffn_norm = nn.LayerNorm(config.d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model * config.ffn_mult),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model * config.ffn_mult, config.d_model),
+            nn.Dropout(config.dropout),
+        )
+
+    def _condition(
+        self,
+        hidden: torch.Tensor,
+        current_memory: torch.Tensor,
+    ) -> torch.Tensor:
+        query = self.condition_norm(hidden)
+        gate = torch.sigmoid(
+            self.condition_gate(torch.cat((query, current_memory), dim=-1))
+        )
+        update = gate * self.condition_value(current_memory)
+        return hidden + self.condition_dropout(update)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        current_memory: torch.Tensor,
+        *,
+        target_padding_mask: torch.Tensor | None,
+        disable_latent_conditioning: bool,
+    ) -> torch.Tensor:
+        hidden = hidden + self.self_attention(
+            self.self_norm(hidden),
+            target_padding_mask,
+        )
+        hidden = zero_padded_positions(hidden, target_padding_mask)
+        if not disable_latent_conditioning:
+            hidden = self._condition(hidden, current_memory)
+            hidden = zero_padded_positions(hidden, target_padding_mask)
+        hidden = hidden + self.ffn(self.ffn_norm(hidden))
+        return zero_padded_positions(hidden, target_padding_mask)
+
+    def step(
+        self,
+        hidden: torch.Tensor,
+        current_memory: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        attended, cache = self.self_attention.step(self.self_norm(hidden), cache)
+        hidden = self._condition(hidden + attended, current_memory)
+        hidden = hidden + self.ffn(self.ffn_norm(hidden))
+        return hidden, cache
+
+
+class MonotonicAutoregressiveDecoder(nn.Module):
+    """AR decoder that consumes exactly one latent at each token position."""
+
+    def __init__(self, config: SegmentalVQVAEConfig):
+        super().__init__()
+        self.config = config
+        self.memory_projection = nn.Linear(config.latent_dim, config.d_model)
+        self.chunk_position_embedding = nn.Embedding(
+            config.max_seq_len,
+            config.d_model,
+        )
+        self.local_position_embedding = nn.Embedding(
+            config.max_seq_len,
+            config.d_model,
+        )
+        self.memory_norm = nn.LayerNorm(config.d_model)
+        self.layers = nn.ModuleList(
+            MonotonicDecoderBlock(config) for _ in range(config.decoder_layers)
+        )
+        self.output_norm = nn.LayerNorm(config.d_model)
+
+    def prepare_memory(
+        self,
+        latents: torch.Tensor,
+        latent_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        positions = torch.arange(latents.shape[1], device=latents.device)
+        memory = self.memory_projection(latents)
+        memory = memory + self.chunk_position_embedding(positions)[None]
+        memory = self.memory_norm(memory)
+        return torch.where(
+            latent_mask.unsqueeze(-1),
+            memory,
+            torch.zeros_like(memory),
+        )
+
+    def local_positions(self, positions: torch.Tensor) -> torch.Tensor:
+        return self.local_position_embedding(
+            positions.clamp(min=0, max=self.config.max_seq_len - 1)
+        )
+
+    def forward(
+        self,
+        token_embeddings: torch.Tensor,
+        current_memory: torch.Tensor,
+        local_positions: torch.Tensor,
+        *,
+        target_padding_mask: torch.Tensor | None,
+        disable_latent_conditioning: bool = False,
+    ) -> torch.Tensor:
+        hidden = token_embeddings
+        if not disable_latent_conditioning:
+            hidden = hidden + self.local_positions(local_positions)
+        for layer in self.layers:
+            hidden = layer(
+                hidden,
+                current_memory,
+                target_padding_mask=target_padding_mask,
+                disable_latent_conditioning=disable_latent_conditioning,
+            )
+        return self.output_norm(hidden)
+
+    def step(
+        self,
+        token_embedding: torch.Tensor,
+        current_memory: torch.Tensor,
+        local_positions: torch.Tensor,
+        caches: list[tuple[torch.Tensor, torch.Tensor] | None],
+    ) -> tuple[
+        torch.Tensor,
+        list[tuple[torch.Tensor, torch.Tensor]],
+    ]:
+        hidden = token_embedding + self.local_positions(local_positions).unsqueeze(1)
+        next_caches = []
+        for layer, cache in zip(self.layers, caches, strict=True):
+            hidden, cache = layer.step(hidden, current_memory, cache)
+            next_caches.append(cache)
+        return self.output_norm(hidden), next_caches
+
+
+class DecoderBoundaryHead(nn.Module):
+    """Predict whether the emitted token finishes the currently consumed chunk."""
+
+    def __init__(self, config: SegmentalVQVAEConfig):
+        super().__init__()
+        input_dim = 4 * config.d_model
+        hidden_dim = max(config.d_model // 2, 1)
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        emitted_token_embedding: torch.Tensor,
+        current_memory: torch.Tensor,
+        local_position_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        features = torch.cat(
+            (
+                hidden,
+                emitted_token_embedding,
+                current_memory,
+                local_position_embedding,
+            ),
+            dim=-1,
+        )
+        return self.mlp(self.input_norm(features)).squeeze(-1)
+
+
 class SegmentalVQVAE(nn.Module):
     """Learn a variable-rate sequence of VQ codes from contiguous BPE chunks."""
 
@@ -402,7 +579,14 @@ class SegmentalVQVAE(nn.Module):
             config.latent_dim,
             self.collapse_config,
         )
-        self.decoder = SegmentalAutoregressiveDecoder(config)
+        if config.latent_routing == "monotonic_pointer":
+            self.decoder = MonotonicAutoregressiveDecoder(config)
+            self.boundary_head: DecoderBoundaryHead | None = DecoderBoundaryHead(
+                config
+            )
+        else:
+            self.decoder = SegmentalAutoregressiveDecoder(config)
+            self.boundary_head = None
         self.output_head = nn.Linear(config.d_model, config.vocab_size)
 
     def _encode_detailed(
@@ -468,6 +652,108 @@ class SegmentalVQVAE(nn.Module):
             return encoded["z_e"], encoded["chunk_mask"]
         return encoded["z_e"]
 
+    @staticmethod
+    def _teacher_local_positions(
+        segment_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        positions = torch.arange(
+            segment_ids.shape[1],
+            device=segment_ids.device,
+        ).unsqueeze(0).expand_as(segment_ids)
+        starts = torch.zeros_like(attention_mask, dtype=torch.bool)
+        starts[:, 0] = attention_mask[:, 0]
+        starts[:, 1:] = (
+            attention_mask[:, 1:]
+            & (segment_ids[:, 1:] != segment_ids[:, :-1])
+        )
+        segment_starts = torch.where(
+            starts,
+            positions,
+            torch.zeros_like(positions),
+        ).cummax(dim=1).values
+        local_positions = positions - segment_starts
+        return torch.where(
+            attention_mask,
+            local_positions,
+            torch.zeros_like(local_positions),
+        )
+
+    @staticmethod
+    def _gather_current_memory(
+        memory: torch.Tensor,
+        pointers: torch.Tensor,
+    ) -> torch.Tensor:
+        if pointers.ndim == 1:
+            indices = pointers[:, None, None].expand(-1, 1, memory.shape[-1])
+        elif pointers.ndim == 2:
+            indices = pointers.unsqueeze(-1).expand(-1, -1, memory.shape[-1])
+        else:
+            raise ValueError("pointers must have shape [batch] or [batch, length].")
+        return memory.gather(1, indices)
+
+    def _decode_teacher_forced_detailed(
+        self,
+        latents: torch.Tensor,
+        latent_mask: torch.Tensor,
+        targets: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        segment_ids: torch.Tensor | None,
+        disable_cross_attention: bool = False,
+    ) -> dict[str, torch.Tensor | None]:
+        decoder_inputs = torch.full_like(targets, self.config.pad_token_id)
+        decoder_inputs[:, 0] = self.config.bos_token_id
+        decoder_inputs[:, 1:] = targets[:, :-1]
+        memory = self.decoder.prepare_memory(latents, latent_mask)
+        if self.config.latent_routing == "global_cross_attention":
+            assert isinstance(self.decoder, SegmentalAutoregressiveDecoder)
+            hidden = self.decoder(
+                self.token_embedding(decoder_inputs),
+                memory,
+                target_padding_mask=~attention_mask,
+                memory_mask=latent_mask,
+                disable_cross_attention=disable_cross_attention,
+            )
+            return {
+                "logits": self.output_head(hidden),
+                "decoder_boundary_logits": None,
+                "teacher_local_positions": None,
+            }
+
+        if segment_ids is None:
+            raise ValueError("monotonic_pointer decoding requires segment_ids.")
+        assert isinstance(self.decoder, MonotonicAutoregressiveDecoder)
+        assert self.boundary_head is not None
+        local_positions = self._teacher_local_positions(
+            segment_ids,
+            attention_mask,
+        )
+        current_memory = self._gather_current_memory(memory, segment_ids)
+        hidden = self.decoder(
+            self.token_embedding(decoder_inputs),
+            current_memory,
+            local_positions,
+            target_padding_mask=~attention_mask,
+            disable_latent_conditioning=disable_cross_attention,
+        )
+        boundary_logits = self.boundary_head(
+            hidden,
+            self.token_embedding(targets),
+            current_memory,
+            self.decoder.local_positions(local_positions),
+        )
+        boundary_logits = torch.where(
+            attention_mask,
+            boundary_logits,
+            torch.zeros_like(boundary_logits),
+        )
+        return {
+            "logits": self.output_head(hidden),
+            "decoder_boundary_logits": boundary_logits,
+            "teacher_local_positions": local_positions,
+        }
+
     def decode_teacher_forced(
         self,
         latents: torch.Tensor,
@@ -475,20 +761,20 @@ class SegmentalVQVAE(nn.Module):
         targets: torch.Tensor,
         attention_mask: torch.Tensor,
         *,
+        segment_ids: torch.Tensor | None = None,
         disable_cross_attention: bool = False,
     ) -> torch.Tensor:
-        decoder_inputs = torch.full_like(targets, self.config.pad_token_id)
-        decoder_inputs[:, 0] = self.config.bos_token_id
-        decoder_inputs[:, 1:] = targets[:, :-1]
-        memory = self.decoder.prepare_memory(latents, latent_mask)
-        hidden = self.decoder(
-            self.token_embedding(decoder_inputs),
-            memory,
-            target_padding_mask=~attention_mask,
-            memory_mask=latent_mask,
+        detailed = self._decode_teacher_forced_detailed(
+            latents,
+            latent_mask,
+            targets,
+            attention_mask,
+            segment_ids=segment_ids,
             disable_cross_attention=disable_cross_attention,
         )
-        return self.output_head(hidden)
+        logits = detailed["logits"]
+        assert isinstance(logits, torch.Tensor)
+        return logits
 
     def forward(
         self,
@@ -497,7 +783,7 @@ class SegmentalVQVAE(nn.Module):
         *,
         use_quantizer: bool = True,
         sample_gates: bool | None = None,
-    ) -> dict[str, torch.Tensor | bool]:
+    ) -> dict[str, torch.Tensor | bool | None]:
         encoded = self._encode_detailed(
             input_ids,
             attention_mask,
@@ -519,15 +805,16 @@ class SegmentalVQVAE(nn.Module):
                 device=z_e.device,
                 dtype=torch.long,
             )
-        logits = self.decode_teacher_forced(
+        decoded = self._decode_teacher_forced_detailed(
             z_latent,
             latent_mask,
             input_ids,
             encoded["attention_mask"],
+            segment_ids=encoded["segment_ids"],
         )
         return {
             **encoded,
-            "logits": logits,
+            **decoded,
             "z_q_raw": z_q_raw,
             "z_q_st": z_latent,
             "z_latent": z_latent,
@@ -536,6 +823,128 @@ class SegmentalVQVAE(nn.Module):
             "quantizer_active": use_quantizer,
         }
 
+    def _monotonic_pointer_decode(
+        self,
+        latents: torch.Tensor,
+        latent_mask: torch.Tensor,
+        *,
+        max_length: int,
+        teacher_targets: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        assert isinstance(self.decoder, MonotonicAutoregressiveDecoder)
+        assert self.boundary_head is not None
+        memory = self.decoder.prepare_memory(latents, latent_mask)
+        batch_size = latents.shape[0]
+        last_pointers = latent_mask.sum(dim=1).long() - 1
+        pointers = torch.zeros(batch_size, device=latents.device, dtype=torch.long)
+        local_positions = torch.zeros_like(pointers)
+        previous = torch.full(
+            (batch_size,),
+            self.config.bos_token_id,
+            device=latents.device,
+            dtype=torch.long,
+        )
+        caches: list[tuple[torch.Tensor, torch.Tensor] | None] = [
+            None for _ in self.decoder.layers
+        ]
+        logits = []
+        generated = []
+        boundary_logits = []
+        boundary_predictions = []
+        pointer_trace = []
+        local_position_trace = []
+        for position in range(max_length):
+            if teacher_targets is not None:
+                previous = (
+                    torch.full_like(previous, self.config.bos_token_id)
+                    if position == 0
+                    else teacher_targets[:, position - 1]
+                )
+            current_memory = self._gather_current_memory(memory, pointers)
+            hidden, caches = self.decoder.step(
+                self.token_embedding(previous).unsqueeze(1),
+                current_memory,
+                local_positions,
+                caches,
+            )
+            step_logits = self.output_head(hidden[:, 0])
+            if teacher_targets is None:
+                step_logits = step_logits.clone()
+                eos_blocked = pointers < last_pointers
+                step_logits[eos_blocked, self.config.eos_token_id] = torch.finfo(
+                    step_logits.dtype
+                ).min
+                emitted = step_logits.argmax(dim=-1)
+                active = torch.ones_like(pointers, dtype=torch.bool)
+            else:
+                emitted = teacher_targets[:, position]
+                assert attention_mask is not None
+                active = attention_mask[:, position]
+
+            step_boundary_logits = self.boundary_head(
+                hidden[:, 0],
+                self.token_embedding(emitted),
+                current_memory[:, 0],
+                self.decoder.local_positions(local_positions),
+            )
+            predicted_boundary = (
+                torch.sigmoid(step_boundary_logits)
+                > self.config.decoder_boundary_threshold
+            ) & active
+
+            pointer_trace.append(pointers)
+            local_position_trace.append(local_positions)
+            logits.append(step_logits)
+            generated.append(emitted)
+            boundary_logits.append(step_boundary_logits)
+            boundary_predictions.append(predicted_boundary)
+
+            advance = predicted_boundary & (pointers < last_pointers)
+            pointers = pointers + advance.long()
+            next_local_positions = torch.where(
+                advance,
+                torch.zeros_like(local_positions),
+                local_positions + 1,
+            )
+            local_positions = torch.where(
+                active,
+                next_local_positions,
+                local_positions,
+            )
+            if teacher_targets is None:
+                previous = emitted
+
+        return {
+            "logits": torch.stack(logits, dim=1),
+            "generated": torch.stack(generated, dim=1),
+            "boundary_logits": torch.stack(boundary_logits, dim=1),
+            "boundary_predictions": torch.stack(boundary_predictions, dim=1),
+            "pointer_trace": torch.stack(pointer_trace, dim=1),
+            "local_position_trace": torch.stack(local_position_trace, dim=1),
+            "final_pointers": pointers,
+        }
+
+    @torch.no_grad()
+    def decode_with_predicted_pointers(
+        self,
+        latents: torch.Tensor,
+        latent_mask: torch.Tensor,
+        targets: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if self.config.latent_routing != "monotonic_pointer":
+            raise RuntimeError(
+                "Predicted-pointer decoding requires monotonic_pointer routing."
+            )
+        return self._monotonic_pointer_decode(
+            latents,
+            latent_mask,
+            max_length=targets.shape[1],
+            teacher_targets=targets,
+            attention_mask=attention_mask,
+        )
+
     @torch.no_grad()
     def free_running(
         self,
@@ -543,9 +952,21 @@ class SegmentalVQVAE(nn.Module):
         latent_mask: torch.Tensor,
         *,
         max_length: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_details: bool = False,
+    ):
         if not 0 < max_length <= self.config.max_seq_len:
             raise ValueError("max_length is outside the configured sequence range.")
+        if self.config.latent_routing == "monotonic_pointer":
+            details = self._monotonic_pointer_decode(
+                latents,
+                latent_mask,
+                max_length=max_length,
+            )
+            if return_details:
+                return details
+            return details["logits"], details["generated"]
+
+        assert isinstance(self.decoder, SegmentalAutoregressiveDecoder)
         memory = self.decoder.prepare_memory(latents, latent_mask)
         batch_size = latents.shape[0]
         previous = torch.full(
@@ -571,11 +992,17 @@ class SegmentalVQVAE(nn.Module):
             previous = step_logits.argmax(dim=-1)
             logits.append(step_logits)
             generated.append(previous)
-        return torch.stack(logits, dim=1), torch.stack(generated, dim=1)
+        details = {
+            "logits": torch.stack(logits, dim=1),
+            "generated": torch.stack(generated, dim=1),
+        }
+        if return_details:
+            return details
+        return details["logits"], details["generated"]
 
 
 def segmental_vqvae_losses(
-    outputs: dict[str, torch.Tensor | bool],
+    outputs: dict[str, torch.Tensor | bool | None],
     targets: torch.Tensor,
     attention_mask: torch.Tensor,
     config: SegmentalVQVAEConfig,
@@ -606,7 +1033,33 @@ def segmental_vqvae_losses(
     compression_raw = (soft_ratio.mean() - config.compression_target).square()
     compression = config.compression_weight * compression_raw
     gate_regularization = config.gate_logit_l2_weight * gate_logit_l2
-    total = reconstruction + commitment + compression + gate_regularization
+    decoder_boundary_logits = outputs.get("decoder_boundary_logits")
+    if isinstance(decoder_boundary_logits, torch.Tensor):
+        gate_probabilities = outputs["gate_probabilities"]
+        assert isinstance(gate_probabilities, torch.Tensor)
+        next_valid = F.pad(valid_mask[:, 1:], (0, 1), value=False)
+        final_valid = valid_mask & ~next_valid
+        boundary_targets = torch.where(
+            final_valid,
+            torch.ones_like(gate_probabilities),
+            gate_probabilities,
+        ).detach()
+        decoder_boundary_raw = F.binary_cross_entropy_with_logits(
+            decoder_boundary_logits[valid_mask],
+            boundary_targets[valid_mask].to(decoder_boundary_logits.dtype),
+        )
+    else:
+        decoder_boundary_raw = reconstruction.new_zeros(())
+    decoder_boundary = (
+        config.decoder_boundary_loss_weight * decoder_boundary_raw
+    )
+    total = (
+        reconstruction
+        + commitment
+        + compression
+        + gate_regularization
+        + decoder_boundary
+    )
     return {
         "loss": total,
         "reconstruction_loss": reconstruction,
@@ -616,6 +1069,8 @@ def segmental_vqvae_losses(
         "compression_loss_raw": compression_raw,
         "gate_logit_l2": gate_logit_l2,
         "gate_logit_l2_loss": gate_regularization,
+        "decoder_boundary_loss": decoder_boundary_raw,
+        "decoder_boundary_weighted_loss": decoder_boundary,
     }
 
 
