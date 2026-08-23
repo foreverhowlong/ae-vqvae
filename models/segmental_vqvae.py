@@ -137,6 +137,634 @@ class SegmentPooler(nn.Module):
         }
 
 
+class MaskedBidirectionalRotarySelfAttention(nn.Module):
+    """Bidirectional RoPE attention over an explicit sliding-window mask."""
+
+    def __init__(self, config: SegmentalVQVAEConfig):
+        super().__init__()
+        self.n_heads = config.n_heads
+        self.head_dim = config.d_model // config.n_heads
+        self.qkv = nn.Linear(config.d_model, 3 * config.d_model)
+        self.output = nn.Linear(config.d_model, config.d_model)
+        self.attention_dropout = config.dropout
+        self.output_dropout = nn.Dropout(config.dropout)
+        inv_freq = 1.0 / (
+            10_000.0
+            ** (
+                torch.arange(0, self.head_dim, 2, dtype=torch.float32)
+                / self.head_dim
+            )
+        )
+        self.register_buffer("rope_inv_freq", inv_freq, persistent=False)
+
+    def _apply_rope(
+        self,
+        tensor: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        if positions.ndim == 1:
+            positions = positions.unsqueeze(0).expand(tensor.shape[0], -1)
+        angles = positions.float().unsqueeze(-1) * self.rope_inv_freq.float()
+        cos = angles.cos().to(dtype=tensor.dtype)[:, None]
+        sin = angles.sin().to(dtype=tensor.dtype)[:, None]
+        pairs = tensor.reshape(*tensor.shape[:-1], self.head_dim // 2, 2)
+        even, odd = pairs.unbind(dim=-1)
+        return torch.stack(
+            (even * cos - odd * sin, even * sin + odd * cos),
+            dim=-1,
+        ).flatten(-2)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        allowed: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, seq_len, d_model = hidden.shape
+        qkv = self.qkv(hidden).reshape(
+            batch_size,
+            seq_len,
+            3,
+            self.n_heads,
+            self.head_dim,
+        )
+        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
+        query = self._apply_rope(query, positions)
+        key = self._apply_rope(key, positions)
+        if allowed.ndim != 3 or allowed.shape[:2] != (batch_size, seq_len):
+            raise ValueError(
+                "allowed must have shape [batch, length, local_window]."
+            )
+        window_size = allowed.shape[-1]
+        if window_size % 2 != 1:
+            raise ValueError("The local attention window must have odd width.")
+        radius = window_size // 2
+        padded_key = F.pad(key, (0, 0, radius, radius))
+        padded_value = F.pad(value, (0, 0, radius, radius))
+        key_windows = padded_key.unfold(2, window_size, 1).permute(
+            0,
+            1,
+            2,
+            4,
+            3,
+        )
+        value_windows = padded_value.unfold(2, window_size, 1).permute(
+            0,
+            1,
+            2,
+            4,
+            3,
+        )
+        scores = torch.einsum(
+            "bhtd,bhtwd->bhtw",
+            query,
+            key_windows,
+        ) / math.sqrt(self.head_dim)
+        safe_allowed = allowed.clone()
+        empty_queries = ~safe_allowed.any(dim=-1)
+        safe_allowed[:, :, radius] |= empty_queries
+        scores = scores.masked_fill(~safe_allowed[:, None], float("-inf"))
+        attention = torch.softmax(scores, dim=-1)
+        attention = F.dropout(
+            attention,
+            p=self.attention_dropout,
+            training=self.training,
+        )
+        attended = torch.einsum(
+            "bhtw,bhtwd->bhtd",
+            attention,
+            value_windows,
+        )
+        attended = attended.transpose(1, 2).contiguous().reshape(
+            batch_size,
+            seq_len,
+            d_model,
+        )
+        return self.output_dropout(self.output(attended))
+
+
+class MaskedBidirectionalBlock(nn.Module):
+    def __init__(self, config: SegmentalVQVAEConfig):
+        super().__init__()
+        self.attention_norm = nn.LayerNorm(config.d_model)
+        self.attention = MaskedBidirectionalRotarySelfAttention(config)
+        self.ffn_norm = nn.LayerNorm(config.d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model * config.ffn_mult),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model * config.ffn_mult, config.d_model),
+            nn.Dropout(config.dropout),
+        )
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        allowed: torch.Tensor,
+        positions: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = hidden + self.attention(
+            self.attention_norm(hidden),
+            allowed,
+            positions,
+        )
+        hidden = zero_padded_positions(hidden, padding_mask)
+        hidden = hidden + self.ffn(self.ffn_norm(hidden))
+        return zero_padded_positions(hidden, padding_mask)
+
+
+class LocalBoundaryEncoder(nn.Module):
+    """Translation-equivariant encoder with a bounded total receptive field."""
+
+    def __init__(self, config: SegmentalVQVAEConfig):
+        super().__init__()
+        base_radius, remainder = divmod(
+            config.boundary_window_radius,
+            config.boundary_encoder_layers,
+        )
+        self.layer_radii = [
+            base_radius + int(index < remainder)
+            for index in range(config.boundary_encoder_layers)
+        ]
+        self.layers = nn.ModuleList(
+            MaskedBidirectionalBlock(config)
+            for _ in range(config.boundary_encoder_layers)
+        )
+        self.output_norm = nn.LayerNorm(config.d_model)
+
+    def forward(
+        self,
+        token_embeddings: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_len = token_embeddings.shape[1]
+        positions = torch.arange(seq_len, device=token_embeddings.device)
+        hidden = token_embeddings
+        for layer, radius in zip(self.layers, self.layer_radii, strict=True):
+            valid_windows = F.pad(
+                valid_mask,
+                (radius, radius),
+                value=False,
+            ).unfold(1, 2 * radius + 1, 1)
+            allowed = (
+                valid_mask.unsqueeze(-1)
+                & valid_windows
+            )
+            hidden = layer(
+                hidden,
+                allowed,
+                positions,
+                ~valid_mask,
+            )
+        hidden = self.output_norm(hidden)
+        return zero_padded_positions(hidden, ~valid_mask)
+
+
+class SpanScorer(nn.Module):
+    """Score all O(length * max_span_length) locally contextual spans."""
+
+    def __init__(self, config: SegmentalVQVAEConfig):
+        super().__init__()
+        self.max_span_length = config.max_span_length
+        self.d_model = config.d_model
+        self.length_embedding = nn.Embedding(
+            config.max_span_length + 1,
+            config.d_model,
+        )
+        self.pooling_score = nn.Linear(config.d_model, 1)
+        self.input_norm = nn.LayerNorm(8 * config.d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(8 * config.d_model, config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model, max(config.d_model // 2, 1)),
+            nn.GELU(),
+            nn.Linear(max(config.d_model // 2, 1), 1),
+        )
+        lengths = torch.arange(
+            config.max_span_length + 1,
+            dtype=torch.float32,
+        )
+        scale = max(config.compression_target / 2.0, 1.0)
+        initial_bias = -0.5 * (
+            (lengths - config.compression_target) / scale
+        ).square()
+        self.length_bias = nn.Parameter(initial_bias)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden.shape
+        lengths = valid_mask.sum(dim=1)
+        salience_logits = self.pooling_score(hidden).squeeze(-1)
+        salience_logits = salience_logits.masked_fill(~valid_mask, float("-inf"))
+        salience = torch.exp(
+            salience_logits
+            - salience_logits.masked_fill(
+                ~valid_mask,
+                torch.finfo(salience_logits.dtype).min,
+            ).max(dim=1, keepdim=True).values
+        ) * valid_mask
+        prefix_weight = F.pad(salience.cumsum(dim=1), (1, 0))
+        prefix_weighted_hidden = F.pad(
+            (salience.unsqueeze(-1) * hidden).cumsum(dim=1),
+            (0, 0, 1, 0),
+        )
+        scores = hidden.new_full(
+            (batch_size, seq_len, self.max_span_length),
+            float("-inf"),
+        )
+        zero = torch.zeros_like(hidden[:, :1])
+        for span_length in range(1, self.max_span_length + 1):
+            candidate_count = seq_len - span_length + 1
+            if candidate_count <= 0:
+                break
+            span_weight = (
+                prefix_weight[:, span_length:]
+                - prefix_weight[:, :-span_length]
+            )
+            span_weighted_hidden = (
+                prefix_weighted_hidden[:, span_length:]
+                - prefix_weighted_hidden[:, :-span_length]
+            )
+            pooled = span_weighted_hidden / span_weight.clamp_min(1e-12).unsqueeze(-1)
+            left_inside = hidden[:, :candidate_count]
+            right_inside = hidden[
+                :,
+                span_length - 1 : span_length - 1 + candidate_count,
+            ]
+            left_outside = torch.cat(
+                (zero, hidden[:, : max(candidate_count - 1, 0)]),
+                dim=1,
+            )
+            right_outside = torch.cat(
+                (hidden[:, span_length:], zero),
+                dim=1,
+            )[:, :candidate_count]
+            length_feature = self.length_embedding.weight[span_length].view(
+                1,
+                1,
+                -1,
+            ).expand(batch_size, candidate_count, -1)
+            features = torch.cat(
+                (
+                    left_outside,
+                    left_inside,
+                    right_inside,
+                    right_outside,
+                    pooled,
+                    right_inside - left_inside,
+                    right_inside * left_inside,
+                    length_feature,
+                ),
+                dim=-1,
+            )
+            span_scores = self.mlp(self.input_norm(features)).squeeze(-1)
+            span_scores = span_scores + self.length_bias[span_length]
+            starts = torch.arange(candidate_count, device=hidden.device)
+            candidate_valid = (
+                starts.unsqueeze(0) + span_length <= lengths.unsqueeze(1)
+            )
+            scores[:, :candidate_count, span_length - 1] = torch.where(
+                candidate_valid,
+                span_scores,
+                torch.full_like(span_scores, float("-inf")),
+            )
+        return scores
+
+
+class SemiMarkovSegmenter(nn.Module):
+    """Bounded-duration segmental model with Viterbi forward and marginal STE."""
+
+    def __init__(self, config: SegmentalVQVAEConfig):
+        super().__init__()
+        self.max_span_length = config.max_span_length
+        self.scorer = SpanScorer(config)
+
+    def _forward_backward(
+        self,
+        span_scores: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = span_scores.shape
+        zero = span_scores.new_zeros(batch_size)
+        alpha_columns = [zero]
+        for end in range(1, seq_len + 1):
+            max_length = min(self.max_span_length, end)
+            candidates = torch.stack([
+                alpha_columns[end - span_length]
+                + span_scores[:, end - span_length, span_length - 1]
+                for span_length in range(1, max_length + 1)
+            ], dim=1)
+            active = end <= lengths
+            safe_candidates = torch.where(
+                active.unsqueeze(1),
+                candidates,
+                torch.zeros_like(candidates),
+            )
+            value = torch.logsumexp(safe_candidates, dim=1)
+            alpha_columns.append(
+                torch.where(active, value, value.new_full((), float("-inf")))
+            )
+        alpha = torch.stack(alpha_columns, dim=1)
+
+        beta_columns: list[torch.Tensor | None] = [None] * (seq_len + 1)
+        beta_columns[seq_len] = zero
+        for start in range(seq_len - 1, -1, -1):
+            max_length = min(self.max_span_length, seq_len - start)
+            candidates = torch.stack([
+                span_scores[:, start, span_length - 1]
+                + beta_columns[start + span_length]
+                for span_length in range(1, max_length + 1)
+            ], dim=1)
+            active = start < lengths
+            safe_candidates = torch.where(
+                active.unsqueeze(1),
+                candidates,
+                torch.zeros_like(candidates),
+            )
+            value = torch.logsumexp(safe_candidates, dim=1)
+            beta_columns[start] = torch.where(
+                start < lengths,
+                value,
+                torch.where(start == lengths, zero, value.new_full((), float("-inf"))),
+            )
+        beta = torch.stack([column for column in beta_columns], dim=1)
+        log_partition = alpha.gather(1, lengths[:, None]).squeeze(1)
+        return alpha, beta, log_partition
+
+    def _boundary_marginals(
+        self,
+        span_scores: torch.Tensor,
+        lengths: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        log_partition: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = span_scores.shape
+        probabilities = span_scores.new_zeros(batch_size, seq_len)
+        for end in range(1, seq_len + 1):
+            max_length = min(self.max_span_length, end)
+            log_marginals = torch.stack([
+                alpha[:, end - span_length]
+                + span_scores[:, end - span_length, span_length - 1]
+                + beta[:, end]
+                - log_partition
+                for span_length in range(1, max_length + 1)
+            ], dim=1)
+            active = end <= lengths
+            safe_log_marginals = torch.where(
+                active.unsqueeze(1),
+                log_marginals,
+                torch.zeros_like(log_marginals),
+            )
+            probability = torch.exp(
+                torch.logsumexp(safe_log_marginals, dim=1)
+            )
+            probabilities[:, end - 1] = torch.where(
+                active,
+                probability,
+                torch.zeros_like(probability),
+            )
+        final_positions = (lengths - 1).clamp_min(0)
+        final_mask = F.one_hot(
+            final_positions,
+            num_classes=seq_len,
+        ).to(dtype=torch.bool)
+        return torch.where(
+            final_mask,
+            torch.ones_like(probabilities),
+            probabilities.clamp(0.0, 1.0),
+        )
+
+    def _viterbi(
+        self,
+        span_scores: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = span_scores.shape
+        zero = span_scores.new_zeros(batch_size)
+        delta_columns = [zero]
+        back_lengths = torch.zeros(
+            batch_size,
+            seq_len + 1,
+            device=span_scores.device,
+            dtype=torch.long,
+        )
+        for end in range(1, seq_len + 1):
+            max_length = min(self.max_span_length, end)
+            candidates = torch.stack([
+                delta_columns[end - span_length]
+                + span_scores[:, end - span_length, span_length - 1]
+                for span_length in range(1, max_length + 1)
+            ], dim=1)
+            value, choice = candidates.max(dim=1)
+            delta_columns.append(
+                torch.where(end <= lengths, value, value.new_full((), float("-inf")))
+            )
+            back_lengths[:, end] = choice + 1
+
+        hard_boundaries = torch.zeros(
+            batch_size,
+            seq_len,
+            device=span_scores.device,
+            dtype=torch.bool,
+        )
+        current = lengths.clone()
+        for _ in range(seq_len):
+            active = current > 0
+            boundary_positions = (current - 1).clamp_min(0)
+            hard_boundaries = hard_boundaries | (
+                F.one_hot(boundary_positions, num_classes=seq_len).bool()
+                & active.unsqueeze(1)
+            )
+            chosen_lengths = back_lengths.gather(1, current[:, None]).squeeze(1)
+            current = torch.where(active, current - chosen_lengths, current)
+        return hard_boundaries
+
+    @staticmethod
+    def _soft_assignment(
+        boundary_probabilities: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, seq_len = boundary_probabilities.shape
+        next_valid = F.pad(valid_mask[:, 1:], (0, 1), value=False)
+        candidate_mask = valid_mask & next_valid
+        state = boundary_probabilities.new_zeros(batch_size, seq_len)
+        state[:, 0] = 1.0
+        rows = []
+        for position in range(seq_len):
+            rows.append(state)
+            probability = (
+                boundary_probabilities[:, position]
+                * candidate_mask[:, position]
+            ).unsqueeze(1)
+            shifted = F.pad(state[:, :-1], (1, 0))
+            state = state * (1.0 - probability) + shifted * probability
+        return torch.stack(rows, dim=1) * valid_mask.unsqueeze(-1)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        batch_size, seq_len, _ = hidden.shape
+        lengths = valid_mask.sum(dim=1).long()
+        span_scores = self.scorer(hidden, valid_mask)
+        alpha, beta, log_partition = self._forward_backward(
+            span_scores,
+            lengths,
+        )
+        probabilities = self._boundary_marginals(
+            span_scores,
+            lengths,
+            alpha,
+            beta,
+            log_partition,
+        )
+        hard_boundaries = self._viterbi(span_scores, lengths)
+        segment_ids = (
+            hard_boundaries.long().cumsum(dim=1) - hard_boundaries.long()
+        )
+        hard_assignment = F.one_hot(
+            segment_ids.clamp(min=0, max=seq_len - 1),
+            num_classes=seq_len,
+        ).to(dtype=hidden.dtype)
+        hard_assignment = hard_assignment * valid_mask.unsqueeze(-1)
+        soft_assignment = self._soft_assignment(probabilities, valid_mask)
+        assignment = soft_assignment + (
+            hard_assignment - soft_assignment
+        ).detach()
+        counts = assignment.sum(dim=1)
+        soft_proxy = torch.einsum("btk,btd->bkd", assignment, hidden)
+        soft_proxy = soft_proxy / counts.clamp_min(1e-6).unsqueeze(-1)
+
+        chunk_counts = hard_boundaries.sum(dim=1)
+        chunk_mask = (
+            torch.arange(seq_len, device=hidden.device).unsqueeze(0)
+            < chunk_counts.unsqueeze(1)
+        )
+        soft_chunk_counts = probabilities.sum(dim=1)
+        soft_ratio = lengths.to(hidden.dtype) / soft_chunk_counts.clamp_min(1.0)
+        hard_ratio = lengths.to(hidden.dtype) / chunk_counts.clamp_min(1)
+        candidate_mask = valid_mask & F.pad(
+            valid_mask[:, 1:],
+            (0, 1),
+            value=False,
+        )
+        logits = torch.logit(probabilities.clamp(1e-6, 1.0 - 1e-6))
+        candidate_logits = logits[candidate_mask]
+        logit_l2 = (
+            candidate_logits.square().mean()
+            if candidate_logits.numel()
+            else logits.sum() * 0.0
+        )
+        return {
+            "pooled": soft_proxy,
+            "hard_assignment": hard_assignment,
+            "soft_assignment": soft_assignment,
+            "chunk_mask": chunk_mask,
+            "chunk_counts": chunk_counts,
+            "hard_boundaries": hard_boundaries,
+            "segment_ids": segment_ids,
+            "gate_logits": logits * valid_mask,
+            "gate_probabilities": probabilities * valid_mask,
+            "soft_chunk_counts": soft_chunk_counts,
+            "soft_tokens_per_chunk": soft_ratio,
+            "hard_tokens_per_chunk": hard_ratio,
+            "gate_logit_l2": logit_l2,
+            "semi_markov_log_partition": log_partition,
+        }
+
+
+class SegmentContentEncoder(nn.Module):
+    """Encode selected spans bidirectionally without cross-span information."""
+
+    def __init__(self, config: SegmentalVQVAEConfig):
+        super().__init__()
+        self.max_span_length = config.max_span_length
+        self.local_position_embedding = nn.Embedding(
+            config.max_span_length,
+            config.d_model,
+        )
+        self.layers = nn.ModuleList(
+            MaskedBidirectionalBlock(config)
+            for _ in range(config.span_encoder_layers)
+        )
+        self.output_norm = nn.LayerNorm(config.d_model)
+        self.pooling_head = nn.Linear(config.d_model, 1)
+
+    @staticmethod
+    def local_positions(
+        segment_ids: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        positions = torch.arange(
+            segment_ids.shape[1],
+            device=segment_ids.device,
+        ).unsqueeze(0).expand_as(segment_ids)
+        starts = torch.zeros_like(valid_mask)
+        starts[:, 0] = valid_mask[:, 0]
+        starts[:, 1:] = (
+            valid_mask[:, 1:]
+            & (segment_ids[:, 1:] != segment_ids[:, :-1])
+        )
+        start_positions = torch.where(
+            starts,
+            positions,
+            torch.zeros_like(positions),
+        ).cummax(dim=1).values
+        return torch.where(
+            valid_mask,
+            positions - start_positions,
+            torch.zeros_like(positions),
+        )
+
+    def forward(
+        self,
+        token_embeddings: torch.Tensor,
+        segment_ids: torch.Tensor,
+        valid_mask: torch.Tensor,
+        hard_assignment: torch.Tensor,
+    ) -> torch.Tensor:
+        local_positions = self.local_positions(segment_ids, valid_mask)
+        hidden = token_embeddings + self.local_position_embedding(
+            local_positions.clamp_max(self.local_position_embedding.num_embeddings - 1)
+        )
+        radius = self.max_span_length - 1
+        valid_windows = F.pad(
+            valid_mask,
+            (radius, radius),
+            value=False,
+        ).unfold(1, 2 * radius + 1, 1)
+        segment_windows = F.pad(
+            segment_ids,
+            (radius, radius),
+            value=-1,
+        ).unfold(1, 2 * radius + 1, 1)
+        allowed = (
+            valid_mask.unsqueeze(-1)
+            & valid_windows
+            & (segment_ids.unsqueeze(-1) == segment_windows)
+        )
+        for layer in self.layers:
+            hidden = layer(
+                hidden,
+                allowed,
+                local_positions,
+                ~valid_mask,
+            )
+        hidden = zero_padded_positions(self.output_norm(hidden), ~valid_mask)
+        logits = self.pooling_head(hidden).squeeze(-1)
+        stabilized = torch.exp(logits - logits.max(dim=1, keepdim=True).values)
+        weights = stabilized.unsqueeze(-1) * hard_assignment
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        return torch.einsum("btk,btd->bkd", weights, hidden)
+
+
 class CausalRotarySelfAttention(nn.Module):
     """RoPE self-attention with full-sequence and cached incremental paths."""
 
@@ -562,12 +1190,30 @@ class SegmentalVQVAE(nn.Module):
             config.d_model,
             padding_idx=config.pad_token_id,
         )
-        self.encoder_layers = nn.ModuleList(
-            RotaryResidualBlock(config) for _ in range(config.encoder_layers)
-        )
-        self.encoder_norm = nn.LayerNorm(config.d_model)
-        self.gater = BoundaryGater(config)
-        self.segment_pooler = SegmentPooler(config.gate_threshold)
+        if config.segmentation_mode == "semi_markov":
+            self.encoder_layers = None
+            self.encoder_norm = None
+            self.gater = None
+            self.segment_pooler = None
+            self.boundary_encoder: LocalBoundaryEncoder | None = (
+                LocalBoundaryEncoder(config)
+            )
+            self.semi_markov_segmenter: SemiMarkovSegmenter | None = (
+                SemiMarkovSegmenter(config)
+            )
+            self.span_content_encoder: SegmentContentEncoder | None = (
+                SegmentContentEncoder(config)
+            )
+        else:
+            self.encoder_layers = nn.ModuleList(
+                RotaryResidualBlock(config) for _ in range(config.encoder_layers)
+            )
+            self.encoder_norm = nn.LayerNorm(config.d_model)
+            self.gater = BoundaryGater(config)
+            self.segment_pooler = SegmentPooler(config.gate_threshold)
+            self.boundary_encoder = None
+            self.semi_markov_segmenter = None
+            self.span_content_encoder = None
         self.latent_projection = nn.Linear(config.d_model, config.latent_dim)
         self.collapse_config = CollapseControlConfig(
             use_ema_codebook=True,
@@ -610,19 +1256,45 @@ class SegmentalVQVAE(nn.Module):
         if not valid_mask.any(dim=1).all():
             raise ValueError("Every sequence must contain at least one valid BPE token.")
 
-        hidden = self.token_embedding(input_ids)
-        for layer in self.encoder_layers:
-            hidden = layer(hidden, padding_mask=~valid_mask)
+        token_embeddings = self.token_embedding(input_ids)
+        if self.config.segmentation_mode == "semi_markov":
+            assert self.boundary_encoder is not None
+            assert self.semi_markov_segmenter is not None
+            assert self.span_content_encoder is not None
+            boundary_hidden = self.boundary_encoder(token_embeddings, valid_mask)
+            segmented = self.semi_markov_segmenter(
+                boundary_hidden,
+                valid_mask,
+            )
+            hard_pooled = self.span_content_encoder(
+                token_embeddings,
+                segmented["segment_ids"],
+                valid_mask,
+                segmented["hard_assignment"],
+            )
+            soft_proxy = segmented["pooled"]
+            pooled = hard_pooled + (soft_proxy - soft_proxy.detach())
+            segmented = {**segmented, "pooled": pooled}
+        else:
+            assert self.encoder_layers is not None
+            assert self.encoder_norm is not None
+            assert self.gater is not None
+            assert self.segment_pooler is not None
+            hidden = token_embeddings
+            for layer in self.encoder_layers:
+                hidden = layer(hidden, padding_mask=~valid_mask)
+                hidden = zero_padded_positions(hidden, ~valid_mask)
+            hidden = self.encoder_norm(hidden)
             hidden = zero_padded_positions(hidden, ~valid_mask)
-        hidden = self.encoder_norm(hidden)
-        hidden = zero_padded_positions(hidden, ~valid_mask)
-        gate_logits = self.gater(hidden, valid_mask)
-        segmented = self.segment_pooler(
-            hidden,
-            gate_logits,
-            valid_mask,
-            sample_gates=self.training if sample_gates is None else sample_gates,
-        )
+            gate_logits = self.gater(hidden, valid_mask)
+            segmented = self.segment_pooler(
+                hidden,
+                gate_logits,
+                valid_mask,
+                sample_gates=(
+                    self.training if sample_gates is None else sample_gates
+                ),
+            )
         latents = self.latent_projection(segmented["pooled"])
         latents = torch.where(
             segmented["chunk_mask"].unsqueeze(-1),
@@ -849,6 +1521,7 @@ class SegmentalVQVAE(nn.Module):
             None for _ in self.decoder.layers
         ]
         logits = []
+        raw_logits = []
         generated = []
         boundary_logits = []
         boundary_predictions = []
@@ -869,6 +1542,7 @@ class SegmentalVQVAE(nn.Module):
                 caches,
             )
             step_logits = self.output_head(hidden[:, 0])
+            raw_step_logits = step_logits
             if teacher_targets is None:
                 step_logits = step_logits.clone()
                 eos_blocked = pointers < last_pointers
@@ -896,6 +1570,7 @@ class SegmentalVQVAE(nn.Module):
             pointer_trace.append(pointers)
             local_position_trace.append(local_positions)
             logits.append(step_logits)
+            raw_logits.append(raw_step_logits)
             generated.append(emitted)
             boundary_logits.append(step_boundary_logits)
             boundary_predictions.append(predicted_boundary)
@@ -917,6 +1592,7 @@ class SegmentalVQVAE(nn.Module):
 
         return {
             "logits": torch.stack(logits, dim=1),
+            "raw_logits": torch.stack(raw_logits, dim=1),
             "generated": torch.stack(generated, dim=1),
             "boundary_logits": torch.stack(boundary_logits, dim=1),
             "boundary_predictions": torch.stack(boundary_predictions, dim=1),

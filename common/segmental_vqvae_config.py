@@ -13,6 +13,11 @@ LATENT_ROUTING_MODES = (
     "monotonic_pointer",
 )
 
+SEGMENTATION_MODES = (
+    "bernoulli",
+    "semi_markov",
+)
+
 
 @dataclass
 class SegmentalVQVAETrainConfig:
@@ -68,6 +73,11 @@ class SegmentalVQVAEConfig:
     encoder_layers: int = 4
     decoder_layers: int = 6
     latent_routing: str = "global_cross_attention"
+    segmentation_mode: str = "bernoulli"
+    boundary_encoder_layers: int = 4
+    boundary_window_radius: int = 16
+    max_span_length: int = 16
+    span_encoder_layers: int = 2
     ffn_mult: int = 4
     dropout: float = 0.1
     codebook_size: int = 8192
@@ -92,9 +102,19 @@ class SegmentalVQVAEConfig:
             raise ValueError("RoPE requires an even attention head dimension.")
         if self.encoder_layers < 1 or self.decoder_layers < 1:
             raise ValueError("Encoder and decoder depths must be positive.")
+        if self.boundary_encoder_layers < 1 or self.span_encoder_layers < 1:
+            raise ValueError("Boundary and span encoder depths must be positive.")
         if self.latent_routing not in LATENT_ROUTING_MODES:
             raise ValueError(
                 "latent_routing must be global_cross_attention or monotonic_pointer."
+            )
+        if self.segmentation_mode not in SEGMENTATION_MODES:
+            raise ValueError("segmentation_mode must be bernoulli or semi_markov.")
+        if self.boundary_window_radius < 1:
+            raise ValueError("boundary_window_radius must be positive.")
+        if not 1 <= self.max_span_length <= self.max_seq_len:
+            raise ValueError(
+                "max_span_length must be between one and max_seq_len."
             )
         if self.codebook_size < 2:
             raise ValueError("codebook_size must be at least two.")

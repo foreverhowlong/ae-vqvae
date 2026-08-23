@@ -17,6 +17,7 @@
       "encoder-layers": 4,
       "decoder-layers": 6,
       "latent-routing": "global_cross_attention",
+      "segmentation-mode": "bernoulli",
       "ffn-mult": 4,
       "codebook-size": 8192,
       "commitment-beta": 0.25,

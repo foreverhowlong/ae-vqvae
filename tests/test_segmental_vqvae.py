@@ -10,6 +10,9 @@ from common.segmental_vqvae_config import (
     SegmentalVQVAEDataConfig,
 )
 from models.segmental_vqvae import (
+    LocalBoundaryEncoder,
+    SemiMarkovSegmenter,
+    SegmentContentEncoder,
     SegmentPooler,
     SegmentalVQVAE,
     segmental_vqvae_losses,
@@ -41,6 +44,10 @@ def _config(**overrides) -> SegmentalVQVAEConfig:
         "n_heads": 4,
         "encoder_layers": 1,
         "decoder_layers": 1,
+        "boundary_encoder_layers": 1,
+        "boundary_window_radius": 2,
+        "max_span_length": 8,
+        "span_encoder_layers": 1,
         "ffn_mult": 2,
         "dropout": 0.0,
         "codebook_size": 16,
@@ -103,6 +110,145 @@ def test_warmup_forward_keeps_gate_losses_active_and_backpropagates():
     gradient = model.gater.mlp[-1].weight.grad
     assert gradient is not None
     assert torch.count_nonzero(gradient) > 0
+
+
+def test_semi_markov_segmentation_covers_sequence_with_bounded_spans():
+    torch.manual_seed(11)
+    model = SegmentalVQVAE(
+        _config(
+            segmentation_mode="semi_markov",
+            max_span_length=3,
+        )
+    )
+    batch = _batch()
+    outputs = model(
+        batch["input_ids"],
+        batch["attention_mask"],
+        use_quantizer=False,
+        sample_gates=False,
+    )
+
+    valid = batch["attention_mask"].bool()
+    assert torch.equal(outputs["hard_boundaries"].sum(dim=1), outputs["chunk_counts"])
+    for row, length in zip(outputs["segment_ids"], valid.sum(dim=1), strict=True):
+        segment_ids = row[:length]
+        assert segment_ids[0] == 0
+        assert torch.equal(
+            segment_ids.unique_consecutive(),
+            torch.arange(int(segment_ids[-1]) + 1),
+        )
+        assert int(torch.bincount(segment_ids).max()) <= 3
+    assert torch.allclose(
+        outputs["gate_probabilities"].gather(
+            1,
+            (valid.sum(dim=1) - 1).unsqueeze(1),
+        ),
+        torch.ones(valid.shape[0], 1),
+    )
+
+
+def test_semi_markov_forward_backward_matches_enumerated_partitions():
+    config = _config(
+        segmentation_mode="semi_markov",
+        max_seq_len=3,
+        max_span_length=2,
+    )
+    segmenter = SemiMarkovSegmenter(config)
+    span_scores = torch.tensor([[[0.0, 0.0], [0.0, 0.0], [0.0, -torch.inf]]])
+    lengths = torch.tensor([3])
+
+    alpha, beta, log_partition = segmenter._forward_backward(
+        span_scores,
+        lengths,
+    )
+    probabilities = segmenter._boundary_marginals(
+        span_scores,
+        lengths,
+        alpha,
+        beta,
+        log_partition,
+    )
+
+    assert math.isclose(float(log_partition), math.log(3.0), rel_tol=1e-6)
+    torch.testing.assert_close(
+        probabilities,
+        torch.tensor([[2.0 / 3.0, 2.0 / 3.0, 1.0]]),
+    )
+
+
+def test_semi_markov_reconstruction_gradient_reaches_span_scorer():
+    torch.manual_seed(13)
+    model = SegmentalVQVAE(
+        _config(
+            segmentation_mode="semi_markov",
+            max_span_length=4,
+        )
+    )
+    batch = _batch()
+    outputs = model(
+        batch["input_ids"],
+        batch["attention_mask"],
+        use_quantizer=False,
+        sample_gates=False,
+    )
+    losses = segmental_vqvae_losses(
+        outputs,
+        batch["input_ids"],
+        batch["attention_mask"],
+        model.config,
+    )
+    losses["loss"].backward()
+
+    assert model.semi_markov_segmenter is not None
+    gradient = model.semi_markov_segmenter.scorer.mlp[-1].weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) > 0
+
+
+def test_local_boundary_encoder_cannot_read_beyond_its_receptive_field():
+    torch.manual_seed(17)
+    config = _config(
+        segmentation_mode="semi_markov",
+        boundary_encoder_layers=1,
+        boundary_window_radius=1,
+    )
+    embedding = torch.nn.Embedding(config.vocab_size, config.d_model)
+    encoder = LocalBoundaryEncoder(config).eval()
+    first = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 2]])
+    second = first.clone()
+    second[:, -1] = 10
+    valid = torch.ones_like(first, dtype=torch.bool)
+
+    first_hidden = encoder(embedding(first), valid)
+    second_hidden = encoder(embedding(second), valid)
+
+    torch.testing.assert_close(first_hidden[:, :-2], second_hidden[:, :-2])
+
+
+def test_span_content_encoder_does_not_mix_selected_spans():
+    torch.manual_seed(19)
+    config = _config(
+        segmentation_mode="semi_markov",
+        max_span_length=5,
+    )
+    embedding = torch.nn.Embedding(config.vocab_size, config.d_model)
+    encoder = SegmentContentEncoder(config).eval()
+    first = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 2]])
+    second = first.clone()
+    second[:, -1] = 10
+    valid = torch.ones_like(first, dtype=torch.bool)
+    segment_ids = torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1]])
+    assignment = torch.nn.functional.one_hot(
+        segment_ids,
+        num_classes=first.shape[1],
+    ).float()
+
+    first_pooled = encoder(embedding(first), segment_ids, valid, assignment)
+    second_pooled = encoder(embedding(second), segment_ids, valid, assignment)
+
+    torch.testing.assert_close(first_pooled[:, 0], second_pooled[:, 0])
+    assert not torch.equal(first_pooled[:, 1], second_pooled[:, 1])
 
 
 def test_teacher_forced_decoder_is_causal():
@@ -307,6 +453,32 @@ def test_monotonic_free_running_reports_pointer_health():
     assert 0.0 <= metrics["free_running_code_consumption_at_eos"] <= 1.0
     assert 0.0 <= metrics["premature_code_exhaustion_fraction"] <= 1.0
     assert math.isfinite(metrics["predicted_pointer_gap_bits_per_bpe"])
+    assert math.isfinite(metrics["free_running_ce_nats_per_bpe"])
+
+
+def test_monotonic_free_running_keeps_unmasked_logits_for_ce():
+    model = SegmentalVQVAE(
+        _config(latent_routing="monotonic_pointer")
+    ).eval()
+    assert model.boundary_head is not None
+    for parameter in model.boundary_head.parameters():
+        parameter.data.zero_()
+    model.boundary_head.mlp[-1].bias.data.fill_(-10.0)
+    latents = torch.randn(1, 2, model.config.latent_dim)
+    latent_mask = torch.ones(1, 2, dtype=torch.bool)
+
+    details = model.free_running(
+        latents,
+        latent_mask,
+        max_length=4,
+        return_details=True,
+    )
+
+    assert torch.isfinite(details["raw_logits"]).all()
+    assert torch.all(
+        details["logits"][:, :, model.config.eos_token_id]
+        < details["raw_logits"][:, :, model.config.eos_token_id]
+    )
 
 
 def test_research_defaults_match_the_confirmed_architecture():
@@ -323,6 +495,7 @@ def test_research_defaults_match_the_confirmed_architecture():
     assert config.gate_logit_l2_weight == 1e-4
     assert data_config.continuous_truncation is False
     assert config.latent_routing == "global_cross_attention"
+    assert config.segmentation_mode == "bernoulli"
     assert config.decoder_boundary_loss_weight == 1.0
 
 
@@ -346,6 +519,31 @@ def test_monotonic_experiment_config_is_paired_with_comparable_global_decoder():
         if monotonic[key] != global_decoder[key]
     }
     assert differing_keys == {"ablation", "latent-routing"}
+
+
+def test_semi_markov_experiment_is_paired_with_bernoulli_control():
+    config_path = (
+        Path(__file__).parents[1]
+        / "configs"
+        / "segmental-vqvae-bpe-k8192-semimarkov.json"
+    )
+    experiments = json.loads(config_path.read_text())["experiments"]
+    assert len(experiments) == 2
+    semi_markov, bernoulli = experiments
+    assert semi_markov["continuous-truncation"] is False
+    assert bernoulli["continuous-truncation"] is False
+    assert semi_markov["latent-routing"] == "global_cross_attention"
+    assert bernoulli["latent-routing"] == "global_cross_attention"
+    assert semi_markov["encoder-layers"] == 6
+    assert bernoulli["encoder-layers"] == 6
+    assert semi_markov["segmentation-mode"] == "semi_markov"
+    assert bernoulli["segmentation-mode"] == "bernoulli"
+    differing_keys = {
+        key
+        for key in semi_markov
+        if semi_markov[key] != bernoulli[key]
+    }
+    assert differing_keys == {"ablation", "segmentation-mode"}
 
 
 def test_metrics_first_checkpoints_overwrite_and_drop_resume_state():

@@ -16,6 +16,7 @@ from torch.utils.data import Subset
 from common import ROOT, enable_tf32, get_device
 from common.segmental_vqvae_config import (
     LATENT_ROUTING_MODES,
+    SEGMENTATION_MODES,
     SegmentalVQVAEConfig,
     SegmentalVQVAEDataConfig,
     SegmentalVQVAETrainConfig,
@@ -80,6 +81,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         ("n-heads", int),
         ("encoder-layers", int),
         ("decoder-layers", int),
+        ("boundary-encoder-layers", int),
+        ("boundary-window-radius", int),
+        ("max-span-length", int),
+        ("span-encoder-layers", int),
         ("ffn-mult", int),
         ("dropout", float),
         ("codebook-size", int),
@@ -107,6 +112,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--latent-routing",
         choices=LATENT_ROUTING_MODES,
+    )
+    parser.add_argument(
+        "--segmentation-mode",
+        choices=SEGMENTATION_MODES,
     )
     parser.add_argument(
         "--continuous-truncation",
@@ -575,7 +584,7 @@ def evaluate_free_running(
             max_length=batch["input_ids"].shape[1],
             return_details=True,
         )
-        free_logits = free_details["logits"]
+        free_logits = free_details.get("raw_logits", free_details["logits"])
         generated = free_details["generated"]
         valid = batch["attention_mask"].bool()
         teacher_ce = _masked_ce(outputs["logits"], batch["input_ids"], valid)
@@ -862,13 +871,21 @@ def main() -> None:
         f"[Params] {payload['parameter_count']:,}"
     )
     print(
-        "[Architecture] BPE -> RoPE encoder -> Bernoulli segments -> "
+        f"[Architecture] BPE -> {model_cfg.segmentation_mode} segmentation -> "
         f"EMA VQ -> {model_cfg.latent_routing} AR decoder"
     )
     print(
         f"[Rate target] {model_cfg.compression_target:.2f} BPE/chunk "
         f"with K={model_cfg.codebook_size}"
     )
+    if model_cfg.segmentation_mode == "semi_markov":
+        print(
+            "[Semi-Markov] "
+            f"boundary_layers={model_cfg.boundary_encoder_layers} "
+            f"receptive_radius={model_cfg.boundary_window_radius} "
+            f"max_span={model_cfg.max_span_length} "
+            f"span_layers={model_cfg.span_encoder_layers}"
+        )
 
     with wandb_run(
         run_name,
@@ -879,6 +896,7 @@ def main() -> None:
             "segmental",
             "vqvae",
             "autoregressive",
+            model_cfg.segmentation_mode,
             model_cfg.latent_routing,
         ],
         config=payload,
