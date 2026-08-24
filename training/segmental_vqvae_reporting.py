@@ -165,6 +165,12 @@ def build_segmentation_snapshot(
     probabilities = outputs["gate_probabilities"].detach().cpu()
     boundaries = outputs["hard_boundaries"].detach().cpu().bool()
     segment_ids = outputs["segment_ids"].detach().cpu()
+    pruning_marker = outputs.get("token_pruning_active")
+    token_pruning_active = (
+        bool(pruning_marker.detach().cpu().item())
+        if isinstance(pruning_marker, torch.Tensor)
+        else bool(pruning_marker)
+    )
     decoder_boundary_logits = outputs.get("decoder_boundary_logits")
     if isinstance(decoder_boundary_logits, torch.Tensor):
         decoder_probabilities = torch.sigmoid(
@@ -181,6 +187,8 @@ def build_segmentation_snapshot(
     all_chunk_lengths: list[int] = []
     hard_candidate_boundaries = 0
     candidate_count = 0
+    total_valid_tokens = 0
+    total_kept_codes = 0
     position_candidate_counts = [0] * position_bin_count
     position_hard_boundary_counts = [0] * position_bin_count
     position_soft_boundary_sums = [0.0] * position_bin_count
@@ -190,6 +198,7 @@ def build_segmentation_snapshot(
     examples = []
     for row_index in range(ids.shape[0]):
         length = int(valid[row_index].sum())
+        total_valid_tokens += length
         candidate_length = max(length - 1, 0)
         row_probabilities = probabilities[row_index, :candidate_length].tolist()
         row_boundaries = boundaries[row_index, :length].tolist()
@@ -204,6 +213,7 @@ def build_segmentation_snapshot(
                 ].tolist()
             )
         hard_candidate_boundaries += sum(row_boundaries[:candidate_length])
+        total_kept_codes += sum(row_boundaries)
         candidate_count += candidate_length
         for position in range(candidate_length):
             normalized_position = (position + 0.5) / candidate_length
@@ -284,6 +294,32 @@ def build_segmentation_snapshot(
     memoryless_singleton_baseline = (
         1.0 / mean_chunk_length if mean_chunk_length > 0.0 else 0.0
     )
+    early_bins = max(position_bin_count // 4, 1)
+    late_start = max(position_bin_count - early_bins, 0)
+
+    def _weighted_rate(
+        rates: list[float | None],
+        counts: list[int],
+        start: int,
+        stop: int,
+    ) -> float:
+        selected = [
+            (rate, count)
+            for rate, count in zip(
+                rates[start:stop],
+                counts[start:stop],
+                strict=True,
+            )
+            if rate is not None and count > 0
+        ]
+        denominator = sum(count for _, count in selected)
+        return (
+            sum(float(rate) * count for rate, count in selected) / denominator
+            if denominator
+            else 0.0
+        )
+
+    longest_drop_run = max(all_chunk_lengths, default=1) - 1
     if decoder_probabilities is not None:
         decoder_hard_boundary_rate_by_position = [
             hard_count / count if count else None
@@ -323,6 +359,7 @@ def build_segmentation_snapshot(
         decoder_bpd_hard = None
         decoder_bpd_soft = None
     return {
+        "selection_kind": "keep" if token_pruning_active else "boundary",
         "examples": examples,
         "gate_probabilities": all_probabilities,
         "chunk_lengths": all_chunk_lengths,
@@ -335,6 +372,11 @@ def build_segmentation_snapshot(
             else 0.0
         ),
         "boundary_fraction": hard_boundary_rate,
+        "keep_fraction": (
+            total_kept_codes / total_valid_tokens
+            if token_pruning_active and total_valid_tokens
+            else None
+        ),
         "position_bin_centers": [
             (index + 0.5) / position_bin_count
             for index in range(position_bin_count)
@@ -352,6 +394,64 @@ def build_segmentation_snapshot(
             position_candidate_counts,
             soft_boundary_rate,
         ),
+        "keep_position_dependence_hard": (
+            _position_dependence_score(
+                hard_boundary_rate_by_position,
+                position_candidate_counts,
+                hard_boundary_rate,
+            )
+            if token_pruning_active
+            else None
+        ),
+        "keep_position_dependence_soft": (
+            _position_dependence_score(
+                soft_boundary_rate_by_position,
+                position_candidate_counts,
+                soft_boundary_rate,
+            )
+            if token_pruning_active
+            else None
+        ),
+        "early_keep_rate_hard": (
+            _weighted_rate(
+                hard_boundary_rate_by_position,
+                position_candidate_counts,
+                0,
+                early_bins,
+            )
+            if token_pruning_active
+            else None
+        ),
+        "late_keep_rate_hard": (
+            _weighted_rate(
+                hard_boundary_rate_by_position,
+                position_candidate_counts,
+                late_start,
+                position_bin_count,
+            )
+            if token_pruning_active
+            else None
+        ),
+        "early_keep_rate_soft": (
+            _weighted_rate(
+                soft_boundary_rate_by_position,
+                position_candidate_counts,
+                0,
+                early_bins,
+            )
+            if token_pruning_active
+            else None
+        ),
+        "late_keep_rate_soft": (
+            _weighted_rate(
+                soft_boundary_rate_by_position,
+                position_candidate_counts,
+                late_start,
+                position_bin_count,
+            )
+            if token_pruning_active
+            else None
+        ),
         "decoder_hard_boundary_rate_by_position": (
             decoder_hard_boundary_rate_by_position
         ),
@@ -361,6 +461,10 @@ def build_segmentation_snapshot(
         "decoder_boundary_position_dependence_hard": decoder_bpd_hard,
         "decoder_boundary_position_dependence_soft": decoder_bpd_soft,
         "singleton_chunk_fraction": singleton_chunk_fraction,
+        "consecutive_keep_fraction": (
+            singleton_chunk_fraction if token_pruning_active else None
+        ),
+        "longest_drop_run": longest_drop_run if token_pruning_active else None,
         "excess_singleton_fraction": (
             singleton_chunk_fraction - memoryless_singleton_baseline
         ),
@@ -369,6 +473,16 @@ def build_segmentation_snapshot(
         ),
         "chunk_length_p90": (
             float(torch.quantile(length_tensor, 0.9)) if length_tensor.numel() else 0.0
+        ),
+        "keep_gap_p50": (
+            float(torch.quantile(length_tensor, 0.5))
+            if token_pruning_active and length_tensor.numel()
+            else None
+        ),
+        "keep_gap_p90": (
+            float(torch.quantile(length_tensor, 0.9))
+            if token_pruning_active and length_tensor.numel()
+            else None
         ),
     }
 
@@ -419,6 +533,7 @@ def plot_segmental_metrics(
     intervention_rows = [
         row for row in rows if row.get("split") == "latent_intervention"
     ]
+    is_pruning_run = any("keep_fraction" in row for row in intervention_rows)
     free_rows = [row for row in rows if row.get("split") == "free_running"]
     transition_rows = [row for row in rows if row.get("split") == "phase_transition"]
     transition_step = transition_rows[0]["step"] if transition_rows else None
@@ -481,7 +596,15 @@ def plot_segmental_metrics(
         linestyle=":",
         label=f"target {compression_target:g}",
     )
-    axes[0, 2].set(title="Compression ratio", xlabel="step", ylabel="BPE tokens / chunk")
+    axes[0, 2].set(
+        title="Compression ratio",
+        xlabel="step",
+        ylabel=(
+            "BPE tokens / kept code"
+            if is_pruning_run
+            else "BPE tokens / chunk"
+        ),
+    )
 
     rd_rows = [
         row for row in eval_rows
@@ -615,17 +738,27 @@ def plot_segmental_metrics(
     if segmentation_health_rows:
         steps = [row["step"] for row in segmentation_health_rows]
         fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
-        axes[0].plot(
-            steps,
-            [row["boundary_position_dependence_hard"] for row in segmentation_health_rows],
-            marker="o",
-            label="hard BPD",
+        hard_key = (
+            "keep_position_dependence_hard"
+            if is_pruning_run
+            else "boundary_position_dependence_hard"
+        )
+        soft_key = (
+            "keep_position_dependence_soft"
+            if is_pruning_run
+            else "boundary_position_dependence_soft"
         )
         axes[0].plot(
             steps,
-            [row["boundary_position_dependence_soft"] for row in segmentation_health_rows],
+            [row[hard_key] for row in segmentation_health_rows],
+            marker="o",
+            label="hard KPD" if is_pruning_run else "hard BPD",
+        )
+        axes[0].plot(
+            steps,
+            [row[soft_key] for row in segmentation_health_rows],
             marker=".",
-            label="soft BPD",
+            label="soft KPD" if is_pruning_run else "soft BPD",
         )
         decoder_bpd_rows = [
             row
@@ -656,38 +789,79 @@ def plot_segmental_metrics(
                 label="decoder soft BPD",
             )
         axes[0].set(
-            title="Boundary-position dependence",
+            title=(
+                "Keep-position dependence"
+                if is_pruning_run
+                else "Boundary-position dependence"
+            ),
             xlabel="step",
-            ylabel="position-explained boundary variance",
+            ylabel=(
+                "position-explained keep variance"
+                if is_pruning_run
+                else "position-explained boundary variance"
+            ),
             ylim=(-0.02, 1.02),
         )
 
-        singleton_rows = [
-            row
-            for row in segmentation_health_rows
-            if "singleton_chunk_fraction" in row
-            and "excess_singleton_fraction" in row
-        ]
-        if singleton_rows:
-            singleton_steps = [row["step"] for row in singleton_rows]
+        if is_pruning_run:
+            pruning_rows = [
+                row
+                for row in segmentation_health_rows
+                if "keep_gap_p50" in row
+                and "keep_gap_p90" in row
+                and "longest_drop_run" in row
+            ]
+            pruning_steps = [row["step"] for row in pruning_rows]
             axes[1].plot(
-                singleton_steps,
-                [row["singleton_chunk_fraction"] for row in singleton_rows],
+                pruning_steps,
+                [row["keep_gap_p50"] for row in pruning_rows],
                 marker="o",
-                label="singleton chunks",
+                label="keep gap p50",
             )
             axes[1].plot(
-                singleton_steps,
-                [row["excess_singleton_fraction"] for row in singleton_rows],
+                pruning_steps,
+                [row["keep_gap_p90"] for row in pruning_rows],
                 marker=".",
-                label="excess vs geometric",
+                label="keep gap p90",
             )
-        axes[1].axhline(0.0, color="0.3", linestyle=":")
-        axes[1].set(
-            title="Singleton-chunk concentration",
-            xlabel="step",
-            ylabel="fraction",
-        )
+            axes[1].plot(
+                pruning_steps,
+                [row["longest_drop_run"] for row in pruning_rows],
+                marker="x",
+                label="longest drop run",
+            )
+            axes[1].set(
+                title="Keep-gap concentration",
+                xlabel="step",
+                ylabel="BPE tokens",
+            )
+        else:
+            singleton_rows = [
+                row
+                for row in segmentation_health_rows
+                if "singleton_chunk_fraction" in row
+                and "excess_singleton_fraction" in row
+            ]
+            if singleton_rows:
+                singleton_steps = [row["step"] for row in singleton_rows]
+                axes[1].plot(
+                    singleton_steps,
+                    [row["singleton_chunk_fraction"] for row in singleton_rows],
+                    marker="o",
+                    label="singleton chunks",
+                )
+                axes[1].plot(
+                    singleton_steps,
+                    [row["excess_singleton_fraction"] for row in singleton_rows],
+                    marker=".",
+                    label="excess vs geometric",
+                )
+            axes[1].axhline(0.0, color="0.3", linestyle=":")
+            axes[1].set(
+                title="Singleton-chunk concentration",
+                xlabel="step",
+                ylabel="fraction",
+            )
         for axis in axes:
             if transition_step is not None:
                 axis.axvline(transition_step, color="0.5", linestyle=":")
@@ -860,13 +1034,16 @@ def write_segmentation_visualization(
         ],
         figsize=(18, 8),
     )
+    is_pruning = snapshot.get("selection_kind") == "keep"
+    decision_name = "keep" if is_pruning else "boundary"
+    interval_name = "kept-code gap" if is_pruning else "chunk"
     probabilities = snapshot["gate_probabilities"]
     if probabilities:
         axes["gate"].hist(probabilities, bins=30, range=(0.0, 1.0))
     axes["gate"].axvline(0.5, color="0.3", linestyle=":", label="hard threshold")
     axes["gate"].set(
         title="Gate probability distribution",
-        xlabel="boundary probability",
+        xlabel=f"{decision_name} probability",
         ylabel="candidate token positions",
     )
 
@@ -885,7 +1062,11 @@ def write_segmentation_visualization(
         linestyle=":",
         label=f"target mean {compression_target:g}",
     )
-    axes["length"].set(title="Hard chunk lengths", xlabel="BPE tokens / chunk", ylabel="chunks")
+    axes["length"].set(
+        title=f"Hard {interval_name} lengths",
+        xlabel=f"BPE tokens / {interval_name}",
+        ylabel=f"{interval_name}s",
+    )
 
     position_centers = snapshot.get("position_bin_centers", [])
     for key, label, marker, linestyle in (
@@ -928,7 +1109,7 @@ def write_segmentation_visualization(
     )
     hard_bpd = snapshot.get("boundary_position_dependence_hard")
     soft_bpd = snapshot.get("boundary_position_dependence_soft")
-    bpd_title = "Boundary rate by normalized position"
+    bpd_title = f"{decision_name.capitalize()} rate by normalized position"
     if hard_bpd is not None and soft_bpd is not None:
         bpd_title += f"\nencoder BPD H/S={hard_bpd:.3f}/{soft_bpd:.3f}"
     decoder_hard_bpd = snapshot.get(
@@ -945,7 +1126,7 @@ def write_segmentation_visualization(
     axes["position"].set(
         title=bpd_title,
         xlabel="normalized token position",
-        ylabel="boundary rate",
+        ylabel=f"{decision_name} rate",
         xlim=(0.0, 1.0),
         ylim=(-0.03, 1.03),
     )
@@ -967,7 +1148,12 @@ def write_segmentation_visualization(
                 alpha=0.65,
                 zorder=-2,
             )
-        axis.plot(positions, example["gate_probabilities"], marker=".", label="gate p")
+        axis.plot(
+            positions,
+            example["gate_probabilities"],
+            marker=".",
+            label=f"{decision_name} p",
+        )
         decoder_example_probabilities = example.get(
             "decoder_boundary_probabilities"
         )
@@ -988,16 +1174,19 @@ def write_segmentation_visualization(
             [1.02] * len(boundary_positions),
             marker="v",
             color="#C44E52",
-            label="hard boundary",
+            label=f"hard {decision_name}",
         )
         stride = max(math.ceil(token_count / 24), 1)
         ticks = positions[::stride]
         axis.set_xticks(ticks, [example["tokens"][index][:12] for index in ticks], rotation=60, ha="right", fontsize=7)
         axis.set_ylim(-0.03, 1.1)
         axis.set(
-            title=f"Fixed example {example_index + 1}: alternating colors are chunks",
+            title=(
+                f"Fixed example {example_index + 1}: alternating colors are "
+                f"{interval_name}s"
+            ),
             xlabel="BPE token",
-            ylabel="boundary probability",
+            ylabel=f"{decision_name} probability",
         )
 
     for axis in axes.values():

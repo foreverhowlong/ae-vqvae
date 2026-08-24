@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
 import torch
 
 from common.segmental_vqvae_config import (
@@ -15,6 +16,7 @@ from models.segmental_vqvae import (
     SegmentContentEncoder,
     SegmentPooler,
     SegmentalVQVAE,
+    TokenPruner,
     segmental_vqvae_losses,
 )
 from training.run_segmental_vqvae_experiment import (
@@ -84,6 +86,97 @@ def test_segment_pooler_makes_disjoint_contiguous_chunks_not_prefixes():
         torch.tensor([1.5, 3.5, 5.5]),
     )
     assert math.isclose(float(outputs["hard_tokens_per_chunk"]), 2.0)
+
+
+def test_token_pruner_packs_only_kept_latents_in_source_order():
+    pruner = TokenPruner(threshold=0.5)
+    latents = torch.arange(1, 6, dtype=torch.float32).view(1, 5, 1)
+    logits = torch.tensor([[-10.0, 10.0, -10.0, 10.0, -10.0]])
+    outputs = pruner(
+        latents,
+        logits,
+        torch.ones(1, 5, dtype=torch.bool),
+        sample_gates=False,
+    )
+
+    assert outputs["hard_boundaries"].tolist() == [
+        [False, True, False, True, True]
+    ]
+    assert outputs["chunk_counts"].tolist() == [3]
+    assert outputs["packed_source_positions"][0, :3].tolist() == [1, 3, 4]
+    torch.testing.assert_close(
+        outputs["pooled"][0, :3, 0],
+        torch.tensor([2.0, 4.0, 5.0]),
+    )
+    assert torch.count_nonzero(outputs["pooled"][0, 3:]) == 0
+
+
+def test_token_pruning_forces_final_code_and_quantizes_only_packed_slots():
+    model = SegmentalVQVAE(_config(segmentation_mode="token_pruning")).eval()
+    assert model.gater is not None
+    for parameter in model.gater.parameters():
+        parameter.data.zero_()
+    model.gater.network[-1].bias.data.fill_(-10.0)
+
+    batch = _batch()
+    outputs = model(
+        batch["input_ids"],
+        batch["attention_mask"],
+        use_quantizer=True,
+        sample_gates=False,
+    )
+
+    expected_final = torch.tensor([3, 7])
+    assert outputs["chunk_counts"].tolist() == [1, 1]
+    assert outputs["packed_source_positions"][:, 0].tolist() == [3, 7]
+    assert torch.equal(
+        outputs["hard_boundaries"].gather(1, expected_final[:, None]),
+        torch.ones(2, 1, dtype=torch.bool),
+    )
+    assert torch.all(outputs["indices"][:, 0] >= 0)
+    assert torch.all(outputs["indices"][:, 1:] == -1)
+
+
+def test_token_pruning_gate_backpropagates_before_vq():
+    torch.manual_seed(5)
+    model = SegmentalVQVAE(
+        _config(
+            segmentation_mode="token_pruning",
+            compression_weight=0.0,
+            gate_logit_l2_weight=0.0,
+        )
+    )
+    batch = _batch()
+    outputs = model(
+        batch["input_ids"],
+        batch["attention_mask"],
+        use_quantizer=False,
+        sample_gates=False,
+    )
+    losses = segmental_vqvae_losses(
+        outputs,
+        batch["input_ids"],
+        batch["attention_mask"],
+        model.config,
+    )
+    losses["loss"].backward()
+
+    assert model.gater is not None
+    gradient = model.gater.network[-1].weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) > 0
+
+
+def test_token_pruning_rejects_monotonic_pointer_decoder():
+    with pytest.raises(
+        ValueError,
+        match="token_pruning requires global_cross_attention",
+    ):
+        _config(
+            segmentation_mode="token_pruning",
+            latent_routing="monotonic_pointer",
+        ).validate()
 
 
 def test_warmup_forward_keeps_gate_losses_active_and_backpropagates():
@@ -388,6 +481,55 @@ def test_interventions_are_length_matched_and_report_rate_aligned_gains():
         assert math.isfinite(metrics[key])
 
 
+def test_token_pruning_interventions_report_keep_and_gap_health():
+    model = SegmentalVQVAE(
+        _config(segmentation_mode="token_pruning")
+    ).eval()
+    metrics, snapshot = evaluate_interventions(
+        model,
+        _batch(),
+        torch.device("cpu"),
+        use_quantizer=True,
+        seed=59,
+    )
+
+    assert snapshot["selection_kind"] == "keep"
+    assert 0.0 < metrics["keep_fraction"] <= 1.0
+    assert 0.0 <= metrics["keep_position_dependence_hard"] <= 1.0
+    assert 0.0 <= metrics["keep_position_dependence_soft"] <= 1.0
+    assert 0.0 <= metrics["early_keep_rate_hard"] <= 1.0
+    assert 0.0 <= metrics["late_keep_rate_hard"] <= 1.0
+    assert metrics["longest_drop_run"] >= 0
+    assert metrics["keep_gap_p50"] >= 1.0
+    assert metrics["keep_gap_p90"] >= metrics["keep_gap_p50"]
+
+    with TemporaryDirectory() as temporary:
+        plot_dir = Path(temporary) / "plots"
+        write_segmentation_visualization(
+            snapshot,
+            plot_dir,
+            compression_target=model.config.compression_target,
+            run_name="token-pruning-test",
+        )
+        metrics_path = Path(temporary) / "metrics.jsonl"
+        metrics_path.write_text(
+            json.dumps({
+                "split": "latent_intervention",
+                "step": 1,
+                **metrics,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        plot_segmental_metrics(
+            metrics_path,
+            plot_dir,
+            compression_target=model.config.compression_target,
+            run_name="token-pruning-test",
+        )
+        assert (plot_dir / "segmentation_latest.png").is_file()
+        assert (plot_dir / "segmentation_health.png").is_file()
+
+
 def test_segmentation_snapshot_detects_position_determined_boundaries():
     token_count = 21
     input_ids = torch.arange(3, 3 + token_count).unsqueeze(0)
@@ -544,6 +686,20 @@ def test_semi_markov_experiment_is_paired_with_bernoulli_control():
         if semi_markov[key] != bernoulli[key]
     }
     assert differing_keys == {"ablation", "segmentation-mode"}
+
+
+def test_token_pruning_experiment_contains_only_the_pruning_run():
+    config_path = (
+        Path(__file__).parents[1]
+        / "configs"
+        / "segmental-vqvae-bpe-k8192-token-pruning.json"
+    )
+    experiments = json.loads(config_path.read_text())["experiments"]
+    assert len(experiments) == 1
+    token_pruning = experiments[0]
+    assert token_pruning["continuous-truncation"] is False
+    assert token_pruning["latent-routing"] == "global_cross_attention"
+    assert token_pruning["segmentation-mode"] == "token_pruning"
 
 
 def test_metrics_first_checkpoints_overwrite_and_drop_resume_state():

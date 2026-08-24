@@ -518,6 +518,26 @@ def evaluate_interventions(
             "chunk_length_p50": snapshot["chunk_length_p50"],
             "chunk_length_p90": snapshot["chunk_length_p90"],
         }
+        if model.config.segmentation_mode == "token_pruning":
+            metrics.update({
+                "keep_fraction": snapshot["keep_fraction"],
+                "keep_position_dependence_hard": snapshot[
+                    "keep_position_dependence_hard"
+                ],
+                "keep_position_dependence_soft": snapshot[
+                    "keep_position_dependence_soft"
+                ],
+                "early_keep_rate_hard": snapshot["early_keep_rate_hard"],
+                "late_keep_rate_hard": snapshot["late_keep_rate_hard"],
+                "early_keep_rate_soft": snapshot["early_keep_rate_soft"],
+                "late_keep_rate_soft": snapshot["late_keep_rate_soft"],
+                "consecutive_keep_fraction": snapshot[
+                    "consecutive_keep_fraction"
+                ],
+                "longest_drop_run": snapshot["longest_drop_run"],
+                "keep_gap_p50": snapshot["keep_gap_p50"],
+                "keep_gap_p90": snapshot["keep_gap_p90"],
+            })
         boundary_logits = outputs.get("decoder_boundary_logits")
         if isinstance(boundary_logits, torch.Tensor):
             metrics.update({
@@ -870,12 +890,22 @@ def main() -> None:
         f"[Run] {run_name} [Device] {device} "
         f"[Params] {payload['parameter_count']:,}"
     )
-    print(
-        f"[Architecture] BPE -> {model_cfg.segmentation_mode} segmentation -> "
-        f"EMA VQ -> {model_cfg.latent_routing} AR decoder"
+    architecture_middle = (
+        "contextual latents -> VQ-pre token pruning -> packed EMA VQ"
+        if model_cfg.segmentation_mode == "token_pruning"
+        else f"{model_cfg.segmentation_mode} segmentation -> EMA VQ"
     )
     print(
-        f"[Rate target] {model_cfg.compression_target:.2f} BPE/chunk "
+        f"[Architecture] BPE -> {architecture_middle} -> "
+        f"{model_cfg.latent_routing} AR decoder"
+    )
+    rate_unit = (
+        "kept code"
+        if model_cfg.segmentation_mode == "token_pruning"
+        else "chunk"
+    )
+    print(
+        f"[Rate target] {model_cfg.compression_target:.2f} BPE/{rate_unit} "
         f"with K={model_cfg.codebook_size}"
     )
     if model_cfg.segmentation_mode == "semi_markov":

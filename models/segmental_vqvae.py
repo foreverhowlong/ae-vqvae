@@ -39,6 +39,142 @@ class BoundaryGater(nn.Module):
         return torch.where(valid_mask, logits, torch.zeros_like(logits))
 
 
+class TokenKeepGate(nn.Module):
+    """Predict whether each continuous contextual latent should be transmitted."""
+
+    def __init__(self, config: SegmentalVQVAEConfig):
+        super().__init__()
+        hidden_dim = config.d_model
+        inner_dim = max(config.d_model // 2, 1)
+        self.network = nn.Sequential(
+            nn.LayerNorm(config.latent_dim),
+            nn.Linear(config.latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, inner_dim),
+            nn.GELU(),
+            nn.Linear(inner_dim, 1),
+        )
+
+    def forward(
+        self,
+        latents: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = self.network(latents).squeeze(-1)
+        return torch.where(valid_mask, logits, torch.zeros_like(logits))
+
+
+class TokenPruner(nn.Module):
+    """Order-preserving hard pruning with a soft packed-sequence STE."""
+
+    def __init__(self, threshold: float):
+        super().__init__()
+        self.threshold = threshold
+
+    @staticmethod
+    def _soft_selection(
+        probabilities: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Probability that token t becomes packed code ordinal k."""
+        batch_size, seq_len = probabilities.shape
+        state = probabilities.new_zeros(batch_size, seq_len)
+        state[:, 0] = 1.0
+        selections = []
+        for position in range(seq_len):
+            probability = probabilities[:, position].unsqueeze(1)
+            selections.append(state * probability)
+            shifted = F.pad(state[:, :-1], (1, 0))
+            state = state * (1.0 - probability) + shifted * probability
+        return torch.stack(selections, dim=1) * valid_mask.unsqueeze(-1)
+
+    def forward(
+        self,
+        latents: torch.Tensor,
+        gate_logits: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        sample_gates: bool,
+    ) -> dict[str, torch.Tensor]:
+        batch_size, seq_len, _ = latents.shape
+        valid_mask = valid_mask.to(device=latents.device, dtype=torch.bool)
+        next_valid = F.pad(valid_mask[:, 1:], (0, 1), value=False)
+        candidate_mask = valid_mask & next_valid
+        final_mask = valid_mask & ~next_valid
+        raw_probabilities = torch.sigmoid(gate_logits)
+        probabilities = (
+            raw_probabilities * candidate_mask.to(raw_probabilities.dtype)
+            + final_mask.to(raw_probabilities.dtype)
+        )
+        if sample_gates:
+            sampled = torch.bernoulli(raw_probabilities).bool()
+        else:
+            sampled = raw_probabilities > self.threshold
+        keep_mask = (sampled & candidate_mask) | final_mask
+        packed_ordinals = keep_mask.long().cumsum(dim=1) - 1
+        hard_selection = F.one_hot(
+            packed_ordinals.clamp(min=0, max=seq_len - 1),
+            num_classes=seq_len,
+        ).to(dtype=latents.dtype)
+        hard_selection = hard_selection * keep_mask.unsqueeze(-1)
+        soft_selection = self._soft_selection(probabilities, valid_mask)
+        selection = soft_selection + (
+            hard_selection - soft_selection
+        ).detach()
+        packed = torch.einsum("btk,btd->bkd", selection, latents)
+
+        keep_counts = keep_mask.sum(dim=1)
+        packed_mask = (
+            torch.arange(seq_len, device=latents.device).unsqueeze(0)
+            < keep_counts.unsqueeze(1)
+        )
+        packed = torch.where(
+            packed_mask.unsqueeze(-1),
+            packed,
+            torch.zeros_like(packed),
+        )
+        segment_ids = keep_mask.long().cumsum(dim=1) - keep_mask.long()
+        lengths = valid_mask.sum(dim=1)
+        soft_keep_counts = probabilities.sum(dim=1)
+        soft_ratio = lengths.to(latents.dtype) / soft_keep_counts.clamp_min(1.0)
+        hard_ratio = lengths.to(latents.dtype) / keep_counts.clamp_min(1)
+        candidate_logits = gate_logits[candidate_mask]
+        logit_l2 = (
+            candidate_logits.square().mean()
+            if candidate_logits.numel()
+            else gate_logits.sum() * 0.0
+        )
+        positions = torch.arange(
+            seq_len,
+            device=latents.device,
+            dtype=latents.dtype,
+        )
+        packed_source_positions = torch.einsum(
+            "btk,t->bk",
+            hard_selection,
+            positions,
+        ).long()
+        return {
+            "pooled": packed,
+            "chunk_mask": packed_mask,
+            "chunk_counts": keep_counts,
+            "hard_boundaries": keep_mask,
+            "segment_ids": segment_ids,
+            "gate_logits": gate_logits,
+            "gate_probabilities": probabilities,
+            "soft_chunk_counts": soft_keep_counts,
+            "soft_tokens_per_chunk": soft_ratio,
+            "hard_tokens_per_chunk": hard_ratio,
+            "gate_logit_l2": logit_l2,
+            "packed_source_positions": packed_source_positions,
+            "token_pruning_active": torch.ones(
+                (),
+                device=latents.device,
+                dtype=torch.bool,
+            ),
+        }
+
+
 class SegmentPooler(nn.Module):
     """Hard contiguous segmentation with a soft segment-ordinal STE."""
 
@@ -1195,6 +1331,7 @@ class SegmentalVQVAE(nn.Module):
             self.encoder_norm = None
             self.gater = None
             self.segment_pooler = None
+            self.token_pruner = None
             self.boundary_encoder: LocalBoundaryEncoder | None = (
                 LocalBoundaryEncoder(config)
             )
@@ -1209,8 +1346,16 @@ class SegmentalVQVAE(nn.Module):
                 RotaryResidualBlock(config) for _ in range(config.encoder_layers)
             )
             self.encoder_norm = nn.LayerNorm(config.d_model)
-            self.gater = BoundaryGater(config)
-            self.segment_pooler = SegmentPooler(config.gate_threshold)
+            if config.segmentation_mode == "token_pruning":
+                self.gater = TokenKeepGate(config)
+                self.segment_pooler = None
+                self.token_pruner: TokenPruner | None = TokenPruner(
+                    config.gate_threshold
+                )
+            else:
+                self.gater = BoundaryGater(config)
+                self.segment_pooler = SegmentPooler(config.gate_threshold)
+                self.token_pruner = None
             self.boundary_encoder = None
             self.semi_markov_segmenter = None
             self.span_content_encoder = None
@@ -1279,23 +1424,39 @@ class SegmentalVQVAE(nn.Module):
             assert self.encoder_layers is not None
             assert self.encoder_norm is not None
             assert self.gater is not None
-            assert self.segment_pooler is not None
             hidden = token_embeddings
             for layer in self.encoder_layers:
                 hidden = layer(hidden, padding_mask=~valid_mask)
                 hidden = zero_padded_positions(hidden, ~valid_mask)
             hidden = self.encoder_norm(hidden)
             hidden = zero_padded_positions(hidden, ~valid_mask)
-            gate_logits = self.gater(hidden, valid_mask)
-            segmented = self.segment_pooler(
-                hidden,
-                gate_logits,
-                valid_mask,
-                sample_gates=(
-                    self.training if sample_gates is None else sample_gates
-                ),
-            )
-        latents = self.latent_projection(segmented["pooled"])
+            should_sample = self.training if sample_gates is None else sample_gates
+            if self.config.segmentation_mode == "token_pruning":
+                assert isinstance(self.gater, TokenKeepGate)
+                assert self.token_pruner is not None
+                token_latents = self.latent_projection(hidden)
+                token_latents = zero_padded_positions(token_latents, ~valid_mask)
+                gate_logits = self.gater(token_latents, valid_mask)
+                segmented = self.token_pruner(
+                    token_latents,
+                    gate_logits,
+                    valid_mask,
+                    sample_gates=should_sample,
+                )
+            else:
+                assert self.segment_pooler is not None
+                gate_logits = self.gater(hidden, valid_mask)
+                segmented = self.segment_pooler(
+                    hidden,
+                    gate_logits,
+                    valid_mask,
+                    sample_gates=should_sample,
+                )
+        latents = (
+            segmented["pooled"]
+            if self.config.segmentation_mode == "token_pruning"
+            else self.latent_projection(segmented["pooled"])
+        )
         latents = torch.where(
             segmented["chunk_mask"].unsqueeze(-1),
             latents,

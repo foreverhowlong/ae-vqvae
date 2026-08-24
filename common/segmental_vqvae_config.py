@@ -16,6 +16,7 @@ LATENT_ROUTING_MODES = (
 SEGMENTATION_MODES = (
     "bernoulli",
     "semi_markov",
+    "token_pruning",
 )
 
 
@@ -109,7 +110,17 @@ class SegmentalVQVAEConfig:
                 "latent_routing must be global_cross_attention or monotonic_pointer."
             )
         if self.segmentation_mode not in SEGMENTATION_MODES:
-            raise ValueError("segmentation_mode must be bernoulli or semi_markov.")
+            raise ValueError(
+                "segmentation_mode must be bernoulli, semi_markov, or "
+                "token_pruning."
+            )
+        if (
+            self.segmentation_mode == "token_pruning"
+            and self.latent_routing != "global_cross_attention"
+        ):
+            raise ValueError(
+                "token_pruning requires global_cross_attention latent routing."
+            )
         if self.boundary_window_radius < 1:
             raise ValueError("boundary_window_radius must be positive.")
         if not 1 <= self.max_span_length <= self.max_seq_len:
