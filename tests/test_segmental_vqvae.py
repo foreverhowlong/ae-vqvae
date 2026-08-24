@@ -20,6 +20,8 @@ from models.segmental_vqvae import (
     segmental_vqvae_losses,
 )
 from training.run_segmental_vqvae_experiment import (
+    _viterbi_path_churn,
+    evaluate,
     evaluate_free_running,
     evaluate_interventions,
 )
@@ -267,6 +269,138 @@ def test_semi_markov_forward_backward_matches_enumerated_partitions():
         probabilities,
         torch.tensor([[2.0 / 3.0, 2.0 / 3.0, 1.0]]),
     )
+
+
+def test_fixed_count_semi_markov_matches_enumerated_two_segment_paths():
+    config = _config(
+        segmentation_mode="semi_markov_fixed_count",
+        compression_target=1.5,
+        max_seq_len=3,
+        max_span_length=2,
+    )
+    segmenter = SemiMarkovSegmenter(config)
+    span_scores = torch.tensor([[[0.0, 0.0], [0.0, 0.0], [0.0, -torch.inf]]])
+    lengths = torch.tensor([3])
+    target_counts = segmenter._target_chunk_counts(lengths)
+
+    alpha, beta, log_partition = segmenter._forward_backward_fixed_count(
+        span_scores,
+        lengths,
+        target_counts,
+    )
+    probabilities = segmenter._boundary_marginals_fixed_count(
+        span_scores,
+        lengths,
+        target_counts,
+        alpha,
+        beta,
+        log_partition,
+    )
+    hard_boundaries, path_scores = segmenter._viterbi_fixed_count(
+        span_scores,
+        lengths,
+        target_counts,
+    )
+
+    assert target_counts.tolist() == [2]
+    assert math.isclose(float(log_partition), math.log(2.0), rel_tol=1e-6)
+    torch.testing.assert_close(
+        probabilities,
+        torch.tensor([[0.5, 0.5, 1.0]]),
+    )
+    assert hard_boundaries.sum().item() == 2
+    assert float(path_scores) == 0.0
+
+
+def test_fixed_count_semi_markov_enforces_rate_and_disables_compression_loss():
+    torch.manual_seed(23)
+    model = SegmentalVQVAE(
+        _config(segmentation_mode="semi_markov_fixed_count")
+    )
+    batch = _batch()
+    outputs = model(
+        batch["input_ids"],
+        batch["attention_mask"],
+        use_quantizer=False,
+        sample_gates=False,
+    )
+    losses = segmental_vqvae_losses(
+        outputs,
+        batch["input_ids"],
+        batch["attention_mask"],
+        model.config,
+    )
+
+    assert outputs["target_chunk_counts"].tolist() == [2, 5]
+    assert torch.equal(
+        outputs["chunk_counts"],
+        outputs["target_chunk_counts"],
+    )
+    torch.testing.assert_close(
+        outputs["soft_chunk_counts"],
+        outputs["target_chunk_counts"].float(),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.count_nonzero(outputs["chunk_count_constraint_violation"]) == 0
+    assert float(losses["compression_loss"]) == 0.0
+    losses["loss"].backward()
+    assert model.semi_markov_segmenter is not None
+    gradient = model.semi_markov_segmenter.scorer.mlp[-1].weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) > 0
+
+
+def test_fixed_count_interventions_report_constraint_health():
+    model = SegmentalVQVAE(
+        _config(segmentation_mode="semi_markov_fixed_count")
+    ).eval()
+    metrics, snapshot = evaluate_interventions(
+        model,
+        _batch(),
+        torch.device("cpu"),
+        use_quantizer=True,
+        seed=59,
+    )
+
+    assert snapshot["fixed_count_active"] is True
+    assert metrics["target_chunks"] == metrics["chunks"]
+    assert metrics["chunk_count_constraint_violations"] == 0
+    assert metrics["hard_soft_ratio_gap"] < 1e-5
+
+    eval_metrics = evaluate(
+        model,
+        [_batch()],
+        torch.device("cpu"),
+        use_quantizer=False,
+    )
+    assert eval_metrics["target_chunks"] == eval_metrics["chunks"]
+    assert eval_metrics["chunk_count_constraint_violations"] == 0
+    assert eval_metrics["hard_soft_ratio_gap"] < 1e-5
+
+
+def test_viterbi_path_churn_compares_the_same_fixed_examples():
+    first = {
+        "examples": [{
+            "token_ids": [3, 4, 5, 2],
+            "hard_boundaries": [False, True, False, True],
+        }]
+    }
+    second = {
+        "examples": [{
+            "token_ids": [3, 4, 5, 2],
+            "hard_boundaries": [True, False, False, True],
+        }]
+    }
+
+    unavailable = _viterbi_path_churn(None, first)
+    changed = _viterbi_path_churn(first, second)
+
+    assert unavailable["viterbi_path_churn_available"] == 0
+    assert changed["viterbi_path_churn_available"] == 1
+    assert changed["viterbi_path_change_fraction"] == 1.0
+    assert math.isclose(changed["viterbi_boundary_churn"], 2.0 / 3.0)
 
 
 def test_semi_markov_reconstruction_gradient_reaches_span_scorer():
@@ -700,6 +834,21 @@ def test_token_pruning_experiment_contains_only_the_pruning_run():
     assert token_pruning["continuous-truncation"] is False
     assert token_pruning["latent-routing"] == "global_cross_attention"
     assert token_pruning["segmentation-mode"] == "token_pruning"
+
+
+def test_fixed_count_semi_markov_config_contains_only_the_constrained_run():
+    config_path = (
+        Path(__file__).parents[1]
+        / "configs"
+        / "segmental-vqvae-bpe-k8192-semimarkov-fixed-count.json"
+    )
+    experiments = json.loads(config_path.read_text())["experiments"]
+    assert len(experiments) == 1
+    fixed_count = experiments[0]
+    assert fixed_count["continuous-truncation"] is False
+    assert fixed_count["latent-routing"] == "global_cross_attention"
+    assert fixed_count["segmentation-mode"] == "semi_markov_fixed_count"
+    assert fixed_count["compression-weight"] == 0.0
 
 
 def test_metrics_first_checkpoints_overwrite_and_drop_resume_state():

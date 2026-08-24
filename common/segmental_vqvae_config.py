@@ -16,6 +16,7 @@ LATENT_ROUTING_MODES = (
 SEGMENTATION_MODES = (
     "bernoulli",
     "semi_markov",
+    "semi_markov_fixed_count",
     "token_pruning",
 )
 
@@ -111,8 +112,8 @@ class SegmentalVQVAEConfig:
             )
         if self.segmentation_mode not in SEGMENTATION_MODES:
             raise ValueError(
-                "segmentation_mode must be bernoulli, semi_markov, or "
-                "token_pruning."
+                "segmentation_mode must be bernoulli, semi_markov, "
+                "semi_markov_fixed_count, or token_pruning."
             )
         if (
             self.segmentation_mode == "token_pruning"

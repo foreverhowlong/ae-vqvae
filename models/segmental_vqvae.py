@@ -578,7 +578,264 @@ class SemiMarkovSegmenter(nn.Module):
     def __init__(self, config: SegmentalVQVAEConfig):
         super().__init__()
         self.max_span_length = config.max_span_length
+        self.compression_target = config.compression_target
+        self.fixed_count = (
+            config.segmentation_mode == "semi_markov_fixed_count"
+        )
         self.scorer = SpanScorer(config)
+
+    def _target_chunk_counts(self, lengths: torch.Tensor) -> torch.Tensor:
+        rounded = torch.round(
+            lengths.to(dtype=torch.float32) / self.compression_target
+        ).long()
+        minimum = torch.div(
+            lengths + self.max_span_length - 1,
+            self.max_span_length,
+            rounding_mode="floor",
+        )
+        return torch.maximum(rounded, minimum).clamp(min=1).minimum(lengths)
+
+    @staticmethod
+    def _safe_logsumexp(
+        values: torch.Tensor,
+        *,
+        dim: int,
+    ) -> torch.Tensor:
+        reachable = torch.isfinite(values).any(dim=dim)
+        safe_values = torch.where(
+            reachable.unsqueeze(dim),
+            values,
+            torch.zeros_like(values),
+        )
+        reduced = torch.logsumexp(safe_values, dim=dim)
+        return torch.where(
+            reachable,
+            reduced,
+            torch.full_like(reduced, float("-inf")),
+        )
+
+    def _forward_backward_fixed_count(
+        self,
+        span_scores: torch.Tensor,
+        lengths: torch.Tensor,
+        target_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = span_scores.shape
+        max_count = int(target_counts.max().item())
+        negative_infinity = float("-inf")
+        initial = span_scores.new_full(
+            (batch_size, max_count + 1),
+            negative_infinity,
+        )
+        initial[:, 0] = 0.0
+        alpha_columns = [initial]
+        for end in range(1, seq_len + 1):
+            candidates = []
+            for span_length in range(
+                1,
+                min(self.max_span_length, end) + 1,
+            ):
+                previous = alpha_columns[end - span_length]
+                shifted = F.pad(
+                    previous[:, :-1],
+                    (1, 0),
+                    value=negative_infinity,
+                )
+                candidates.append(
+                    shifted
+                    + span_scores[
+                        :, end - span_length, span_length - 1
+                    ].unsqueeze(1)
+                )
+            value = self._safe_logsumexp(
+                torch.stack(candidates, dim=1),
+                dim=1,
+            )
+            alpha_columns.append(torch.where(
+                (end <= lengths).unsqueeze(1),
+                value,
+                torch.full_like(value, negative_infinity),
+            ))
+        alpha = torch.stack(alpha_columns, dim=1)
+
+        beta_columns: list[torch.Tensor | None] = [None] * (seq_len + 1)
+        for start in range(seq_len, -1, -1):
+            if start == seq_len:
+                value = span_scores.new_full(
+                    (batch_size, max_count + 1),
+                    negative_infinity,
+                )
+            else:
+                candidates = []
+                for span_length in range(
+                    1,
+                    min(self.max_span_length, seq_len - start) + 1,
+                ):
+                    following = beta_columns[start + span_length]
+                    assert following is not None
+                    shifted = F.pad(
+                        following[:, :-1],
+                        (1, 0),
+                        value=negative_infinity,
+                    )
+                    candidates.append(
+                        shifted
+                        + span_scores[:, start, span_length - 1].unsqueeze(1)
+                    )
+                value = self._safe_logsumexp(
+                    torch.stack(candidates, dim=1),
+                    dim=1,
+                )
+            at_sequence_end = lengths == start
+            value = torch.where(
+                (start <= lengths).unsqueeze(1),
+                value,
+                torch.full_like(value, negative_infinity),
+            )
+            value = value.clone()
+            value[:, 0] = torch.where(
+                at_sequence_end,
+                torch.zeros_like(value[:, 0]),
+                value[:, 0],
+            )
+            beta_columns[start] = value
+        beta = torch.stack(
+            [column for column in beta_columns if column is not None],
+            dim=1,
+        )
+        batch_indices = torch.arange(batch_size, device=span_scores.device)
+        log_partition = alpha[batch_indices, lengths, target_counts]
+        if not torch.isfinite(log_partition).all():
+            raise RuntimeError(
+                "The fixed-count semi-Markov constraint has no feasible path."
+            )
+        return alpha, beta, log_partition
+
+    def _boundary_marginals_fixed_count(
+        self,
+        span_scores: torch.Tensor,
+        lengths: torch.Tensor,
+        target_counts: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        log_partition: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = span_scores.shape
+        max_count = alpha.shape[-1] - 1
+        prefix_counts = torch.arange(max_count, device=span_scores.device)
+        suffix_counts = (
+            target_counts.unsqueeze(1) - prefix_counts.unsqueeze(0) - 1
+        )
+        valid_counts = (suffix_counts >= 0) & (suffix_counts <= max_count)
+        safe_suffix_counts = suffix_counts.clamp(min=0, max=max_count)
+        probabilities = span_scores.new_zeros(batch_size, seq_len)
+        for end in range(1, seq_len + 1):
+            terms = []
+            for span_length in range(
+                1,
+                min(self.max_span_length, end) + 1,
+            ):
+                start = end - span_length
+                suffix = beta[:, end].gather(
+                    1,
+                    safe_suffix_counts,
+                )
+                term = (
+                    alpha[:, start, :max_count]
+                    + span_scores[:, start, span_length - 1].unsqueeze(1)
+                    + suffix
+                    - log_partition.unsqueeze(1)
+                )
+                terms.append(torch.where(
+                    valid_counts,
+                    term,
+                    torch.full_like(term, float("-inf")),
+                ))
+            probability = torch.exp(self._safe_logsumexp(
+                torch.cat(terms, dim=1),
+                dim=1,
+            ))
+            probabilities[:, end - 1] = torch.where(
+                end <= lengths,
+                probability,
+                torch.zeros_like(probability),
+            )
+        return probabilities.clamp(0.0, 1.0)
+
+    def _viterbi_fixed_count(
+        self,
+        span_scores: torch.Tensor,
+        lengths: torch.Tensor,
+        target_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = span_scores.shape
+        max_count = int(target_counts.max().item())
+        negative_infinity = float("-inf")
+        initial = span_scores.new_full(
+            (batch_size, max_count + 1),
+            negative_infinity,
+        )
+        initial[:, 0] = 0.0
+        delta_columns = [initial]
+        back_lengths = torch.zeros(
+            batch_size,
+            seq_len + 1,
+            max_count + 1,
+            device=span_scores.device,
+            dtype=torch.long,
+        )
+        for end in range(1, seq_len + 1):
+            candidates = []
+            for span_length in range(
+                1,
+                min(self.max_span_length, end) + 1,
+            ):
+                shifted = F.pad(
+                    delta_columns[end - span_length][:, :-1],
+                    (1, 0),
+                    value=negative_infinity,
+                )
+                candidates.append(
+                    shifted
+                    + span_scores[
+                        :, end - span_length, span_length - 1
+                    ].unsqueeze(1)
+                )
+            value, choice = torch.stack(candidates, dim=1).max(dim=1)
+            value = torch.where(
+                (end <= lengths).unsqueeze(1),
+                value,
+                torch.full_like(value, negative_infinity),
+            )
+            delta_columns.append(value)
+            back_lengths[:, end] = choice + 1
+
+        delta = torch.stack(delta_columns, dim=1)
+        batch_indices = torch.arange(batch_size, device=span_scores.device)
+        path_scores = delta[batch_indices, lengths, target_counts]
+        hard_boundaries = torch.zeros(
+            batch_size,
+            seq_len,
+            device=span_scores.device,
+            dtype=torch.bool,
+        )
+        current = lengths.clone()
+        remaining = target_counts.clone()
+        for _ in range(max_count):
+            active = remaining > 0
+            chosen_lengths = back_lengths[
+                batch_indices,
+                current.clamp(min=0),
+                remaining.clamp(min=0),
+            ]
+            boundary_positions = (current - 1).clamp_min(0)
+            hard_boundaries = hard_boundaries | (
+                F.one_hot(boundary_positions, num_classes=seq_len).bool()
+                & active.unsqueeze(1)
+            )
+            current = torch.where(active, current - chosen_lengths, current)
+            remaining = torch.where(active, remaining - 1, remaining)
+        return hard_boundaries, path_scores
 
     def _forward_backward(
         self,
@@ -750,18 +1007,41 @@ class SemiMarkovSegmenter(nn.Module):
         batch_size, seq_len, _ = hidden.shape
         lengths = valid_mask.sum(dim=1).long()
         span_scores = self.scorer(hidden, valid_mask)
-        alpha, beta, log_partition = self._forward_backward(
-            span_scores,
-            lengths,
-        )
-        probabilities = self._boundary_marginals(
-            span_scores,
-            lengths,
-            alpha,
-            beta,
-            log_partition,
-        )
-        hard_boundaries = self._viterbi(span_scores, lengths)
+        if self.fixed_count:
+            target_chunk_counts = self._target_chunk_counts(lengths)
+            alpha, beta, log_partition = self._forward_backward_fixed_count(
+                span_scores,
+                lengths,
+                target_chunk_counts,
+            )
+            probabilities = self._boundary_marginals_fixed_count(
+                span_scores,
+                lengths,
+                target_chunk_counts,
+                alpha,
+                beta,
+                log_partition,
+            )
+            hard_boundaries, viterbi_scores = self._viterbi_fixed_count(
+                span_scores,
+                lengths,
+                target_chunk_counts,
+            )
+        else:
+            alpha, beta, log_partition = self._forward_backward(
+                span_scores,
+                lengths,
+            )
+            probabilities = self._boundary_marginals(
+                span_scores,
+                lengths,
+                alpha,
+                beta,
+                log_partition,
+            )
+            hard_boundaries = self._viterbi(span_scores, lengths)
+            target_chunk_counts = torch.zeros_like(lengths)
+            viterbi_scores = log_partition.new_zeros(log_partition.shape)
         segment_ids = (
             hard_boundaries.long().cumsum(dim=1) - hard_boundaries.long()
         )
@@ -779,6 +1059,8 @@ class SemiMarkovSegmenter(nn.Module):
         soft_proxy = soft_proxy / counts.clamp_min(1e-6).unsqueeze(-1)
 
         chunk_counts = hard_boundaries.sum(dim=1)
+        if not self.fixed_count:
+            target_chunk_counts = chunk_counts
         chunk_mask = (
             torch.arange(seq_len, device=hidden.device).unsqueeze(0)
             < chunk_counts.unsqueeze(1)
@@ -786,6 +1068,7 @@ class SemiMarkovSegmenter(nn.Module):
         soft_chunk_counts = probabilities.sum(dim=1)
         soft_ratio = lengths.to(hidden.dtype) / soft_chunk_counts.clamp_min(1.0)
         hard_ratio = lengths.to(hidden.dtype) / chunk_counts.clamp_min(1)
+        target_ratio = lengths.to(hidden.dtype) / target_chunk_counts.clamp_min(1)
         candidate_mask = valid_mask & F.pad(
             valid_mask[:, 1:],
             (0, 1),
@@ -813,6 +1096,18 @@ class SemiMarkovSegmenter(nn.Module):
             "hard_tokens_per_chunk": hard_ratio,
             "gate_logit_l2": logit_l2,
             "semi_markov_log_partition": log_partition,
+            "target_chunk_counts": target_chunk_counts,
+            "target_tokens_per_chunk": target_ratio,
+            "chunk_count_constraint_violation": (
+                chunk_counts - target_chunk_counts
+            ).abs(),
+            "hard_soft_ratio_gap": (hard_ratio - soft_ratio).abs(),
+            "semi_markov_viterbi_score": viterbi_scores,
+            "fixed_count_active": torch.tensor(
+                self.fixed_count,
+                device=hidden.device,
+                dtype=torch.bool,
+            ),
         }
 
 
@@ -1326,7 +1621,10 @@ class SegmentalVQVAE(nn.Module):
             config.d_model,
             padding_idx=config.pad_token_id,
         )
-        if config.segmentation_mode == "semi_markov":
+        if config.segmentation_mode in {
+            "semi_markov",
+            "semi_markov_fixed_count",
+        }:
             self.encoder_layers = None
             self.encoder_norm = None
             self.gater = None
@@ -1402,7 +1700,10 @@ class SegmentalVQVAE(nn.Module):
             raise ValueError("Every sequence must contain at least one valid BPE token.")
 
         token_embeddings = self.token_embedding(input_ids)
-        if self.config.segmentation_mode == "semi_markov":
+        if self.config.segmentation_mode in {
+            "semi_markov",
+            "semi_markov_fixed_count",
+        }:
             assert self.boundary_encoder is not None
             assert self.semi_markov_segmenter is not None
             assert self.span_content_encoder is not None
@@ -1867,8 +2168,12 @@ def segmental_vqvae_losses(
     gate_logit_l2 = outputs["gate_logit_l2"]
     assert isinstance(soft_ratio, torch.Tensor)
     assert isinstance(gate_logit_l2, torch.Tensor)
-    compression_raw = (soft_ratio.mean() - config.compression_target).square()
-    compression = config.compression_weight * compression_raw
+    if config.segmentation_mode == "semi_markov_fixed_count":
+        compression_raw = reconstruction.new_zeros(())
+        compression = reconstruction.new_zeros(())
+    else:
+        compression_raw = (soft_ratio.mean() - config.compression_target).square()
+        compression = config.compression_weight * compression_raw
     gate_regularization = config.gate_logit_l2_weight * gate_logit_l2
     decoder_boundary_logits = outputs.get("decoder_boundary_logits")
     if isinstance(decoder_boundary_logits, torch.Tensor):

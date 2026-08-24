@@ -171,6 +171,12 @@ def build_segmentation_snapshot(
         if isinstance(pruning_marker, torch.Tensor)
         else bool(pruning_marker)
     )
+    fixed_count_marker = outputs.get("fixed_count_active")
+    fixed_count_active = (
+        bool(fixed_count_marker.detach().cpu().item())
+        if isinstance(fixed_count_marker, torch.Tensor)
+        else bool(fixed_count_marker)
+    )
     decoder_boundary_logits = outputs.get("decoder_boundary_logits")
     if isinstance(decoder_boundary_logits, torch.Tensor):
         decoder_probabilities = torch.sigmoid(
@@ -360,6 +366,7 @@ def build_segmentation_snapshot(
         decoder_bpd_soft = None
     return {
         "selection_kind": "keep" if token_pruning_active else "boundary",
+        "fixed_count_active": fixed_count_active,
         "examples": examples,
         "gate_probabilities": all_probabilities,
         "chunk_lengths": all_chunk_lengths,
@@ -534,6 +541,9 @@ def plot_segmental_metrics(
         row for row in rows if row.get("split") == "latent_intervention"
     ]
     is_pruning_run = any("keep_fraction" in row for row in intervention_rows)
+    is_fixed_count_run = any(
+        "target_chunks" in row for row in intervention_rows
+    )
     free_rows = [row for row in rows if row.get("split") == "free_running"]
     transition_rows = [row for row in rows if row.get("split") == "phase_transition"]
     transition_step = transition_rows[0]["step"] if transition_rows else None
@@ -856,9 +866,31 @@ def plot_segmental_metrics(
                     marker=".",
                     label="excess vs geometric",
                 )
+            if is_fixed_count_run:
+                churn_rows = [
+                    row
+                    for row in segmentation_health_rows
+                    if row.get("viterbi_path_churn_available")
+                ]
+                axes[1].plot(
+                    [row["step"] for row in churn_rows],
+                    [row["viterbi_path_change_fraction"] for row in churn_rows],
+                    marker="x",
+                    label="Viterbi paths changed",
+                )
+                axes[1].plot(
+                    [row["step"] for row in churn_rows],
+                    [row["viterbi_boundary_churn"] for row in churn_rows],
+                    marker="+",
+                    label="boundary churn",
+                )
             axes[1].axhline(0.0, color="0.3", linestyle=":")
             axes[1].set(
-                title="Singleton-chunk concentration",
+                title=(
+                    "Fixed-count path stability"
+                    if is_fixed_count_run
+                    else "Singleton-chunk concentration"
+                ),
                 xlabel="step",
                 ylabel="fraction",
             )

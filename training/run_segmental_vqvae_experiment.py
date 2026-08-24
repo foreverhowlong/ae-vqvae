@@ -272,6 +272,51 @@ def _boundary_metrics_from_counts(counts: dict[str, float]) -> dict[str, float]:
     }
 
 
+def _viterbi_path_churn(
+    previous_snapshot: dict | None,
+    current_snapshot: dict,
+) -> dict[str, float | int]:
+    if previous_snapshot is None:
+        return {
+            "viterbi_path_churn_available": 0,
+            "viterbi_path_change_fraction": 0.0,
+            "viterbi_boundary_churn": 0.0,
+        }
+    previous_examples = previous_snapshot["examples"]
+    current_examples = current_snapshot["examples"]
+    if len(previous_examples) != len(current_examples):
+        raise ValueError("Fixed segmentation probes changed example count.")
+    changed_paths = 0
+    changed_boundaries = 0
+    candidate_boundaries = 0
+    for previous, current in zip(
+        previous_examples,
+        current_examples,
+        strict=True,
+    ):
+        if previous["token_ids"] != current["token_ids"]:
+            raise ValueError("Fixed segmentation probes changed token ids.")
+        candidate_length = max(len(current["token_ids"]) - 1, 0)
+        previous_path = previous["hard_boundaries"][:candidate_length]
+        current_path = current["hard_boundaries"][:candidate_length]
+        changes = sum(
+            left != right
+            for left, right in zip(previous_path, current_path, strict=True)
+        )
+        changed_paths += int(changes > 0)
+        changed_boundaries += changes
+        candidate_boundaries += candidate_length
+    return {
+        "viterbi_path_churn_available": 1,
+        "viterbi_path_change_fraction": (
+            changed_paths / max(len(current_examples), 1)
+        ),
+        "viterbi_boundary_churn": (
+            changed_boundaries / max(candidate_boundaries, 1)
+        ),
+    }
+
+
 @torch.no_grad()
 def evaluate(
     model: SegmentalVQVAE,
@@ -285,6 +330,8 @@ def evaluate(
     batches = 0
     total_tokens = 0
     total_chunks = 0
+    total_target_chunks = 0
+    total_constraint_violations = 0
     all_indices = []
     all_masks = []
     try:
@@ -317,6 +364,14 @@ def evaluate(
             chunks = int(outputs["chunk_counts"].sum())
             total_tokens += tokens
             total_chunks += chunks
+            if model.config.segmentation_mode == "semi_markov_fixed_count":
+                total_target_chunks += int(outputs["target_chunk_counts"].sum())
+                total_constraint_violations += int(
+                    outputs["chunk_count_constraint_violation"].sum()
+                )
+                totals["hard_soft_ratio_gap"] = totals.get(
+                    "hard_soft_ratio_gap", 0.0
+                ) + float(outputs["hard_soft_ratio_gap"].mean())
             predictions = outputs["logits"].argmax(dim=-1)
             totals["correct_tokens"] = totals.get("correct_tokens", 0.0) + int(
                 ((predictions == batch["input_ids"]) & valid).sum()
@@ -369,6 +424,16 @@ def evaluate(
             / max(total_tokens, 1)
         ),
     })
+    if model.config.segmentation_mode == "semi_markov_fixed_count":
+        metrics.update({
+            "target_chunks": total_target_chunks,
+            "target_tokens_per_chunk": (
+                total_tokens / max(total_target_chunks, 1)
+            ),
+            "chunk_count_constraint_violations": total_constraint_violations,
+            "hard_soft_ratio_gap": totals.get("hard_soft_ratio_gap", 0.0)
+            / max(batches, 1),
+        })
     metrics["distortion_nats_per_bpe"] = (
         totals.get("reconstruction_nll_sum", 0.0) / max(total_tokens, 1)
     )
@@ -537,6 +602,20 @@ def evaluate_interventions(
                 "longest_drop_run": snapshot["longest_drop_run"],
                 "keep_gap_p50": snapshot["keep_gap_p50"],
                 "keep_gap_p90": snapshot["keep_gap_p90"],
+            })
+        if model.config.segmentation_mode == "semi_markov_fixed_count":
+            target_chunk_count = int(outputs["target_chunk_counts"].sum())
+            metrics.update({
+                "target_chunks": target_chunk_count,
+                "target_tokens_per_chunk": (
+                    token_count / max(target_chunk_count, 1)
+                ),
+                "chunk_count_constraint_violations": int(
+                    outputs["chunk_count_constraint_violation"].sum()
+                ),
+                "hard_soft_ratio_gap": float(
+                    outputs["hard_soft_ratio_gap"].mean()
+                ),
             })
         boundary_logits = outputs.get("decoder_boundary_logits")
         if isinstance(boundary_logits, torch.Tensor):
@@ -884,6 +963,7 @@ def main() -> None:
     last_eval_step = None
     last_interventions = None
     last_free_running = None
+    previous_segmentation_snapshot = None
     started = time.time()
 
     print(
@@ -908,7 +988,10 @@ def main() -> None:
         f"[Rate target] {model_cfg.compression_target:.2f} BPE/{rate_unit} "
         f"with K={model_cfg.codebook_size}"
     )
-    if model_cfg.segmentation_mode == "semi_markov":
+    if model_cfg.segmentation_mode in {
+        "semi_markov",
+        "semi_markov_fixed_count",
+    }:
         print(
             "[Semi-Markov] "
             f"boundary_layers={model_cfg.boundary_encoder_layers} "
@@ -916,6 +999,11 @@ def main() -> None:
             f"max_span={model_cfg.max_span_length} "
             f"span_layers={model_cfg.span_encoder_layers}"
         )
+        if model_cfg.segmentation_mode == "semi_markov_fixed_count":
+            print(
+                "[Semi-Markov count constraint] "
+                "K=round(valid_BPE/compression_target); compression loss disabled"
+            )
 
     with wandb_run(
         run_name,
@@ -1022,6 +1110,20 @@ def main() -> None:
                         for key, value in losses.items()
                     },
                 }
+                if model_cfg.segmentation_mode == "semi_markov_fixed_count":
+                    train_row.update({
+                        "target_tokens_per_chunk": float(
+                            outputs["target_tokens_per_chunk"].mean().detach()
+                        ),
+                        "chunk_count_constraint_violations": int(
+                            outputs[
+                                "chunk_count_constraint_violation"
+                            ].sum().detach()
+                        ),
+                        "hard_soft_ratio_gap": float(
+                            outputs["hard_soft_ratio_gap"].mean().detach()
+                        ),
+                    })
                 append_jsonl(train_row, metrics_path)
                 tracker.log(
                     {
@@ -1081,6 +1183,12 @@ def main() -> None:
                         seed=train_cfg.seed + 17,
                         tokenizer=tokenizer,
                     )
+                    if model_cfg.segmentation_mode == "semi_markov_fixed_count":
+                        interventions.update(_viterbi_path_churn(
+                            previous_segmentation_snapshot,
+                            segmentation_snapshot,
+                        ))
+                        previous_segmentation_snapshot = segmentation_snapshot
                     eval_row = {
                         "split": "eval",
                         "epoch": epoch,
@@ -1195,6 +1303,12 @@ def main() -> None:
                 seed=train_cfg.seed + 17,
                 tokenizer=tokenizer,
             )
+            if model_cfg.segmentation_mode == "semi_markov_fixed_count":
+                last_interventions.update(_viterbi_path_churn(
+                    previous_segmentation_snapshot,
+                    segmentation_snapshot,
+                ))
+                previous_segmentation_snapshot = segmentation_snapshot
             append_jsonl({
                 "split": "eval",
                 "event": "final",
