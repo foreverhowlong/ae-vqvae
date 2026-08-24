@@ -17,6 +17,7 @@ SEGMENTATION_MODES = (
     "bernoulli",
     "semi_markov",
     "semi_markov_fixed_count",
+    "semi_markov_greedy",
     "token_pruning",
 )
 
@@ -113,7 +114,7 @@ class SegmentalVQVAEConfig:
         if self.segmentation_mode not in SEGMENTATION_MODES:
             raise ValueError(
                 "segmentation_mode must be bernoulli, semi_markov, "
-                "semi_markov_fixed_count, or token_pruning."
+                "semi_markov_fixed_count, semi_markov_greedy, or token_pruning."
             )
         if (
             self.segmentation_mode == "token_pruning"

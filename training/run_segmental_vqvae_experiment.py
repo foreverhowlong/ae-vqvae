@@ -317,6 +317,22 @@ def _viterbi_path_churn(
     }
 
 
+def _greedy_path_churn(
+    previous_snapshot: dict | None,
+    current_snapshot: dict,
+) -> dict[str, float | int]:
+    viterbi_metrics = _viterbi_path_churn(previous_snapshot, current_snapshot)
+    return {
+        "greedy_path_churn_available": viterbi_metrics[
+            "viterbi_path_churn_available"
+        ],
+        "greedy_path_change_fraction": viterbi_metrics[
+            "viterbi_path_change_fraction"
+        ],
+        "greedy_boundary_churn": viterbi_metrics["viterbi_boundary_churn"],
+    }
+
+
 @torch.no_grad()
 def evaluate(
     model: SegmentalVQVAE,
@@ -372,6 +388,15 @@ def evaluate(
                 totals["hard_soft_ratio_gap"] = totals.get(
                     "hard_soft_ratio_gap", 0.0
                 ) + float(outputs["hard_soft_ratio_gap"].mean())
+            elif model.config.segmentation_mode == "semi_markov_greedy":
+                for key in (
+                    "hard_soft_ratio_gap",
+                    "greedy_selected_probability",
+                    "greedy_local_entropy",
+                ):
+                    totals[key] = totals.get(key, 0.0) + float(
+                        outputs[key].mean()
+                    )
             predictions = outputs["logits"].argmax(dim=-1)
             totals["correct_tokens"] = totals.get("correct_tokens", 0.0) + int(
                 ((predictions == batch["input_ids"]) & valid).sum()
@@ -432,6 +457,18 @@ def evaluate(
             ),
             "chunk_count_constraint_violations": total_constraint_violations,
             "hard_soft_ratio_gap": totals.get("hard_soft_ratio_gap", 0.0)
+            / max(batches, 1),
+        })
+    elif model.config.segmentation_mode == "semi_markov_greedy":
+        metrics.update({
+            "tokens_per_chunk_local_expected": totals.get("soft_ratio", 0.0)
+            / max(batches, 1),
+            "hard_soft_ratio_gap": totals.get("hard_soft_ratio_gap", 0.0)
+            / max(batches, 1),
+            "greedy_selected_probability": totals.get(
+                "greedy_selected_probability", 0.0
+            ) / max(batches, 1),
+            "greedy_local_entropy": totals.get("greedy_local_entropy", 0.0)
             / max(batches, 1),
         })
     metrics["distortion_nats_per_bpe"] = (
@@ -615,6 +652,21 @@ def evaluate_interventions(
                 ),
                 "hard_soft_ratio_gap": float(
                     outputs["hard_soft_ratio_gap"].mean()
+                ),
+            })
+        elif model.config.segmentation_mode == "semi_markov_greedy":
+            metrics.update({
+                "tokens_per_chunk_local_expected": float(
+                    outputs["soft_tokens_per_chunk"].mean()
+                ),
+                "hard_soft_ratio_gap": float(
+                    outputs["hard_soft_ratio_gap"].mean()
+                ),
+                "greedy_selected_probability": float(
+                    outputs["greedy_selected_probability"].mean()
+                ),
+                "greedy_local_entropy": float(
+                    outputs["greedy_local_entropy"].mean()
                 ),
             })
         boundary_logits = outputs.get("decoder_boundary_logits")
@@ -991,6 +1043,7 @@ def main() -> None:
     if model_cfg.segmentation_mode in {
         "semi_markov",
         "semi_markov_fixed_count",
+        "semi_markov_greedy",
     }:
         print(
             "[Semi-Markov] "
@@ -1003,6 +1056,11 @@ def main() -> None:
             print(
                 "[Semi-Markov count constraint] "
                 "K=round(valid_BPE/compression_target); compression loss disabled"
+            )
+        elif model_cfg.segmentation_mode == "semi_markov_greedy":
+            print(
+                "[Greedy span selection] local argmax forward; "
+                "local-softmax straight-through backward; learned rate"
             )
 
     with wandb_run(
@@ -1124,6 +1182,28 @@ def main() -> None:
                             outputs["hard_soft_ratio_gap"].mean().detach()
                         ),
                     })
+                elif model_cfg.segmentation_mode == "semi_markov_greedy":
+                    train_row.update({
+                        "tokens_per_chunk_local_expected": float(
+                            outputs["soft_tokens_per_chunk"].mean().detach()
+                        ),
+                        "tokens_per_chunk_compression_forward": float(
+                            outputs[
+                                "compression_tokens_per_chunk"
+                            ].mean().detach()
+                        ),
+                        "hard_soft_ratio_gap": float(
+                            outputs["hard_soft_ratio_gap"].mean().detach()
+                        ),
+                        "greedy_selected_probability": float(
+                            outputs[
+                                "greedy_selected_probability"
+                            ].mean().detach()
+                        ),
+                        "greedy_local_entropy": float(
+                            outputs["greedy_local_entropy"].mean().detach()
+                        ),
+                    })
                 append_jsonl(train_row, metrics_path)
                 tracker.log(
                     {
@@ -1185,6 +1265,12 @@ def main() -> None:
                     )
                     if model_cfg.segmentation_mode == "semi_markov_fixed_count":
                         interventions.update(_viterbi_path_churn(
+                            previous_segmentation_snapshot,
+                            segmentation_snapshot,
+                        ))
+                        previous_segmentation_snapshot = segmentation_snapshot
+                    elif model_cfg.segmentation_mode == "semi_markov_greedy":
+                        interventions.update(_greedy_path_churn(
                             previous_segmentation_snapshot,
                             segmentation_snapshot,
                         ))
@@ -1305,6 +1391,12 @@ def main() -> None:
             )
             if model_cfg.segmentation_mode == "semi_markov_fixed_count":
                 last_interventions.update(_viterbi_path_churn(
+                    previous_segmentation_snapshot,
+                    segmentation_snapshot,
+                ))
+                previous_segmentation_snapshot = segmentation_snapshot
+            elif model_cfg.segmentation_mode == "semi_markov_greedy":
+                last_interventions.update(_greedy_path_churn(
                     previous_segmentation_snapshot,
                     segmentation_snapshot,
                 ))

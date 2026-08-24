@@ -1111,6 +1111,234 @@ class SemiMarkovSegmenter(nn.Module):
         }
 
 
+class GreedySpanSegmenter(nn.Module):
+    """Choose each next bounded span locally with an aligned soft backward pass."""
+
+    def __init__(self, config: SegmentalVQVAEConfig):
+        super().__init__()
+        self.max_span_length = config.max_span_length
+        self.scorer = SpanScorer(config)
+
+    def _greedy_boundaries(
+        self,
+        span_scores: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Decode local argmax spans and retain local-softmax training statistics."""
+        batch_size, seq_len, max_span_length = span_scores.shape
+        if max_span_length != self.max_span_length:
+            raise ValueError("span_scores has the wrong maximum span length.")
+        batch_indices = torch.arange(batch_size, device=span_scores.device)
+        candidate_lengths = torch.arange(
+            1,
+            self.max_span_length + 1,
+            device=span_scores.device,
+            dtype=span_scores.dtype,
+        )
+        current = torch.zeros_like(lengths)
+        hard_boundaries = torch.zeros(
+            batch_size,
+            seq_len,
+            device=span_scores.device,
+            dtype=torch.bool,
+        )
+        expected_length_rows = []
+        selected_probability_rows = []
+        entropy_rows = []
+        active_rows = []
+        chosen_length_rows = []
+        for _ in range(seq_len):
+            active = current < lengths
+            safe_start = current.clamp(max=max(seq_len - 1, 0))
+            local_scores = span_scores[batch_indices, safe_start]
+            local_scores = torch.where(
+                active.unsqueeze(1),
+                local_scores,
+                torch.zeros_like(local_scores),
+            )
+            probabilities = torch.softmax(local_scores, dim=1)
+            chosen_indices = local_scores.argmax(dim=1)
+            chosen_lengths = chosen_indices + 1
+            chosen_lengths = torch.where(
+                active,
+                chosen_lengths,
+                torch.zeros_like(chosen_lengths),
+            )
+            boundary_positions = (
+                current + chosen_lengths - 1
+            ).clamp(min=0, max=max(seq_len - 1, 0))
+            hard_boundaries = hard_boundaries | (
+                F.one_hot(boundary_positions, num_classes=seq_len).bool()
+                & active.unsqueeze(1)
+            )
+            expected_length_rows.append(
+                (probabilities * candidate_lengths.unsqueeze(0)).sum(dim=1)
+            )
+            selected_probability_rows.append(
+                probabilities.gather(1, chosen_indices.unsqueeze(1)).squeeze(1)
+            )
+            entropy_rows.append(
+                -(probabilities * probabilities.clamp_min(1e-12).log()).sum(dim=1)
+            )
+            active_rows.append(active)
+            chosen_length_rows.append(chosen_lengths)
+            current = torch.where(active, current + chosen_lengths, current)
+
+        if not torch.equal(current, lengths):
+            raise RuntimeError("Greedy span decoding did not exactly cover the sequence.")
+        return (
+            hard_boundaries,
+            torch.stack(expected_length_rows, dim=1),
+            torch.stack(selected_probability_rows, dim=1),
+            torch.stack(entropy_rows, dim=1),
+            torch.stack(active_rows, dim=1),
+            torch.stack(chosen_length_rows, dim=1),
+        )
+
+    def _soft_span_proxies(
+        self,
+        hidden: torch.Tensor,
+        span_scores: torch.Tensor,
+        lengths: torch.Tensor,
+        active_steps: torch.Tensor,
+        chosen_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mix candidate-span means at each hard-visited start for STE gradients."""
+        batch_size, seq_len, hidden_dim = hidden.shape
+        batch_indices = torch.arange(batch_size, device=hidden.device)
+        candidate_lengths = torch.arange(
+            1,
+            self.max_span_length + 1,
+            device=hidden.device,
+        )
+        prefix = F.pad(hidden.cumsum(dim=1), (0, 0, 1, 0))
+        current = torch.zeros_like(lengths)
+        rows = []
+        for step in range(seq_len):
+            active = active_steps[:, step]
+            safe_start = current.clamp(max=max(seq_len - 1, 0))
+            local_scores = span_scores[batch_indices, safe_start]
+            local_scores = torch.where(
+                active.unsqueeze(1),
+                local_scores,
+                torch.zeros_like(local_scores),
+            )
+            probabilities = torch.softmax(local_scores, dim=1)
+            ends = (
+                safe_start.unsqueeze(1) + candidate_lengths.unsqueeze(0)
+            ).clamp(max=seq_len)
+            end_values = prefix.gather(
+                1,
+                ends.unsqueeze(-1).expand(-1, -1, hidden_dim),
+            )
+            start_values = prefix.gather(
+                1,
+                safe_start[:, None, None].expand(-1, 1, hidden_dim),
+            )
+            candidate_means = (
+                end_values - start_values
+            ) / candidate_lengths.to(hidden.dtype)[None, :, None]
+            rows.append(
+                (probabilities.unsqueeze(-1) * candidate_means).sum(dim=1)
+                * active.unsqueeze(1)
+            )
+            current = torch.where(
+                active,
+                current + chosen_lengths[:, step],
+                current,
+            )
+        return torch.stack(rows, dim=1)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        _, seq_len, _ = hidden.shape
+        lengths = valid_mask.sum(dim=1).long()
+        span_scores = self.scorer(hidden, valid_mask)
+        (
+            hard_boundaries,
+            expected_lengths,
+            selected_probabilities,
+            local_entropies,
+            active_steps,
+            chosen_lengths,
+        ) = self._greedy_boundaries(span_scores, lengths)
+        segment_ids = (
+            hard_boundaries.long().cumsum(dim=1) - hard_boundaries.long()
+        )
+        hard_assignment = F.one_hot(
+            segment_ids.clamp(min=0, max=seq_len - 1),
+            num_classes=seq_len,
+        ).to(dtype=hidden.dtype)
+        hard_assignment = hard_assignment * valid_mask.unsqueeze(-1)
+        soft_proxy = self._soft_span_proxies(
+            hidden,
+            span_scores,
+            lengths,
+            active_steps,
+            chosen_lengths,
+        )
+
+        chunk_counts = hard_boundaries.sum(dim=1)
+        chunk_mask = (
+            torch.arange(seq_len, device=hidden.device).unsqueeze(0)
+            < chunk_counts.unsqueeze(1)
+        )
+        active_float = active_steps.to(hidden.dtype)
+        local_expected_ratio = (
+            expected_lengths * active_float
+        ).sum(dim=1) / chunk_counts.clamp_min(1).to(hidden.dtype)
+        hard_ratio = lengths.to(hidden.dtype) / chunk_counts.clamp_min(1)
+        aligned_ratio = local_expected_ratio + (
+            hard_ratio - local_expected_ratio
+        ).detach()
+        mean_selected_probability = (
+            selected_probabilities * active_float
+        ).sum(dim=1) / chunk_counts.clamp_min(1).to(hidden.dtype)
+        mean_local_entropy = (
+            local_entropies * active_float
+        ).sum(dim=1) / chunk_counts.clamp_min(1).to(hidden.dtype)
+        boundary_values = hard_boundaries.to(hidden.dtype)
+        zero = span_scores[torch.isfinite(span_scores)].sum() * 0.0
+        return {
+            "pooled": soft_proxy,
+            "hard_assignment": hard_assignment,
+            "soft_assignment": hard_assignment.to(hidden.dtype),
+            "chunk_mask": chunk_mask,
+            "chunk_counts": chunk_counts,
+            "hard_boundaries": hard_boundaries,
+            "segment_ids": segment_ids,
+            "gate_logits": boundary_values,
+            "gate_probabilities": boundary_values,
+            "soft_chunk_counts": lengths.to(hidden.dtype)
+            / local_expected_ratio.clamp_min(1e-6),
+            "soft_tokens_per_chunk": local_expected_ratio,
+            "compression_tokens_per_chunk": aligned_ratio,
+            "hard_tokens_per_chunk": hard_ratio,
+            "gate_logit_l2": zero,
+            "hard_soft_ratio_gap": (
+                hard_ratio - local_expected_ratio
+            ).abs(),
+            "greedy_selected_probability": mean_selected_probability,
+            "greedy_local_entropy": mean_local_entropy,
+            "fixed_count_active": torch.zeros(
+                (), device=hidden.device, dtype=torch.bool
+            ),
+            "greedy_active": torch.ones(
+                (), device=hidden.device, dtype=torch.bool
+            ),
+        }
+
+
 class SegmentContentEncoder(nn.Module):
     """Encode selected spans bidirectionally without cross-span information."""
 
@@ -1624,6 +1852,7 @@ class SegmentalVQVAE(nn.Module):
         if config.segmentation_mode in {
             "semi_markov",
             "semi_markov_fixed_count",
+            "semi_markov_greedy",
         }:
             self.encoder_layers = None
             self.encoder_norm = None
@@ -1633,8 +1862,12 @@ class SegmentalVQVAE(nn.Module):
             self.boundary_encoder: LocalBoundaryEncoder | None = (
                 LocalBoundaryEncoder(config)
             )
-            self.semi_markov_segmenter: SemiMarkovSegmenter | None = (
-                SemiMarkovSegmenter(config)
+            self.semi_markov_segmenter: (
+                SemiMarkovSegmenter | GreedySpanSegmenter | None
+            ) = (
+                GreedySpanSegmenter(config)
+                if config.segmentation_mode == "semi_markov_greedy"
+                else SemiMarkovSegmenter(config)
             )
             self.span_content_encoder: SegmentContentEncoder | None = (
                 SegmentContentEncoder(config)
@@ -1703,6 +1936,7 @@ class SegmentalVQVAE(nn.Module):
         if self.config.segmentation_mode in {
             "semi_markov",
             "semi_markov_fixed_count",
+            "semi_markov_greedy",
         }:
             assert self.boundary_encoder is not None
             assert self.semi_markov_segmenter is not None
@@ -2164,7 +2398,10 @@ def segmental_vqvae_losses(
         commitment_raw = reconstruction.new_zeros(())
     commitment = config.commitment_beta * commitment_raw
 
-    soft_ratio = outputs["soft_tokens_per_chunk"]
+    soft_ratio = outputs.get(
+        "compression_tokens_per_chunk",
+        outputs["soft_tokens_per_chunk"],
+    )
     gate_logit_l2 = outputs["gate_logit_l2"]
     assert isinstance(soft_ratio, torch.Tensor)
     assert isinstance(gate_logit_l2, torch.Tensor)

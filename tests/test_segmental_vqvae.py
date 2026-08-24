@@ -11,6 +11,7 @@ from common.segmental_vqvae_config import (
     SegmentalVQVAEDataConfig,
 )
 from models.segmental_vqvae import (
+    GreedySpanSegmenter,
     LocalBoundaryEncoder,
     SemiMarkovSegmenter,
     SegmentContentEncoder,
@@ -20,6 +21,7 @@ from models.segmental_vqvae import (
     segmental_vqvae_losses,
 )
 from training.run_segmental_vqvae_experiment import (
+    _greedy_path_churn,
     _viterbi_path_churn,
     evaluate,
     evaluate_free_running,
@@ -352,6 +354,113 @@ def test_fixed_count_semi_markov_enforces_rate_and_disables_compression_loss():
     assert torch.count_nonzero(gradient) > 0
 
 
+def test_greedy_span_selection_is_local_not_viterbi_global():
+    config = _config(
+        segmentation_mode="semi_markov_greedy",
+        max_seq_len=4,
+        max_span_length=2,
+    )
+    greedy = GreedySpanSegmenter(config)
+    viterbi = SemiMarkovSegmenter(
+        _config(
+            segmentation_mode="semi_markov",
+            max_seq_len=4,
+            max_span_length=2,
+        )
+    )
+    span_scores = torch.tensor([[
+        [5.0, 4.0],
+        [-100.0, -100.0],
+        [0.0, 10.0],
+        [0.0, -torch.inf],
+    ]])
+    lengths = torch.tensor([4])
+
+    hard_boundaries, *_ = greedy._greedy_boundaries(span_scores, lengths)
+    viterbi_boundaries = viterbi._viterbi(span_scores, lengths)
+
+    assert hard_boundaries.tolist() == [[True, True, False, True]]
+    assert viterbi_boundaries.tolist() == [[False, True, False, True]]
+
+
+def test_greedy_span_rate_is_hard_forward_soft_backward():
+    torch.manual_seed(29)
+    model = SegmentalVQVAE(
+        _config(
+            segmentation_mode="semi_markov_greedy",
+            max_span_length=3,
+            compression_target=7.0,
+            compression_weight=2.0,
+            gate_logit_l2_weight=0.0,
+        )
+    )
+    batch = _batch()
+    outputs = model(
+        batch["input_ids"],
+        batch["attention_mask"],
+        use_quantizer=False,
+        sample_gates=False,
+    )
+    losses = segmental_vqvae_losses(
+        outputs,
+        batch["input_ids"],
+        batch["attention_mask"],
+        model.config,
+    )
+
+    torch.testing.assert_close(
+        outputs["compression_tokens_per_chunk"],
+        outputs["hard_tokens_per_chunk"],
+    )
+    expected_compression = 2.0 * (
+        outputs["hard_tokens_per_chunk"].mean() - 7.0
+    ).square()
+    torch.testing.assert_close(losses["compression_loss"], expected_compression)
+    for row, length in zip(
+        outputs["segment_ids"],
+        batch["attention_mask"].sum(dim=1),
+        strict=True,
+    ):
+        chunk_lengths = torch.bincount(row[:length])
+        assert int(chunk_lengths.max()) <= 3
+        assert int(chunk_lengths.sum()) == int(length)
+
+    losses["compression_loss"].backward()
+    assert isinstance(model.semi_markov_segmenter, GreedySpanSegmenter)
+    gradient = model.semi_markov_segmenter.scorer.mlp[-1].weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) > 0
+
+
+def test_greedy_span_diagnostics_report_local_soft_and_hard_gap():
+    model = SegmentalVQVAE(
+        _config(segmentation_mode="semi_markov_greedy", max_span_length=3)
+    ).eval()
+    metrics, snapshot = evaluate_interventions(
+        model,
+        _batch(),
+        torch.device("cpu"),
+        use_quantizer=False,
+        seed=61,
+    )
+    eval_metrics = evaluate(
+        model,
+        [_batch()],
+        torch.device("cpu"),
+        use_quantizer=False,
+    )
+
+    assert snapshot["fixed_count_active"] is False
+    assert metrics["tokens_per_chunk_local_expected"] >= 1.0
+    assert metrics["hard_soft_ratio_gap"] >= 0.0
+    assert 0.0 <= metrics["greedy_selected_probability"] <= 1.0
+    assert metrics["greedy_local_entropy"] >= 0.0
+    assert eval_metrics["tokens_per_chunk_local_expected"] >= 1.0
+    assert eval_metrics["hard_soft_ratio_gap"] >= 0.0
+    assert 0.0 <= eval_metrics["greedy_selected_probability"] <= 1.0
+
+
 def test_fixed_count_interventions_report_constraint_health():
     model = SegmentalVQVAE(
         _config(segmentation_mode="semi_markov_fixed_count")
@@ -401,6 +510,10 @@ def test_viterbi_path_churn_compares_the_same_fixed_examples():
     assert changed["viterbi_path_churn_available"] == 1
     assert changed["viterbi_path_change_fraction"] == 1.0
     assert math.isclose(changed["viterbi_boundary_churn"], 2.0 / 3.0)
+    greedy = _greedy_path_churn(first, second)
+    assert greedy["greedy_path_churn_available"] == 1
+    assert greedy["greedy_path_change_fraction"] == 1.0
+    assert math.isclose(greedy["greedy_boundary_churn"], 2.0 / 3.0)
 
 
 def test_semi_markov_reconstruction_gradient_reaches_span_scorer():
@@ -849,6 +962,22 @@ def test_fixed_count_semi_markov_config_contains_only_the_constrained_run():
     assert fixed_count["latent-routing"] == "global_cross_attention"
     assert fixed_count["segmentation-mode"] == "semi_markov_fixed_count"
     assert fixed_count["compression-weight"] == 0.0
+
+
+def test_greedy_semi_markov_config_contains_only_the_local_run():
+    config_path = (
+        Path(__file__).parents[1]
+        / "configs"
+        / "segmental-vqvae-bpe-k8192-semimarkov-greedy.json"
+    )
+    experiments = json.loads(config_path.read_text())["experiments"]
+    assert len(experiments) == 1
+    greedy = experiments[0]
+    assert greedy["continuous-truncation"] is False
+    assert greedy["latent-routing"] == "global_cross_attention"
+    assert greedy["segmentation-mode"] == "semi_markov_greedy"
+    assert greedy["compression-weight"] == 10.0
+    assert greedy["gate-logit-l2-weight"] == 0.0
 
 
 def test_metrics_first_checkpoints_overwrite_and_drop_resume_state():
