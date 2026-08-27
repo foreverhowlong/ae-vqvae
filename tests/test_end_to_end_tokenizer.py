@@ -12,6 +12,10 @@ from models.end_to_end_tokenizer import (
 )
 from models.segmental_vqvae import GreedySpanSegmenter
 from training.run_experiment_sequence import load_config
+from training.run_end_to_end_tokenizer_experiment import (
+    _set_prior_trainable,
+    prior_objective_weight,
+)
 
 
 def _config(**overrides) -> EndToEndTokenizerConfig:
@@ -136,6 +140,44 @@ def test_rate_dual_uses_observed_hard_chunk_rate():
     assert decreased < increased
 
 
+def test_vq_warmup_schedule_delays_and_then_anneals_prior_objective():
+    weights = [
+        prior_objective_weight(
+            step,
+            vq_warmup_steps=3,
+            prior_anneal_steps=2,
+        )
+        for step in range(1, 7)
+    ]
+    assert weights == [0.0, 0.0, 0.0, 0.5, 1.0, 1.0]
+
+
+def test_vq_warmup_trains_reconstruction_path_without_prior_parameters():
+    torch.manual_seed(13)
+    model = EndToEndTokenizerModel(_config()).train()
+    _set_prior_trainable(model, False)
+    input_ids, attention_mask, legal_endpoints = _batch()
+    outputs = model(input_ids, attention_mask, legal_endpoints)
+    losses = end_to_end_tokenizer_losses(
+        outputs,
+        input_ids,
+        attention_mask,
+        model,
+        prior_weight=0.0,
+    )
+    expected = (
+        losses["text_nll_per_bpe"]
+        + losses["commitment_weighted_loss"]
+        + losses["rate_constraint_loss"]
+    )
+    torch.testing.assert_close(losses["loss"], expected)
+    losses["loss"].backward()
+    assert all(parameter.grad is None for parameter in model.chunk_prior.parameters())
+    gradient = model.latent_projection.weight.grad
+    assert gradient is not None
+    assert torch.count_nonzero(gradient) > 0
+
+
 def test_end_to_end_experiment_config_is_single_runnable_experiment():
     path = (
         Path(__file__).resolve().parents[1]
@@ -151,3 +193,19 @@ def test_end_to_end_experiment_config_is_single_runnable_experiment():
     assert experiment["continuous-truncation"] is False
     assert experiment["word-boundary-only"] is True
     json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_vq_warmup_config_preserves_original_experiment_shape():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "end-to-end-greedy-vq-k8192-18m-vq-warmup.json"
+    )
+    module, experiments = load_config(path)
+    assert module == "training.run_end_to_end_tokenizer_experiment"
+    assert len(experiments) == 1
+    experiment = experiments[0]
+    assert experiment["vq-warmup-steps"] == 3000
+    assert experiment["prior-anneal-steps"] == 2000
+    assert experiment["max-train-samples"] == 50000
+    assert experiment["continuous-truncation"] is False

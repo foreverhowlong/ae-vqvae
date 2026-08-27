@@ -26,6 +26,8 @@ class EndToEndTokenizerTrainConfig:
     target_prior_parameters: int = 18_000_000
     parameter_tolerance: float = 0.05
     save_last_resume: bool = False
+    vq_warmup_steps: int = 0
+    prior_anneal_steps: int = 0
 
 
 @dataclass

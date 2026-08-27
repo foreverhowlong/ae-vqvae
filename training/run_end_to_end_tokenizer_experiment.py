@@ -49,6 +49,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         ("num-workers", int),
         ("target-prior-parameters", int),
         ("parameter-tolerance", float),
+        ("vq-warmup-steps", int),
+        ("prior-anneal-steps", int),
         ("max-train-samples", int),
         ("max-eval-samples", int),
         ("val-fraction", float),
@@ -143,9 +145,36 @@ def build_configs(
         train.eval_every,
     ) < 1:
         raise ValueError("Training counts and cadence must be positive.")
+    if train.vq_warmup_steps < 0 or train.prior_anneal_steps < 0:
+        raise ValueError("Warmup and annealing steps must be non-negative.")
     if not 0 <= data.val_fraction < 1:
         raise ValueError("val_fraction must be in [0, 1).")
     return train, data, model
+
+
+def prior_objective_weight(
+    optimizer_step: int,
+    *,
+    vq_warmup_steps: int,
+    prior_anneal_steps: int,
+) -> float:
+    """Keep the latent prior off during VQ warmup, then introduce it linearly."""
+    if optimizer_step <= vq_warmup_steps:
+        return 0.0
+    if prior_anneal_steps == 0:
+        return 1.0
+    return min(
+        (optimizer_step - vq_warmup_steps) / prior_anneal_steps,
+        1.0,
+    )
+
+
+def _set_prior_trainable(
+    model: EndToEndTokenizerModel,
+    trainable: bool,
+) -> None:
+    model.chunk_prior.requires_grad_(trainable)
+    model.chunk_prior.train(trainable)
 
 
 def _batch_to_device(batch, device: torch.device) -> dict[str, torch.Tensor]:
@@ -364,6 +393,17 @@ def main() -> None:
         device=device,
         num_workers=train_cfg.num_workers,
     )
+    optimizer_steps_per_epoch = math.ceil(
+        len(train_loader) / train_cfg.gradient_accumulation_steps
+    )
+    total_optimizer_steps = train_cfg.epochs * optimizer_steps_per_epoch
+    if (
+        train_cfg.vq_warmup_steps + train_cfg.prior_anneal_steps
+        >= total_optimizer_steps
+    ):
+        raise ValueError(
+            "VQ warmup plus prior annealing must leave at least one full-objective step."
+        )
     validation_loader = make_loader(
         validation_dataset,
         train_cfg.batch_size,
@@ -383,6 +423,7 @@ def main() -> None:
     )
     diagnostic_batch = next(iter(diagnostic_loader))
     model = model.to(device)
+    _set_prior_trainable(model, train_cfg.vq_warmup_steps == 0)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_cfg.learning_rate,
@@ -403,6 +444,12 @@ def main() -> None:
         "[Objective] length NLL + code NLL + causal text NLL; "
         f"hard rate target={model_cfg.compression_target:.3f} BPE/chunk"
     )
+    if train_cfg.vq_warmup_steps:
+        print(
+            "[VQ warmup] "
+            f"text+commitment+rate for {train_cfg.vq_warmup_steps} steps; "
+            f"length/code NLL annealed over {train_cfg.prior_anneal_steps} steps"
+        )
     metrics_path = run_dir / "metrics.jsonl"
     global_step = 0
     best_bpb = math.inf
@@ -422,6 +469,12 @@ def main() -> None:
         for epoch in range(1, train_cfg.epochs + 1):
             model.train()
             for batch_index, cpu_batch in enumerate(train_loader):
+                prior_weight = prior_objective_weight(
+                    global_step + 1,
+                    vq_warmup_steps=train_cfg.vq_warmup_steps,
+                    prior_anneal_steps=train_cfg.prior_anneal_steps,
+                )
+                _set_prior_trainable(model, prior_weight > 0.0)
                 batch = _batch_to_device(cpu_batch, device)
                 outputs = model(
                     batch["input_ids"],
@@ -433,6 +486,7 @@ def main() -> None:
                     batch["input_ids"],
                     batch["attention_mask"],
                     model,
+                    prior_weight=prior_weight,
                 )
                 (losses["loss"] / train_cfg.gradient_accumulation_steps).backward()
                 accumulated += 1
@@ -458,6 +512,7 @@ def main() -> None:
                     "epoch": epoch,
                     "step": global_step,
                     "loss": float(losses["loss"].detach()),
+                    "training_nll_per_bpe": float(losses["training_nll_per_bpe"].detach()),
                     "generative_nll_per_bpe": float(losses["generative_nll_per_bpe"].detach()),
                     "length_nll_per_bpe": float(losses["length_nll_per_bpe"].detach()),
                     "code_nll_per_bpe": float(losses["code_nll_per_bpe"].detach()),
@@ -466,6 +521,14 @@ def main() -> None:
                     "rate_constraint_loss": float(losses["rate_constraint_loss"].detach()),
                     "tokens_per_chunk": 1.0 / max(hard_rate, 1e-12),
                     "rate_dual": float(model.rate_dual),
+                    "prior_weight": prior_weight,
+                    "phase": (
+                        "vq_warmup"
+                        if prior_weight == 0.0
+                        else "prior_anneal"
+                        if prior_weight < 1.0
+                        else "joint"
+                    ),
                     "grad_norm": float(grad_norm),
                     "elapsed_sec": time.time() - started,
                 }

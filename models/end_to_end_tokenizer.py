@@ -393,8 +393,12 @@ def end_to_end_tokenizer_losses(
     targets: torch.Tensor,
     attention_mask: torch.Tensor,
     model: EndToEndTokenizerModel,
+    *,
+    prior_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Hard-forward codelength with local-softmax gradients for discrete choices."""
+    if not 0.0 <= prior_weight <= 1.0:
+        raise ValueError("prior_weight must be in [0, 1].")
     valid_mask = attention_mask.to(device=targets.device, dtype=torch.bool)
     chunk_mask = outputs["latent_mask"].bool()
     token_count = valid_mask.sum().clamp_min(1)
@@ -461,10 +465,15 @@ def end_to_end_tokenizer_losses(
 
     generative_nll_sum = length_nll_sum + code_nll_sum + text_nll_sum
     generative_nll_per_bpe = generative_nll_sum / token_count
+    prior_nll_sum = length_nll_sum + code_nll_sum
+    training_nll_per_bpe = (
+        text_nll_sum + prior_weight * prior_nll_sum
+    ) / token_count
     commitment = model.config.commitment_beta * commitment_raw
-    loss = generative_nll_per_bpe + commitment + rate_constraint
+    loss = training_nll_per_bpe + commitment + rate_constraint
     return {
         "loss": loss,
+        "training_nll_per_bpe": training_nll_per_bpe,
         "generative_nll_sum": generative_nll_sum,
         "generative_nll_per_bpe": generative_nll_per_bpe,
         "length_nll_sum": length_nll_sum,
@@ -480,6 +489,7 @@ def end_to_end_tokenizer_losses(
         "hard_tokens_per_chunk": token_count / hard_chunk_count.clamp_min(1.0),
         "aligned_chunks_per_token": aligned_chunks_per_token,
         "rate_dual": model.rate_dual.detach().clone(),
+        "prior_weight": text_nll_sum.new_tensor(prior_weight),
         "token_count": token_count,
         "chunk_count": hard_chunk_count,
     }
