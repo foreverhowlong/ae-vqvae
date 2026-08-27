@@ -1130,6 +1130,7 @@ class GreedySpanSegmenter(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         """Decode local argmax spans and retain local-softmax training statistics."""
         batch_size, seq_len, max_span_length = span_scores.shape
@@ -1154,6 +1155,7 @@ class GreedySpanSegmenter(nn.Module):
         entropy_rows = []
         active_rows = []
         chosen_length_rows = []
+        probability_rows = []
         for _ in range(seq_len):
             active = current < lengths
             safe_start = current.clamp(max=max(seq_len - 1, 0))
@@ -1189,6 +1191,7 @@ class GreedySpanSegmenter(nn.Module):
             )
             active_rows.append(active)
             chosen_length_rows.append(chosen_lengths)
+            probability_rows.append(probabilities)
             current = torch.where(active, current + chosen_lengths, current)
 
         if not torch.equal(current, lengths):
@@ -1200,7 +1203,42 @@ class GreedySpanSegmenter(nn.Module):
             torch.stack(entropy_rows, dim=1),
             torch.stack(active_rows, dim=1),
             torch.stack(chosen_length_rows, dim=1),
+            torch.stack(probability_rows, dim=1),
         )
+
+    def _mask_illegal_endpoints(
+        self,
+        span_scores: torch.Tensor,
+        legal_endpoints: torch.Tensor,
+    ) -> torch.Tensor:
+        """Restrict spans to legal ends, with a bounded emergency fallback."""
+        if legal_endpoints.shape != span_scores.shape[:2]:
+            raise ValueError("legal_endpoints must match hidden sequence dimensions.")
+        _, seq_len, max_span_length = span_scores.shape
+        starts = torch.arange(seq_len, device=span_scores.device).unsqueeze(1)
+        candidate_lengths = torch.arange(
+            1,
+            max_span_length + 1,
+            device=span_scores.device,
+        ).unsqueeze(0)
+        ends = starts + candidate_lengths - 1
+        in_range = ends < seq_len
+        endpoint_legal = legal_endpoints.gather(
+            1,
+            ends.clamp_max(seq_len - 1).reshape(1, -1).expand(
+                legal_endpoints.shape[0], -1
+            ),
+        ).reshape(legal_endpoints.shape[0], seq_len, max_span_length)
+        candidate_valid = torch.isfinite(span_scores) & in_range.unsqueeze(0)
+        permitted = candidate_valid & endpoint_legal
+
+        # A very long word can contain no legal endpoint within max_span_length.
+        # Keep the partition feasible by allowing only the furthest valid span.
+        missing = candidate_valid.any(dim=-1) & ~permitted.any(dim=-1)
+        furthest = candidate_valid.long().sum(dim=-1).clamp_min(1) - 1
+        fallback = F.one_hot(furthest, num_classes=max_span_length).bool()
+        permitted = permitted | (fallback & missing.unsqueeze(-1))
+        return span_scores.masked_fill(~permitted, float("-inf"))
 
     def _soft_span_proxies(
         self,
@@ -1260,10 +1298,16 @@ class GreedySpanSegmenter(nn.Module):
         self,
         hidden: torch.Tensor,
         valid_mask: torch.Tensor,
+        legal_endpoints: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         _, seq_len, _ = hidden.shape
         lengths = valid_mask.sum(dim=1).long()
         span_scores = self.scorer(hidden, valid_mask)
+        if legal_endpoints is not None:
+            span_scores = self._mask_illegal_endpoints(
+                span_scores,
+                legal_endpoints.to(device=hidden.device, dtype=torch.bool),
+            )
         (
             hard_boundaries,
             expected_lengths,
@@ -1271,6 +1315,7 @@ class GreedySpanSegmenter(nn.Module):
             local_entropies,
             active_steps,
             chosen_lengths,
+            length_probabilities,
         ) = self._greedy_boundaries(span_scores, lengths)
         segment_ids = (
             hard_boundaries.long().cumsum(dim=1) - hard_boundaries.long()
@@ -1330,6 +1375,9 @@ class GreedySpanSegmenter(nn.Module):
             ).abs(),
             "greedy_selected_probability": mean_selected_probability,
             "greedy_local_entropy": mean_local_entropy,
+            "greedy_active_steps": active_steps,
+            "greedy_chosen_lengths": chosen_lengths,
+            "greedy_length_probabilities": length_probabilities,
             "fixed_count_active": torch.zeros(
                 (), device=hidden.device, dtype=torch.bool
             ),
