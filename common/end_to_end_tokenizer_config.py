@@ -28,6 +28,9 @@ class EndToEndTokenizerTrainConfig:
     save_last_resume: bool = False
     vq_warmup_steps: int = 0
     prior_anneal_steps: int = 0
+    ae_warmup_steps: int = 0
+    prior_catchup_steps: int = 0
+    kmeans_max_vectors: int = 65536
 
 
 @dataclass
@@ -84,6 +87,9 @@ class EndToEndTokenizerConfig:
     rate_dual_initial: float = 0.0
     rate_dual_lr: float = 0.05
     rate_dual_max_abs: float = 20.0
+    fixed_chunk_quota: bool = False
+    segmenter_only_downstream: bool = False
+    segmenter_downstream_weight: float = 0.1
     word_boundary_only: bool = True
     dropout: float = 0.1
 
@@ -116,6 +122,8 @@ class EndToEndTokenizerConfig:
             raise ValueError("All model depths must be positive.")
         if self.rate_dual_lr < 0 or self.rate_dual_max_abs <= 0:
             raise ValueError("Rate-dual learning rate and bound must be valid.")
+        if self.segmenter_downstream_weight < 0:
+            raise ValueError("segmenter_downstream_weight must be non-negative.")
         if not 0 <= self.commitment_beta:
             raise ValueError("commitment_beta must be non-negative.")
         special_ids = {self.pad_token_id, self.bos_token_id, self.eos_token_id}

@@ -1117,12 +1117,15 @@ class GreedySpanSegmenter(nn.Module):
     def __init__(self, config: SegmentalVQVAEConfig):
         super().__init__()
         self.max_span_length = config.max_span_length
+        self.compression_target = config.compression_target
         self.scorer = SpanScorer(config)
 
     def _greedy_boundaries(
         self,
         span_scores: torch.Tensor,
         lengths: torch.Tensor,
+        target_chunk_counts: torch.Tensor | None = None,
+        fallback_scores: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1137,12 +1140,23 @@ class GreedySpanSegmenter(nn.Module):
         if max_span_length != self.max_span_length:
             raise ValueError("span_scores has the wrong maximum span length.")
         batch_indices = torch.arange(batch_size, device=span_scores.device)
-        candidate_lengths = torch.arange(
+        candidate_length_ids = torch.arange(
             1,
             self.max_span_length + 1,
             device=span_scores.device,
-            dtype=span_scores.dtype,
         )
+        candidate_lengths = candidate_length_ids.to(span_scores.dtype)
+        if target_chunk_counts is not None:
+            minimum_counts = torch.div(
+                lengths + self.max_span_length - 1,
+                self.max_span_length,
+                rounding_mode="floor",
+            )
+            if (
+                (target_chunk_counts < minimum_counts).any()
+                or (target_chunk_counts > lengths).any()
+            ):
+                raise ValueError("target_chunk_counts is infeasible for the sequence.")
         current = torch.zeros_like(lengths)
         hard_boundaries = torch.zeros(
             batch_size,
@@ -1156,10 +1170,48 @@ class GreedySpanSegmenter(nn.Module):
         active_rows = []
         chosen_length_rows = []
         probability_rows = []
-        for _ in range(seq_len):
-            active = current < lengths
+        for step in range(seq_len):
+            active = (
+                step < target_chunk_counts
+                if target_chunk_counts is not None
+                else current < lengths
+            )
             safe_start = current.clamp(max=max(seq_len - 1, 0))
             local_scores = span_scores[batch_indices, safe_start]
+            if target_chunk_counts is not None:
+                remaining_chunks = target_chunk_counts - step - 1
+                remaining_tokens = (
+                    lengths.unsqueeze(1)
+                    - current.unsqueeze(1)
+                    - candidate_length_ids.unsqueeze(0)
+                )
+                quota_feasible = (
+                    (remaining_tokens >= remaining_chunks.unsqueeze(1))
+                    & (
+                        remaining_tokens
+                        <= remaining_chunks.unsqueeze(1) * self.max_span_length
+                    )
+                )
+                local_scores = local_scores.masked_fill(
+                    active.unsqueeze(1) & ~quota_feasible,
+                    float("-inf"),
+                )
+                missing = active & ~torch.isfinite(local_scores).any(dim=1)
+                if missing.any() and fallback_scores is not None:
+                    fallback_local = fallback_scores[batch_indices, safe_start]
+                    fallback_local = fallback_local.masked_fill(
+                        ~quota_feasible,
+                        float("-inf"),
+                    )
+                    local_scores = torch.where(
+                        missing.unsqueeze(1),
+                        fallback_local,
+                        local_scores,
+                    )
+                if (active & ~torch.isfinite(local_scores).any(dim=1)).any():
+                    raise RuntimeError(
+                        "No locally legal span can satisfy the remaining chunk quota."
+                    )
             local_scores = torch.where(
                 active.unsqueeze(1),
                 local_scores,
@@ -1196,6 +1248,11 @@ class GreedySpanSegmenter(nn.Module):
 
         if not torch.equal(current, lengths):
             raise RuntimeError("Greedy span decoding did not exactly cover the sequence.")
+        if (
+            target_chunk_counts is not None
+            and not torch.equal(hard_boundaries.sum(dim=1), target_chunk_counts)
+        ):
+            raise RuntimeError("Greedy span decoding did not satisfy the chunk quota.")
         return (
             hard_boundaries,
             torch.stack(expected_length_rows, dim=1),
@@ -1243,14 +1300,13 @@ class GreedySpanSegmenter(nn.Module):
     def _soft_span_proxies(
         self,
         hidden: torch.Tensor,
-        span_scores: torch.Tensor,
         lengths: torch.Tensor,
         active_steps: torch.Tensor,
         chosen_lengths: torch.Tensor,
+        length_probabilities: torch.Tensor,
     ) -> torch.Tensor:
         """Mix candidate-span means at each hard-visited start for STE gradients."""
         batch_size, seq_len, hidden_dim = hidden.shape
-        batch_indices = torch.arange(batch_size, device=hidden.device)
         candidate_lengths = torch.arange(
             1,
             self.max_span_length + 1,
@@ -1262,13 +1318,7 @@ class GreedySpanSegmenter(nn.Module):
         for step in range(seq_len):
             active = active_steps[:, step]
             safe_start = current.clamp(max=max(seq_len - 1, 0))
-            local_scores = span_scores[batch_indices, safe_start]
-            local_scores = torch.where(
-                active.unsqueeze(1),
-                local_scores,
-                torch.zeros_like(local_scores),
-            )
-            probabilities = torch.softmax(local_scores, dim=1)
+            probabilities = length_probabilities[:, step]
             ends = (
                 safe_start.unsqueeze(1) + candidate_lengths.unsqueeze(0)
             ).clamp(max=seq_len)
@@ -1299,15 +1349,32 @@ class GreedySpanSegmenter(nn.Module):
         hidden: torch.Tensor,
         valid_mask: torch.Tensor,
         legal_endpoints: torch.Tensor | None = None,
+        *,
+        fixed_chunk_quota: bool = False,
     ) -> dict[str, torch.Tensor]:
         _, seq_len, _ = hidden.shape
         lengths = valid_mask.sum(dim=1).long()
-        span_scores = self.scorer(hidden, valid_mask)
+        raw_span_scores = self.scorer(hidden, valid_mask)
+        span_scores = raw_span_scores
         if legal_endpoints is not None:
             span_scores = self._mask_illegal_endpoints(
                 span_scores,
                 legal_endpoints.to(device=hidden.device, dtype=torch.bool),
             )
+        target_chunk_counts = None
+        if fixed_chunk_quota:
+            target_chunk_counts = torch.round(
+                lengths.to(torch.float32) / self.compression_target
+            ).long()
+            minimum_counts = torch.div(
+                lengths + self.max_span_length - 1,
+                self.max_span_length,
+                rounding_mode="floor",
+            )
+            target_chunk_counts = torch.maximum(
+                target_chunk_counts,
+                minimum_counts,
+            ).clamp(min=1).minimum(lengths)
         (
             hard_boundaries,
             expected_lengths,
@@ -1316,7 +1383,12 @@ class GreedySpanSegmenter(nn.Module):
             active_steps,
             chosen_lengths,
             length_probabilities,
-        ) = self._greedy_boundaries(span_scores, lengths)
+        ) = self._greedy_boundaries(
+            span_scores,
+            lengths,
+            target_chunk_counts=target_chunk_counts,
+            fallback_scores=raw_span_scores,
+        )
         segment_ids = (
             hard_boundaries.long().cumsum(dim=1) - hard_boundaries.long()
         )
@@ -1327,10 +1399,10 @@ class GreedySpanSegmenter(nn.Module):
         hard_assignment = hard_assignment * valid_mask.unsqueeze(-1)
         soft_proxy = self._soft_span_proxies(
             hidden,
-            span_scores,
             lengths,
             active_steps,
             chosen_lengths,
+            length_probabilities,
         )
 
         chunk_counts = hard_boundaries.sum(dim=1)
@@ -1378,8 +1450,23 @@ class GreedySpanSegmenter(nn.Module):
             "greedy_active_steps": active_steps,
             "greedy_chosen_lengths": chosen_lengths,
             "greedy_length_probabilities": length_probabilities,
-            "fixed_count_active": torch.zeros(
-                (), device=hidden.device, dtype=torch.bool
+            "fixed_count_active": torch.tensor(
+                fixed_chunk_quota,
+                device=hidden.device,
+                dtype=torch.bool,
+            ),
+            "target_chunk_counts": (
+                target_chunk_counts
+                if target_chunk_counts is not None
+                else chunk_counts
+            ),
+            "chunk_count_constraint_violation": (
+                chunk_counts
+                != (
+                    target_chunk_counts
+                    if target_chunk_counts is not None
+                    else chunk_counts
+                )
             ),
             "greedy_active": torch.ones(
                 (), device=hidden.device, dtype=torch.bool

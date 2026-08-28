@@ -25,6 +25,12 @@ from models.end_to_end_tokenizer import (
     end_to_end_tokenizer_losses,
 )
 from models.text_vqvae import codebook_stats
+from training.end_to_end_tokenizer_phases import (
+    EndToEndPhase,
+    EndToEndPhaseSchedule,
+)
+from training.text_vqvae.codebook_init import initialize_codebook_kmeans
+from training.text_vqvae.geometry import preserve_rng_state
 from training.text_vqvae.loop import make_loader, split_dataset
 from training.text_vqvae.reporting import append_jsonl, atomic_json_dump
 from training.segmental_vqvae_reporting import (
@@ -49,8 +55,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         ("num-workers", int),
         ("target-prior-parameters", int),
         ("parameter-tolerance", float),
+        ("ae-warmup-steps", int),
         ("vq-warmup-steps", int),
+        ("prior-catchup-steps", int),
         ("prior-anneal-steps", int),
+        ("kmeans-max-vectors", int),
         ("max-train-samples", int),
         ("max-eval-samples", int),
         ("val-fraction", float),
@@ -81,6 +90,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         ("rate-dual-initial", float),
         ("rate-dual-lr", float),
         ("rate-dual-max-abs", float),
+        ("segmenter-downstream-weight", float),
         ("dropout", float),
     ):
         parser.add_argument(f"--{name}", type=value_type)
@@ -100,6 +110,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "prior-bias",
         "text-decoder-bias",
         "save-last-resume",
+        "fixed-chunk-quota",
+        "segmenter-only-downstream",
     ):
         parser.add_argument(
             f"--{name}",
@@ -145,8 +157,20 @@ def build_configs(
         train.eval_every,
     ) < 1:
         raise ValueError("Training counts and cadence must be positive.")
-    if train.vq_warmup_steps < 0 or train.prior_anneal_steps < 0:
-        raise ValueError("Warmup and annealing steps must be non-negative.")
+    schedule = EndToEndPhaseSchedule(
+        ae_warmup_steps=train.ae_warmup_steps,
+        vq_warmup_steps=train.vq_warmup_steps,
+        prior_catchup_steps=train.prior_catchup_steps,
+        prior_anneal_steps=train.prior_anneal_steps,
+        segmenter_only_downstream=model.segmenter_only_downstream,
+        segmenter_downstream_weight=model.segmenter_downstream_weight,
+    )
+    if train.kmeans_max_vectors < model.codebook_size:
+        raise ValueError("kmeans_max_vectors must be at least codebook_size.")
+    if model.segmenter_only_downstream and schedule.segmenter_downstream_weight == 0:
+        raise ValueError(
+            "segmenter_only_downstream requires a positive downstream weight."
+        )
     if not 0 <= data.val_fraction < 1:
         raise ValueError("val_fraction must be in [0, 1).")
     return train, data, model
@@ -175,6 +199,27 @@ def _set_prior_trainable(
 ) -> None:
     model.chunk_prior.requires_grad_(trainable)
     model.chunk_prior.train(trainable)
+
+
+def _set_phase_trainability(
+    model: EndToEndTokenizerModel,
+    phase: EndToEndPhase,
+) -> None:
+    """Apply phase ownership without rebuilding the optimizer."""
+    tokenizer_modules = (
+        model.token_embedding,
+        model.boundary_encoder,
+        model.segmenter,
+        model.span_encoder,
+        model.latent_projection,
+    )
+    for module in tokenizer_modules:
+        module.requires_grad_(phase.train_tokenizer)
+        module.train(phase.train_tokenizer)
+    model.text_decoder.requires_grad_(phase.train_text_decoder)
+    model.text_decoder.train(phase.train_text_decoder)
+    model.chunk_prior.requires_grad_(phase.train_prior)
+    model.chunk_prior.train(phase.train_prior)
 
 
 def _batch_to_device(batch, device: torch.device) -> dict[str, torch.Tensor]:
@@ -349,7 +394,11 @@ def main() -> None:
         "prior_parameter_error_fraction": prior_error,
         "metric_contract": {
             "bits_per_raw_byte": "(length NLL + code NLL + text NLL) / raw UTF-8 bytes / ln(2)",
-            "excluded_from_bpb": ["commitment loss", "rate dual constraint"],
+            "excluded_from_bpb": [
+                "commitment loss",
+                "rate dual constraint",
+                "segmenter downstream gradient surrogate",
+            ],
         },
     }
     if args.print_config:
@@ -397,13 +446,25 @@ def main() -> None:
         len(train_loader) / train_cfg.gradient_accumulation_steps
     )
     total_optimizer_steps = train_cfg.epochs * optimizer_steps_per_epoch
-    if (
-        train_cfg.vq_warmup_steps + train_cfg.prior_anneal_steps
-        >= total_optimizer_steps
-    ):
+    phase_schedule = EndToEndPhaseSchedule(
+        ae_warmup_steps=train_cfg.ae_warmup_steps,
+        vq_warmup_steps=train_cfg.vq_warmup_steps,
+        prior_catchup_steps=train_cfg.prior_catchup_steps,
+        prior_anneal_steps=train_cfg.prior_anneal_steps,
+        segmenter_only_downstream=model_cfg.segmenter_only_downstream,
+        segmenter_downstream_weight=model_cfg.segmenter_downstream_weight,
+    )
+    if phase_schedule.reserved_steps >= total_optimizer_steps:
         raise ValueError(
-            "VQ warmup plus prior annealing must leave at least one full-objective step."
+            "The curriculum must leave at least one joint-objective step."
         )
+    kmeans_loader = make_loader(
+        train_dataset,
+        train_cfg.batch_size,
+        shuffle=False,
+        device=device,
+        num_workers=0,
+    )
     validation_loader = make_loader(
         validation_dataset,
         train_cfg.batch_size,
@@ -423,7 +484,7 @@ def main() -> None:
     )
     diagnostic_batch = next(iter(diagnostic_loader))
     model = model.to(device)
-    _set_prior_trainable(model, train_cfg.vq_warmup_steps == 0)
+    _set_phase_trainability(model, phase_schedule.state(1))
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_cfg.learning_rate,
@@ -434,6 +495,18 @@ def main() -> None:
         "train_examples": len(train_dataset),
         "validation_examples": len(validation_dataset),
     })
+    payload["phase_schedule"] = {
+        "reserved_steps": phase_schedule.reserved_steps,
+        "joint_steps": total_optimizer_steps - phase_schedule.reserved_steps,
+    }
+    payload["codebook_initialization"] = {
+        "method": "kmeans" if train_cfg.ae_warmup_steps else "ema_from_random",
+        "status": (
+            "pending_ae_warmup"
+            if train_cfg.ae_warmup_steps
+            else "not_requested"
+        ),
+    }
     atomic_json_dump(payload, run_dir / "config.json")
 
     print(
@@ -444,11 +517,18 @@ def main() -> None:
         "[Objective] length NLL + code NLL + causal text NLL; "
         f"hard rate target={model_cfg.compression_target:.3f} BPE/chunk"
     )
-    if train_cfg.vq_warmup_steps:
+    print(
+        "[Curriculum] "
+        f"AE={train_cfg.ae_warmup_steps} VQ={train_cfg.vq_warmup_steps} "
+        f"prior-catchup={train_cfg.prior_catchup_steps} "
+        f"prior-anneal={train_cfg.prior_anneal_steps} optimizer steps"
+    )
+    if model_cfg.fixed_chunk_quota:
+        print("[Rate] exact per-sequence greedy chunk quota; rate dual disabled")
+    if model_cfg.segmenter_only_downstream:
         print(
-            "[VQ warmup] "
-            f"text+commitment+rate for {train_cfg.vq_warmup_steps} steps; "
-            f"length/code NLL annealed over {train_cfg.prior_anneal_steps} steps"
+            "[Gradient routing] hard prior CE -> prior; detached downstream "
+            f"surrogate -> segmenter (weight={model_cfg.segmenter_downstream_weight:g})"
         )
     metrics_path = run_dir / "metrics.jsonl"
     global_step = 0
@@ -459,6 +539,8 @@ def main() -> None:
     optimizer.zero_grad(set_to_none=True)
     accumulated = 0
     accumulated_rate = 0.0
+    kmeans_initialized = train_cfg.ae_warmup_steps == 0
+    previous_phase_name = None
 
     with wandb_run(
         run_name,
@@ -469,24 +551,70 @@ def main() -> None:
         for epoch in range(1, train_cfg.epochs + 1):
             model.train()
             for batch_index, cpu_batch in enumerate(train_loader):
-                prior_weight = prior_objective_weight(
-                    global_step + 1,
-                    vq_warmup_steps=train_cfg.vq_warmup_steps,
-                    prior_anneal_steps=train_cfg.prior_anneal_steps,
-                )
-                _set_prior_trainable(model, prior_weight > 0.0)
+                phase = phase_schedule.state(global_step + 1)
+                if phase.use_quantizer and not kmeans_initialized:
+                    with preserve_rng_state():
+                        init_result = initialize_codebook_kmeans(
+                            model,
+                            kmeans_loader,
+                            device,
+                            train_cfg.seed,
+                            max_vectors=train_cfg.kmeans_max_vectors,
+                        )
+                    kmeans_initialized = True
+                    payload["codebook_initialization"] = {
+                        "method": "kmeans",
+                        "status": "completed",
+                        "transition_step": global_step,
+                        **init_result,
+                    }
+                    atomic_json_dump(payload, run_dir / "config.json")
+                    append_jsonl(
+                        {
+                            "split": "phase_transition",
+                            "event": "kmeans_initialized",
+                            "step": global_step,
+                            "phase": phase.name,
+                            **init_result,
+                        },
+                        metrics_path,
+                    )
+                    print(
+                        f"[Phase transition] step={global_step} K-means initialized "
+                        f"from {init_result['encoder_vectors']:,} chunks"
+                    )
+                if phase.name != previous_phase_name:
+                    append_jsonl(
+                        {
+                            "split": "phase_transition",
+                            "event": "phase_started",
+                            "step": global_step + 1,
+                            "phase": phase.name,
+                        },
+                        metrics_path,
+                    )
+                    print(f"[Phase] step={global_step + 1} {phase.name}")
+                    previous_phase_name = phase.name
+                _set_phase_trainability(model, phase)
                 batch = _batch_to_device(cpu_batch, device)
                 outputs = model(
                     batch["input_ids"],
                     batch["attention_mask"],
                     batch["legal_endpoints"],
+                    use_quantizer=phase.use_quantizer,
+                    update_codebook=phase.update_codebook,
                 )
                 losses = end_to_end_tokenizer_losses(
                     outputs,
                     batch["input_ids"],
                     batch["attention_mask"],
                     model,
-                    prior_weight=prior_weight,
+                    prior_weight=phase.prior_weight,
+                    segmenter_downstream_weight=phase.segmenter_downstream_weight,
+                    text_weight=1.0 if phase.train_text_decoder else 0.0,
+                    tokenizer_regularizer_weight=(
+                        1.0 if phase.train_tokenizer else 0.0
+                    ),
                 )
                 (losses["loss"] / train_cfg.gradient_accumulation_steps).backward()
                 accumulated += 1
@@ -506,7 +634,8 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 hard_rate = accumulated_rate / accumulated
-                model.update_rate_dual(hard_rate)
+                if not model_cfg.fixed_chunk_quota and phase.train_tokenizer:
+                    model.update_rate_dual(hard_rate)
                 train_row = {
                     "split": "train",
                     "epoch": epoch,
@@ -519,16 +648,16 @@ def main() -> None:
                     "text_nll_per_bpe": float(losses["text_nll_per_bpe"].detach()),
                     "commitment_loss": float(losses["commitment_loss"].detach()),
                     "rate_constraint_loss": float(losses["rate_constraint_loss"].detach()),
+                    "segmenter_downstream_loss": float(
+                        losses["segmenter_downstream_loss"].detach()
+                    ),
                     "tokens_per_chunk": 1.0 / max(hard_rate, 1e-12),
                     "rate_dual": float(model.rate_dual),
-                    "prior_weight": prior_weight,
-                    "phase": (
-                        "vq_warmup"
-                        if prior_weight == 0.0
-                        else "prior_anneal"
-                        if prior_weight < 1.0
-                        else "joint"
+                    "prior_weight": phase.prior_weight,
+                    "segmenter_downstream_weight": (
+                        phase.segmenter_downstream_weight
                     ),
+                    "phase": phase.name,
                     "grad_norm": float(grad_norm),
                     "elapsed_sec": time.time() - started,
                 }
@@ -540,7 +669,10 @@ def main() -> None:
                 accumulated = 0
                 accumulated_rate = 0.0
 
-                if global_step % train_cfg.eval_every == 0:
+                if (
+                    global_step % train_cfg.eval_every == 0
+                    and phase.use_quantizer
+                ):
                     final_validation = evaluate(model, validation_loader, device)
                     final_validation.update(write_segmentation_diagnostics(
                         model,

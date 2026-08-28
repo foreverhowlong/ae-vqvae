@@ -8,7 +8,14 @@ from sklearn.cluster import MiniBatchKMeans
 
 
 @torch.no_grad()
-def initialize_codebook_kmeans(model, data_loader, device, seed: int) -> dict:
+def initialize_codebook_kmeans(
+    model,
+    data_loader,
+    device,
+    seed: int,
+    *,
+    max_vectors: int | None = None,
+) -> dict:
     """Fit MiniBatch KMeans on one encoder pass and copy centres to the codebook.
 
     Only content (non-PAD) latent slots are included in the KMeans fit so that
@@ -17,6 +24,8 @@ def initialize_codebook_kmeans(model, data_loader, device, seed: int) -> dict:
     Returns a dict with metadata suitable for storing in config.json.
     """
     codebook_size = model.config.codebook_size
+    if max_vectors is not None and max_vectors < codebook_size:
+        raise ValueError("max_vectors must be at least the codebook size.")
     kmeans = MiniBatchKMeans(
         n_clusters=codebook_size,
         init="random",
@@ -35,13 +44,25 @@ def initialize_codebook_kmeans(model, data_loader, device, seed: int) -> dict:
         for batch in data_loader:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            z_e, latent_mask = model.encode(
-                input_ids, attention_mask=attention_mask, return_mask=True
-            )
+            encode_kwargs = {
+                "attention_mask": attention_mask,
+                "return_mask": True,
+            }
+            if "legal_endpoints" in batch:
+                encode_kwargs["legal_endpoints"] = batch["legal_endpoints"].to(
+                    device,
+                    non_blocking=True,
+                )
+            z_e, latent_mask = model.encode(input_ids, **encode_kwargs)
             vectors = z_e[latent_mask].detach().float().cpu().numpy()
+            if max_vectors is not None:
+                remaining = max(max_vectors - vectors_seen, 0)
+                vectors = vectors[:remaining]
             vectors_seen += len(vectors)
 
             if len(vectors) == 0:
+                if max_vectors is not None and vectors_seen >= max_vectors:
+                    break
                 continue
 
             if not fitted:
@@ -54,6 +75,8 @@ def initialize_codebook_kmeans(model, data_loader, device, seed: int) -> dict:
                 fitted = True
 
             kmeans.partial_fit(vectors)
+            if max_vectors is not None and vectors_seen >= max_vectors:
+                break
     finally:
         model.train(was_training)
 

@@ -57,6 +57,7 @@ class VectorQuantizer(nn.Module):
         valid_mask: torch.Tensor | None = None,
         *,
         curriculum_progress: float | None = None,
+        update_ema: bool = True,
     ):
         flat = z_e.reshape(-1, self.d_model)
         if valid_mask is None:
@@ -136,7 +137,11 @@ class VectorQuantizer(nn.Module):
             flat_z_q_raw[flat_valid_mask] = valid_z_q_raw
             distances[flat_valid_mask] = valid_distances
 
-            if self.training and self.collapse_config.use_ema_codebook:
+            if (
+                self.training
+                and update_ema
+                and self.collapse_config.use_ema_codebook
+            ):
                 if mixture_weights is not None and mixture_indices is not None:
                     self._ema_update_weighted(
                         flat[flat_valid_mask].detach(),

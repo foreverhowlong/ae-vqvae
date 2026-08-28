@@ -91,6 +91,8 @@ class ChunkPrior(nn.Module):
         lengths: torch.Tensor,
         chunk_mask: torch.Tensor,
         length_probabilities: torch.Tensor,
+        *,
+        detach_length_condition: bool = False,
     ) -> dict[str, torch.Tensor]:
         batch_size, chunk_slots = codes.shape
         if lengths.shape != codes.shape or chunk_mask.shape != codes.shape:
@@ -120,10 +122,15 @@ class ChunkPrior(nn.Module):
         length_logits = self.length_head(hidden)
 
         hard_current_length = self.length_embedding(lengths.clamp_min(0))
-        soft_current_length = length_probabilities @ self.length_embedding.weight[1:]
-        current_length = soft_current_length + (
-            hard_current_length - soft_current_length
-        ).detach()
+        if detach_length_condition:
+            current_length = hard_current_length
+        else:
+            soft_current_length = (
+                length_probabilities @ self.length_embedding.weight[1:]
+            )
+            current_length = soft_current_length + (
+                hard_current_length - soft_current_length
+            ).detach()
         code_hidden = self.code_condition_norm(hidden + current_length)
         code_logits = F.linear(
             code_hidden,
@@ -279,6 +286,7 @@ class EndToEndTokenizerModel(nn.Module):
             boundary_hidden,
             valid_mask,
             legal_endpoints=legal_endpoints,
+            fixed_chunk_quota=self.config.fixed_chunk_quota,
         )
         hard_pooled = self.span_encoder(
             token_embeddings,
@@ -303,6 +311,9 @@ class EndToEndTokenizerModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         legal_endpoints: torch.Tensor | None = None,
+        *,
+        use_quantizer: bool = True,
+        update_codebook: bool = True,
     ) -> dict[str, torch.Tensor]:
         valid_mask = attention_mask.to(device=input_ids.device, dtype=torch.bool)
         token_embeddings = self.token_embedding(input_ids)
@@ -311,6 +322,7 @@ class EndToEndTokenizerModel(nn.Module):
             boundary_hidden,
             valid_mask,
             legal_endpoints=legal_endpoints,
+            fixed_chunk_quota=self.config.fixed_chunk_quota,
         )
         hard_pooled = self.span_encoder(
             token_embeddings,
@@ -326,8 +338,29 @@ class EndToEndTokenizerModel(nn.Module):
         # Preserve the exact codebook used for hard assignments. EMA mutates the
         # shared table inside VectorQuantizer before returning.
         codebook_snapshot = self.quantizer.codebook.weight.detach().clone()
-        quantized = self.quantizer(z_e, valid_mask=chunk_mask)
-        quantized.pop("distances", None)
+        if use_quantizer:
+            quantized = self.quantizer(
+                z_e,
+                valid_mask=chunk_mask,
+                update_ema=update_codebook,
+            )
+            quantized.pop("distances", None)
+            z_q_raw = quantized["z_q_raw"]
+            z_latent = quantized["z_q_st"]
+            indices = quantized["indices"]
+        else:
+            z_q_raw = z_e
+            z_latent = z_e
+            indices = torch.zeros(
+                z_e.shape[:2],
+                device=z_e.device,
+                dtype=torch.long,
+            )
+            indices = torch.where(
+                chunk_mask,
+                indices,
+                torch.full_like(indices, -1),
+            )
         # Recompute from that immutable snapshot so soft code targets match the
         # hard assignment and can differentiate through z_e safely.
         code_distances = (
@@ -342,16 +375,42 @@ class EndToEndTokenizerModel(nn.Module):
         )
         chunk_lengths = segmented["greedy_chosen_lengths"]
         length_probabilities = segmented["greedy_length_probabilities"]
+        if self.config.segmenter_only_downstream:
+            routing_soft_latent = F.linear(
+                soft_proxy,
+                self.latent_projection.weight.detach(),
+                (
+                    self.latent_projection.bias.detach()
+                    if self.latent_projection.bias is not None
+                    else None
+                ),
+            )
+            routing_latent = z_e.detach() + (
+                routing_soft_latent - routing_soft_latent.detach()
+            )
+            routing_code_distances = (
+                routing_latent.square().sum(dim=-1, keepdim=True)
+                - 2.0 * routing_latent @ codebook_snapshot.t()
+                + codebook_snapshot.square().sum(dim=-1)
+            )
+            routing_code_distances = torch.where(
+                chunk_mask.unsqueeze(-1),
+                routing_code_distances,
+                torch.zeros_like(routing_code_distances),
+            )
+        else:
+            routing_code_distances = code_distances
         prior = self.chunk_prior(
-            quantized["indices"],
+            indices,
             chunk_lengths,
             chunk_mask,
             length_probabilities,
+            detach_length_condition=self.config.segmenter_only_downstream,
         )
         text_logits = self.text_decoder(
             input_ids,
             segmented["segment_ids"],
-            quantized["z_q_st"],
+            z_latent,
             chunk_lengths,
             valid_mask,
         )
@@ -360,13 +419,19 @@ class EndToEndTokenizerModel(nn.Module):
             **prior,
             "text_logits": text_logits,
             "z_e": z_e,
-            "z_q_raw": quantized["z_q_raw"],
-            "z_q_st": quantized["z_q_st"],
-            "indices": quantized["indices"],
+            "z_q_raw": z_q_raw,
+            "z_q_st": z_latent,
+            "indices": indices,
             "code_distances": code_distances,
+            "routing_code_distances": routing_code_distances,
             "chunk_lengths": chunk_lengths,
             "length_probabilities": length_probabilities,
             "latent_mask": chunk_mask,
+            "quantizer_active": torch.tensor(
+                use_quantizer,
+                device=input_ids.device,
+                dtype=torch.bool,
+            ),
         }
 
     @torch.no_grad()
@@ -395,10 +460,17 @@ def end_to_end_tokenizer_losses(
     model: EndToEndTokenizerModel,
     *,
     prior_weight: float = 1.0,
+    segmenter_downstream_weight: float = 0.0,
+    text_weight: float = 1.0,
+    tokenizer_regularizer_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Hard-forward codelength with local-softmax gradients for discrete choices."""
     if not 0.0 <= prior_weight <= 1.0:
         raise ValueError("prior_weight must be in [0, 1].")
+    if segmenter_downstream_weight < 0.0:
+        raise ValueError("segmenter_downstream_weight must be non-negative.")
+    if text_weight < 0.0 or tokenizer_regularizer_weight < 0.0:
+        raise ValueError("Objective weights must be non-negative.")
     valid_mask = attention_mask.to(device=targets.device, dtype=torch.bool)
     chunk_mask = outputs["latent_mask"].bool()
     token_count = valid_mask.sum().clamp_min(1)
@@ -414,9 +486,6 @@ def end_to_end_tokenizer_losses(
         outputs["length_probabilities"]
         * length_log_probabilities
     ).sum(dim=-1)[chunk_mask].sum()
-    length_nll_sum = soft_length_sum + (
-        hard_length_sum - soft_length_sum
-    ).detach()
 
     hard_code_sum = F.cross_entropy(
         outputs["code_logits"][chunk_mask],
@@ -440,16 +509,57 @@ def end_to_end_tokenizer_losses(
         nearest_indices,
     )
     soft_code_sum = -(posterior * candidate_log_probabilities).sum()
-    code_nll_sum = soft_code_sum + (hard_code_sum - soft_code_sum).detach()
+    if model.config.segmenter_only_downstream:
+        length_nll_sum = hard_length_sum
+        code_nll_sum = hard_code_sum
+        routing_length_sum = -(
+            outputs["length_probabilities"]
+            * length_log_probabilities.detach()
+        ).sum(dim=-1)[chunk_mask].sum()
+        routing_distances = outputs["routing_code_distances"][chunk_mask]
+        routing_nearest_distances, routing_nearest_indices = torch.topk(
+            routing_distances,
+            k=model.config.code_target_topk,
+            dim=-1,
+            largest=False,
+        )
+        routing_posterior = torch.softmax(
+            -routing_nearest_distances / model.config.code_target_temperature,
+            dim=-1,
+        )
+        routing_candidate_log_probabilities = (
+            code_log_probabilities.detach().gather(
+                1,
+                routing_nearest_indices,
+            )
+        )
+        routing_code_sum = -(
+            routing_posterior * routing_candidate_log_probabilities
+        ).sum()
+        segmenter_surrogate_sum = (
+            routing_length_sum - routing_length_sum.detach()
+            + routing_code_sum - routing_code_sum.detach()
+        )
+    else:
+        length_nll_sum = soft_length_sum + (
+            hard_length_sum - soft_length_sum
+        ).detach()
+        code_nll_sum = soft_code_sum + (hard_code_sum - soft_code_sum).detach()
+        segmenter_surrogate_sum = hard_code_sum.new_zeros(())
 
     text_nll_sum = F.cross_entropy(
         outputs["text_logits"][valid_mask],
         targets[valid_mask],
         reduction="sum",
     )
-    commitment_raw = (
-        (outputs["z_e"] - outputs["z_q_raw"].detach()).square()[chunk_mask].mean()
-    )
+    if bool(outputs["quantizer_active"]):
+        commitment_raw = (
+            (outputs["z_e"] - outputs["z_q_raw"].detach())
+            .square()[chunk_mask]
+            .mean()
+        )
+    else:
+        commitment_raw = text_nll_sum.new_zeros(())
 
     hard_chunk_count = chunk_mask.sum().to(outputs["z_e"].dtype)
     soft_chunk_count = outputs["soft_chunk_counts"].sum()
@@ -459,18 +569,34 @@ def end_to_end_tokenizer_losses(
     hard_chunks_per_token = hard_chunk_count / token_count
     aligned_chunks_per_token = aligned_chunk_count / token_count
     target_chunks_per_token = 1.0 / model.config.compression_target
-    rate_constraint = model.rate_dual.detach() * (
-        aligned_chunks_per_token - target_chunks_per_token
-    )
+    if model.config.fixed_chunk_quota:
+        rate_constraint = aligned_chunks_per_token.new_zeros(())
+    else:
+        rate_constraint = model.rate_dual.detach() * (
+            aligned_chunks_per_token - target_chunks_per_token
+        )
 
     generative_nll_sum = length_nll_sum + code_nll_sum + text_nll_sum
     generative_nll_per_bpe = generative_nll_sum / token_count
     prior_nll_sum = length_nll_sum + code_nll_sum
     training_nll_per_bpe = (
-        text_nll_sum + prior_weight * prior_nll_sum
+        text_weight * text_nll_sum + prior_weight * prior_nll_sum
     ) / token_count
-    commitment = model.config.commitment_beta * commitment_raw
-    loss = training_nll_per_bpe + commitment + rate_constraint
+    segmenter_downstream = (
+        segmenter_downstream_weight * segmenter_surrogate_sum / token_count
+    )
+    commitment = (
+        tokenizer_regularizer_weight
+        * model.config.commitment_beta
+        * commitment_raw
+    )
+    weighted_rate_constraint = tokenizer_regularizer_weight * rate_constraint
+    loss = (
+        training_nll_per_bpe
+        + commitment
+        + weighted_rate_constraint
+        + segmenter_downstream
+    )
     return {
         "loss": loss,
         "training_nll_per_bpe": training_nll_per_bpe,
@@ -484,12 +610,17 @@ def end_to_end_tokenizer_losses(
         "text_nll_per_bpe": text_nll_sum / token_count,
         "commitment_loss": commitment_raw,
         "commitment_weighted_loss": commitment,
-        "rate_constraint_loss": rate_constraint,
+        "rate_constraint_loss": weighted_rate_constraint,
+        "segmenter_downstream_loss": segmenter_downstream,
         "hard_chunks_per_token": hard_chunks_per_token,
         "hard_tokens_per_chunk": token_count / hard_chunk_count.clamp_min(1.0),
         "aligned_chunks_per_token": aligned_chunks_per_token,
         "rate_dual": model.rate_dual.detach().clone(),
         "prior_weight": text_nll_sum.new_tensor(prior_weight),
+        "text_weight": text_nll_sum.new_tensor(text_weight),
+        "tokenizer_regularizer_weight": text_nll_sum.new_tensor(
+            tokenizer_regularizer_weight
+        ),
         "token_count": token_count,
         "chunk_count": hard_chunk_count,
     }
