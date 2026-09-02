@@ -1,0 +1,78 @@
+{
+  "format_version": 1,
+  "experiment_name": "engram_125m_fineweb_edu_phase0",
+  "expected_backbone_parameters": 123551232,
+  "backbone": {
+    "vocab_size": 50257,
+    "context_length": 1024,
+    "layers": 12,
+    "d_model": 768,
+    "attention_heads": 12,
+    "d_ff": 2048,
+    "rope_theta": 10000.0,
+    "rms_norm_eps": 1e-5
+  },
+  "variants": {
+    "baseline": {
+      "enabled": false,
+      "table_rows_target": 0
+    },
+    "engram_s": {
+      "enabled": true,
+      "table_rows_target": 32768
+    },
+    "engram_m": {
+      "enabled": true,
+      "table_rows_target": 131072
+    },
+    "engram_l": {
+      "enabled": true,
+      "table_rows_target": 524288
+    }
+  },
+  "optimization": {
+    "initialization_seed": 42,
+    "peak_lr": 0.0006,
+    "min_lr": 0.00006,
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "gradient_clipping": 1.0,
+    "engram_lr_multiplier": 5.0
+  },
+  "profiles": {
+    "pilot": {
+      "training_tokens": 100000000,
+      "validation_tokens": 1000000,
+      "warmup_tokens": 2000000,
+      "eval_every_tokens": 10000000,
+      "micro_batch_size": 4,
+      "gradient_accumulation_steps": 32,
+      "eval_batch_size": 8,
+      "log_every_steps": 10,
+      "checkpoint_every_evals": 5
+    },
+    "final": {
+      "training_tokens": 2500000000,
+      "validation_tokens": 10000000,
+      "warmup_tokens": 25000000,
+      "eval_every_tokens": 25000000,
+      "micro_batch_size": 4,
+      "gradient_accumulation_steps": 32,
+      "eval_batch_size": 8,
+      "log_every_steps": 10,
+      "checkpoint_every_evals": 4
+    }
+  },
+  "go_criteria": {
+    "large_min_nll_improvement": 0.01,
+    "late_tail_points": 3,
+    "late_tail_min_positive_fraction": 0.6666666667
+  },
+  "sources": {
+    "paper": "arXiv:2601.07372v2",
+    "official_repository": "https://github.com/deepseek-ai/Engram",
+    "dataset": "HuggingFaceFW/fineweb-edu sample-10BT revision 05c1931294b0d1379055d1f802d369f2c3bb2f4b",
+    "tokenizer": "openai-community/gpt2 revision 607a30d783dfa663caf39e06633721c8d4cfcd7e"
+  }
+}
